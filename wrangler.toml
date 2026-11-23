@@ -1,0 +1,36 @@
+# HomeLedger on Cloudflare Workers
+# 部署前：
+#   npx wrangler d1 create homeledger-db
+#   npx wrangler r2 bucket create homeledger-attachments
+#   把返回的 database_id 填入下方后执行：
+#   npm run db:migrate && npm run deploy
+name = "homeledger"
+main = "src/index.ts"
+compatibility_date = "2025-11-17"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "homeledger-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "homeledger-attachments"
+
+# 定时任务：每 4 小时执行一次（周期账单 / 订阅扣费 / 预算预警 / 借贷与目标提醒 / 轻量 DB 清理）
+[triggers]
+crons = ["0 */4 * * *"]
+
+[vars]
+TZ = "Asia/Shanghai"
+SITE_NAME = "家账簿"
+
+# 敏感配置请通过 wrangler secret put 设置，勿明文提交：
+#   npx wrangler secret put SESSION_SECRET
+# 本地开发请复制 .dev.vars.example 为 .dev.vars

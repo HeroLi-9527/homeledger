@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+.dev.vars
+board.html
+demo.html
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+backups/
