@@ -107,7 +107,7 @@
         let h = '';
         for (const it of data.items || []) {
           const income = it.type === 'income';
-          h += `<div class="ai-record"><div class="m"><b>${esc(it.merchant || it.note || '记账')}</b><span>${esc(it.category_path || '')} · ${esc(it.txn_date)}</span></div><span class="amount ${income ? 'income' : 'expense'}">${income ? '+' : '-'}¥${(Number(it.amount_cents || 0) / 100).toFixed(2)}</span></div>`;
+          h += `<div class="ai-record"><div class="m"><b>${esc(it.merchant || it.note || '记账')}</b><span>${esc(it.category_path || it.category_name || '未分类')} · ${esc(it.txn_date)}</span></div><span class="amount ${income ? 'income' : 'expense'}">${income ? '+' : '-'}¥${(Number(it.amount_cents || 0) / 100).toFixed(2)}</span></div>`;
         }
         h += `<div class="small muted mt8">已入库 ${data.created} 笔 · <a href="/transactions">查看明细 →</a></div>`;
         addBubble('bot', h);

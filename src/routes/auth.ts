@@ -3,7 +3,7 @@ import { addLedgerMember, createDefaultLedger, nowStr, todayStr } from '../db.js
 import * as auth from '../lib/auth.js';
 import { colorFor, esc } from '../lib/util.js';
 import type { HonoEnv, Role, UserRow } from '../types.js';
-import { loginPage, registerPage, setupPage } from '../views/auth.js';
+import { loginPage, registerPage, setupPage, joinRegisterPage } from '../views/auth.js';
 import { blank, layout } from '../views/layout.js';
 import {
   bodyOf,
@@ -288,41 +288,58 @@ async function loadJoinInvite(db: ReturnType<typeof dbOf>, code: string) {
 }
 
 authRoutes.get('/join/:code', async (c) => {
-  const r = requireLogin(c);
-  if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const code = String(c.req.param('code') || '').trim();
   const { invite, ledger, error } = await loadJoinInvite(db, code);
+  const renderErr = (title: string, msg: string, status: 404 | 410) => {
+    if (ctx?.user) {
+      return c.html(
+        layout({
+          title,
+          ctx,
+          siteName: meta.siteName,
+          csrf: c.get('csrf'),
+          cspNonce: c.get('cspNonce'),
+          body: `<div class="card"><h2>${esc(title)}</h2><p class="muted mt8">${esc(msg)}</p></div>`,
+        }),
+        status,
+      );
+    }
+    return c.html(
+      blank({
+        title,
+        siteName: meta.siteName,
+        cspNonce: c.get('cspNonce'),
+        body: `<h2>${esc(title)}</h2><p class="muted mt8">${esc(msg)}</p><a class="btn btn-primary mt12" href="/login">前往登录</a>`,
+      }),
+      status,
+    );
+  };
   if (error || !invite || !ledger) {
-    return c.html(
-      layout({
-        title: error?.title || '错误',
-        ctx,
-        siteName: meta.siteName,
-        csrf: c.get('csrf'),
-        cspNonce: c.get('cspNonce'),
-        body: `<div class="card"><h2>${esc(error?.title || '错误')}</h2><p class="muted mt8">${esc(error?.message || '')}</p></div>`,
-      }),
-      error?.status || 404,
-    );
+    return renderErr(error?.title || '错误', error?.message || '', error?.status || 404);
   }
-  const alreadyMember = await auth.membership(db, ctx.user!.id, invite.ledger_id);
+  const alreadyMember = ctx?.user ? await auth.membership(db, ctx.user.id, invite.ledger_id) : null;
   if (Number(invite.used_by) && !alreadyMember) {
-    return c.html(
-      layout({
-        title: '邀请已使用',
-        ctx,
-        siteName: meta.siteName,
-        csrf: c.get('csrf'),
-        cspNonce: c.get('cspNonce'),
-        body: '<div class="card"><h2>邀请已使用</h2><p class="muted mt8">该邀请链接已被使用，请让账本管理员重新生成。</p></div>',
-      }),
-      410,
-    );
+    return renderErr('邀请已使用', '该邀请链接已被使用，请让账本管理员重新生成。', 410);
   }
   const roleLabel = auth.ROLE_LABEL[safeInviteRole(invite.role)];
+  if (!ctx?.user) {
+    return c.html(
+      blank({
+        title: '受邀注册并加入',
+        siteName: meta.siteName,
+        cspNonce: c.get('cspNonce'),
+        body: joinRegisterPage({
+          code,
+          ledgerName: ledger.name,
+          roleLabel,
+          csrf: '',
+        }),
+      }),
+    );
+  }
   return c.html(
     layout({
       title: '加入账本',
@@ -341,6 +358,99 @@ authRoutes.get('/join/:code', async (c) => {
   );
 });
 
+authRoutes.post('/join/:code/register', async (c) => {
+  if (c.get('ctx')?.user) return c.redirect(`/join/${encodeURIComponent(String(c.req.param('code') || '').trim())}`);
+  const db = dbOf(c);
+  const body = await bodyOf(c);
+  const meta = await siteMeta(c);
+  const code = String(c.req.param('code') || '').trim();
+  const { invite, ledger, error } = await loadJoinInvite(db, code);
+  const renderErr = (title: string, msg: string, status: 404 | 410) =>
+    c.html(
+      blank({
+        title,
+        siteName: meta.siteName,
+        cspNonce: c.get('cspNonce'),
+        body: `<h2>${esc(title)}</h2><p class="muted mt8">${esc(msg)}</p><a class="btn btn-primary mt12" href="/login">前往登录</a>`,
+      }),
+      status,
+    );
+  if (error || !invite || !ledger) {
+    return renderErr(error?.title || '错误', error?.message || '', error?.status || 404);
+  }
+  if (Number(invite.used_by)) {
+    return renderErr('邀请已使用', '该邀请链接已被使用，请让账本管理员重新生成。', 410);
+  }
+
+  const roleLabel = auth.ROLE_LABEL[safeInviteRole(invite.role)];
+  const username = String(body.username || '').trim();
+  const displayName = String(body.display_name || '').trim() || username;
+  const email = String(body.email || '').trim() || null;
+  const password = String(body.password || '');
+  const password2 = String(body.password2 || '');
+
+  const fail = (errMsg: string) =>
+    c.html(
+      blank({
+        title: '受邀注册并加入',
+        siteName: meta.siteName,
+        cspNonce: c.get('cspNonce'),
+        body: joinRegisterPage({
+          code,
+          ledgerName: ledger.name,
+          roleLabel,
+          csrf: '',
+          form: { username, display_name: displayName, email },
+          error: errMsg,
+        }),
+      }),
+      400,
+    );
+
+  if (!USERNAME_RE.test(username)) return fail('用户名需 3–32 位，仅支持字母、数字、下划线、点、@ 和短横线。');
+  if (password.length < 6) return fail('密码至少 6 位。');
+  if (password !== password2) return fail('两次输入的密码不一致。');
+  if (await db.get('SELECT id FROM users WHERE username = ?', username)) return fail('该用户名已被占用。');
+
+  const stamp = nowStr();
+  const info = await db.run(
+    'INSERT INTO users (username, email, password_hash, display_name, avatar_color, is_admin, token_version, created_at) VALUES (?,?,?,?,?,0,1,?)',
+    username,
+    email,
+    await auth.hashPassword(password),
+    displayName.slice(0, 30),
+    colorFor(username),
+    stamp,
+  );
+  const newUserId = Number(info.lastInsertRowid);
+  const claim = await db.run(
+    'UPDATE ledger_invites SET used_by = ?, used_at = ? WHERE id = ? AND used_by IS NULL',
+    newUserId,
+    stamp,
+    invite.id,
+  );
+  if (claim.changes !== 1) {
+    await db.run('DELETE FROM users WHERE id = ?', newUserId);
+    return renderErr('邀请已使用', '该邀请链接已被使用，请让账本管理员重新生成。', 410);
+  }
+
+  await addLedgerMember(db, invite.ledger_id, newUserId, safeInviteRole(invite.role));
+  const payload = auth.createSessionPayload(newUserId, Number(invite.ledger_id), 1);
+  const token = await auth.signSession(payload, getSessionSecret(envOf(c)));
+  c.header('Set-Cookie', auth.sessionCookie(token, envOf(c)), { append: true });
+  setFlash(c, 'success', `注册成功，已加入账本「${ledger.name}」`);
+  for (const uid of await auth.ledgerWriterIds(db, invite.ledger_id)) {
+    if (Number(uid) === newUserId) continue;
+    await auth.notify(db, uid, {
+      kind: 'info',
+      ledgerId: Number(invite.ledger_id),
+      title: `${displayName.slice(0, 30)} 加入了账本「${ledger.name}」`,
+      link: '/members',
+    });
+  }
+  return c.redirect('/');
+});
+
 authRoutes.post('/join/:code', async (c) => {
   const r = requireLogin(c);
   if (r) return r;
@@ -357,8 +467,19 @@ authRoutes.post('/join/:code', async (c) => {
     setFlash(c, 'error', '该邀请链接已被使用');
     return c.redirect('/');
   }
-  await addLedgerMember(db, invite.ledger_id, ctx.user!.id, safeInviteRole(invite.role));
-  await db.run('UPDATE ledger_invites SET used_by = ?, used_at = ? WHERE id = ?', ctx.user!.id, nowStr(), invite.id);
+  if (!alreadyMember) {
+    const claim = await db.run(
+      'UPDATE ledger_invites SET used_by = ?, used_at = ? WHERE id = ? AND used_by IS NULL',
+      ctx.user!.id,
+      nowStr(),
+      invite.id,
+    );
+    if (claim.changes !== 1) {
+      setFlash(c, 'error', '该邀请链接已被使用');
+      return c.redirect('/');
+    }
+    await addLedgerMember(db, invite.ledger_id, ctx.user!.id, safeInviteRole(invite.role));
+  }
   const sess = c.get('sess')!;
   const token = await auth.signSession(
     auth.createSessionPayload(sess.uid, Number(invite.ledger_id), sess.tv, sess.csrf),
@@ -366,14 +487,16 @@ authRoutes.post('/join/:code', async (c) => {
   );
   c.header('Set-Cookie', auth.sessionCookie(token, envOf(c)), { append: true });
   setFlash(c, 'success', `已加入账本「${ledger.name}」`);
-  for (const uid of await auth.ledgerWriterIds(db, invite.ledger_id)) {
-    if (Number(uid) === Number(ctx.user!.id)) continue;
-    await auth.notify(db, uid, {
-      kind: 'info',
-      ledgerId: Number(invite.ledger_id),
-      title: `${ctx.user!.display_name} 加入了账本「${ledger.name}」`,
-      link: '/members',
-    });
+  if (!alreadyMember) {
+    for (const uid of await auth.ledgerWriterIds(db, invite.ledger_id)) {
+      if (Number(uid) === Number(ctx.user!.id)) continue;
+      await auth.notify(db, uid, {
+        kind: 'info',
+        ledgerId: Number(invite.ledger_id),
+        title: `${ctx.user!.display_name} 加入了账本「${ledger.name}」`,
+        link: '/members',
+      });
+    }
   }
   return c.redirect('/');
 });

@@ -150,7 +150,11 @@ export function requireLedger(c: AppCtx): Response | null {
   const r = requireLogin(c);
   if (r) return r;
   const ctx = c.get('ctx');
-  if (!ctx?.ledger) return c.html('<h1>没有账本</h1><p>请先创建一个账本</p>', 400);
+  if (!ctx?.ledger) {
+    if (wantsJson(c)) return c.json({ ok: false, error: '当前没有可用账本，请先创建一个账本' }, 400);
+    if (c.req.method === 'GET') return c.redirect('/');
+    return c.html('<h1>没有账本</h1><p>请先创建一个账本</p>', 400);
+  }
   return null;
 }
 

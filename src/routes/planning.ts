@@ -20,14 +20,14 @@ import { esc, fmtAmount } from '../lib/util.js';
 import type { AccountRow, CategoryRow, HonoEnv } from '../types.js';
 import { layout, simpleTable } from '../views/layout.js';
 import { budgetsPage } from '../views/planning.js';
-import { bodyOf, dbOf, requireLogin, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
+import { bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
 
 export const planningRoutes = new Hono<HonoEnv>();
 const csrfInput = (c: { get: (k: 'csrf') => string }) => `<input type="hidden" name="_csrf" value="${esc(c.get('csrf') || '')}">`;
 const ledgerId = (c: { get: (k: 'ctx') => { ledger: { id: number } | null } }) => Number(c.get('ctx').ledger!.id);
 
 planningRoutes.get('/budgets', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
@@ -216,7 +216,7 @@ planningRoutes.post('/budgets/:id/delete', async (c) => {
 
 // ---- 周期账单 ----
 planningRoutes.get('/recurring', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
@@ -394,7 +394,7 @@ planningRoutes.post('/recurring/:id/delete', async (c) => {
 
 // ---- 借贷台账 ----
 planningRoutes.get('/debts', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
@@ -553,7 +553,7 @@ planningRoutes.post('/debts/:id/delete', async (c) => {
 
 // ---- 储蓄目标 ----
 planningRoutes.get('/goals', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');

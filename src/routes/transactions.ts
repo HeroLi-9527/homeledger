@@ -7,7 +7,7 @@ import { esc } from '../lib/util.js';
 import type { HonoEnv } from '../types.js';
 import { groupList, layout } from '../views/layout.js';
 import { txnFormPage } from '../views/transactions.js';
-import { bodyOf, dbOf, envOf, requireLogin, requireWrite, setFlash, siteMeta, takeFlash, toPublicError, wantsJson } from './helpers.js';
+import { bodyOf, dbOf, envOf, requireLedger, requireLogin, requireWrite, setFlash, siteMeta, takeFlash, toPublicError, wantsJson } from './helpers.js';
 
 export const txnRoutes = new Hono<HonoEnv>();
 
@@ -249,7 +249,7 @@ txnRoutes.post('/transactions/bulk-reimburse', async (c) => {
 });
 
 txnRoutes.get('/transactions/deleted', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');

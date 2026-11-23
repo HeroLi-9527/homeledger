@@ -70,3 +70,34 @@ export function registerPage({
 </form>
 <div class="auth-foot">已有账号？<a href="/login">直接登录</a></div>`;
 }
+
+export function joinRegisterPage({
+  code,
+  ledgerName,
+  roleLabel,
+  csrf,
+  form = {},
+  error = '',
+}: {
+  code: string;
+  ledgerName: string;
+  roleLabel: string;
+  csrf: string;
+  form?: { username?: string; display_name?: string; email?: string | null };
+  error?: string;
+}): string {
+  const nextJoin = `/join/${encodeURIComponent(code)}`;
+  return `${error ? `<div class="flash error"><span>${esc(error)}</span></div>` : ''}
+<h1 style="font-size:18px;margin-bottom:4px">受邀加入账本「${esc(ledgerName)}」</h1>
+<p class="muted small mb16">你将以「${esc(roleLabel)}」身份加入该账本，请先创建你的登录账号</p>
+<form method="post" action="/join/${esc(code)}/register">
+  <input type="hidden" name="_csrf" value="${esc(csrf)}">
+  <div class="field"><label>用户名</label><input type="text" name="username" value="${esc(form.username || '')}" required autofocus><div class="help">3–32 位，字母、数字、下划线、点、@ 或短横线</div></div>
+  <div class="field"><label>显示昵称</label><input type="text" name="display_name" value="${esc(form.display_name || '')}" placeholder="例如：家庭成员"></div>
+  <div class="field"><label>邮箱（可选）</label><input type="email" name="email" value="${esc(form.email || '')}"></div>
+  <div class="field"><label>密码</label><input type="password" name="password" autocomplete="new-password" required><div class="help">至少 6 位</div></div>
+  <div class="field"><label>确认密码</label><input type="password" name="password2" autocomplete="new-password" required></div>
+  <button class="btn btn-primary btn-lg btn-block" type="submit">创建账号并加入账本</button>
+</form>
+<div class="auth-foot">已有账号？<a href="/login?next=${encodeURIComponent(nextJoin)}">登录后加入</a></div>`;
+}

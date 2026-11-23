@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { makeDb } from '../src/db.js';
 import { app } from '../src/index.js';
+import { getAiConfig } from '../src/lib/ai.js';
 import { runScheduled } from '../src/lib/scheduler.js';
 import type { Env } from '../src/types.js';
 
@@ -423,4 +424,278 @@ test('HomeLedger 端到端全链路测试（极简 D1 + 无状态 Cookie + 离�
 
   const schedRes = await runScheduled(makeDb(env), env);
   assert.equal(typeof schedRes.recurring, 'number');
+});
+
+test('P0 回归：AI 配置保存、默认账户兜底、CSV 导入预览、邀请注册与无账本防护', async () => {
+  const { sqlite, env } = setupEnv();
+  const db = makeDb(env);
+  const req = (p: string, init: RequestInit = {}) =>
+    app.fetch(new Request(`http://localhost${p}`, init), env);
+
+  // 初始化管理员 alice（默认开启 site.allow_register = 'false'）
+  const setupRes = await req('/setup', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({
+      username: 'alice',
+      display_name: 'Alice',
+      password: 'password123',
+      password2: 'password123',
+      site_name: '家庭账本',
+    }),
+  });
+  assert.equal(setupRes.status, 302);
+  const cookieHeader = extractSidCookie(setupRes);
+  const homeHtml = await (await req('/', { headers: { Cookie: cookieHeader } })).text();
+  const csrf = extractCsrf(homeHtml);
+
+  // 1. AI 配置真值保存与回读
+  const aiSaveOn = await req('/settings/ai', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      base_url: 'https://api.example.com/v1',
+      model: 'gpt-4o-mini',
+      api_key: 'sk-test-secret-key',
+      enabled: '1',
+      'ai.vision': '1',
+      auto_save: '1',
+    }),
+  });
+  assert.equal(aiSaveOn.status, 302);
+  const cfgOn = await getAiConfig(db);
+  assert.equal(cfgOn.enabled, true);
+  assert.equal(cfgOn.vision, true);
+  assert.equal(cfgOn.autoSave, true);
+  assert.equal(cfgOn.model, 'gpt-4o-mini');
+
+  const aiSaveOff = await req('/settings/ai', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      base_url: 'https://api.example.com/v1',
+      model: 'gpt-4o-mini',
+    }),
+  });
+  assert.equal(aiSaveOff.status, 302);
+  const cfgOff = await getAiConfig(db);
+  assert.equal(cfgOff.enabled, false);
+  assert.equal(cfgOff.vision, false);
+  assert.equal(cfgOff.autoSave, false);
+
+  // 2. 浮动 AI 助手 (/api/ai/chat) 与 OpenAPI (/api/open/ai/bill) category_path + 默认账户兜底
+  const chatRes = await req('/api/ai/chat', {
+    method: 'POST',
+    headers: {
+      Cookie: cookieHeader,
+      'x-csrf-token': csrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ text: '午饭 35 元', images: [] }),
+  });
+  assert.equal(chatRes.status, 200);
+  const chatJson = (await chatRes.json()) as {
+    ok: boolean;
+    created: number;
+    items: Array<{ category_path: string; account_id: number | null; amount_cents: number }>;
+  };
+  assert.equal(chatJson.ok, true);
+  assert.equal(chatJson.created, 1);
+  assert.equal(chatJson.items[0].category_path, '餐饮/午餐');
+  assert.equal(chatJson.items[0].account_id, 1);
+
+  const tokRes = await req('/settings/api-tokens', {
+    method: 'POST',
+    headers: {
+      Cookie: cookieHeader,
+      'x-csrf-token': csrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ name: 'Bot' }),
+  });
+  const { token: apiToken } = (await tokRes.json()) as { token: string };
+
+  const openAiRes = await req('/api/open/ai/bill', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: '打车 28 元' }),
+  });
+  assert.equal(openAiRes.status, 200);
+  const openAiJson = (await openAiRes.json()) as {
+    ok: boolean;
+    created: number;
+    items: Array<{ category_path: string; account_id: number | null }>;
+  };
+  assert.equal(openAiJson.ok, true);
+  assert.equal(openAiJson.created, 1);
+  assert.equal(openAiJson.items[0].category_path, '交通/打车');
+  assert.equal(openAiJson.items[0].account_id, 1);
+
+  const acc1AfterAi = sqlite.prepare('SELECT balance_cents FROM accounts WHERE id = 1').get() as { balance_cents: number };
+  assert.equal(acc1AfterAi.balance_cents, -6300);
+
+  // 3. CSV 导入预览 guess_category / guess_account 与无账户列默认账户提交
+  const csvContent = [
+    '交易时间,交易分类,交易对方,商品说明,收/支,金额(元),收/付款方式,当前状态,交易订单号',
+    '2026-11-20 12:00:00,餐饮美食,瑞幸咖啡,拿铁咖啡,支出,18.00,支付宝,支付成功,ORD20261120001',
+    '2026-11-20 18:00:00,日用百货,路边小店,买水,支出,5.00,,支付成功,ORD20261120002',
+  ].join('\n');
+  const csvDataUrl = `data:text/csv;base64,${Buffer.from(csvContent, 'utf8').toString('base64')}`;
+
+  const previewRes = await req('/api/import/preview', {
+    method: 'POST',
+    headers: {
+      Cookie: cookieHeader,
+      'x-csrf-token': csrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ dataUrl: csvDataUrl, fileName: 'alipay.csv' }),
+  });
+  assert.equal(previewRes.status, 200);
+  const previewJson = (await previewRes.json()) as {
+    ok: boolean;
+    token: string;
+    count: number;
+    sample: Array<{ guess_category: string | null; guess_account: string | null }>;
+  };
+  assert.equal(previewJson.ok, true);
+  assert.equal(previewJson.count, 2);
+  assert.equal(previewJson.sample[0].guess_category, '餐饮美食');
+  assert.equal(previewJson.sample[0].guess_account, '支付宝');
+  assert.equal(previewJson.sample[1].guess_category, '日用百货');
+
+  const commitRes = await req('/api/import/commit', {
+    method: 'POST',
+    headers: {
+      Cookie: cookieHeader,
+      'x-csrf-token': csrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ token: previewJson.token, auto_create_account: true }),
+  });
+  assert.equal(commitRes.status, 200);
+  const commitJson = (await commitRes.json()) as { ok: boolean; imported: number; failed: number };
+  assert.equal(commitJson.ok, true);
+  assert.equal(commitJson.imported, 2);
+  assert.equal(commitJson.failed, 0);
+
+  // 4. 关闭自助注册下的邀请注册闭环与管理员建号
+  const regClosedHtml = await (await req('/register')).text();
+  assert.ok(regClosedHtml.includes('本站未开放自助注册'));
+
+  const inviteRes = await req('/members/invite', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, role: 'member', days: '7' }),
+  });
+  assert.equal(inviteRes.status, 302);
+  const invRow = sqlite.prepare('SELECT code FROM ledger_invites ORDER BY id DESC LIMIT 1').get() as { code: string };
+  assert.ok(invRow?.code);
+
+  const joinGet = await req(`/join/${invRow.code}`);
+  assert.equal(joinGet.status, 200);
+  const joinHtml = await joinGet.text();
+  assert.ok(joinHtml.includes(`/join/${invRow.code}/register`));
+
+  const joinReg = await req(`/join/${invRow.code}/register`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({
+      username: 'bob',
+      display_name: 'Bob',
+      password: 'bobpassword',
+      password2: 'bobpassword',
+    }),
+  });
+  assert.equal(joinReg.status, 302);
+  const bobCookie = extractSidCookie(joinReg);
+  assert.ok(bobCookie.startsWith('hl.sid='));
+  const bobHome = await req('/', { headers: { Cookie: bobCookie } });
+  assert.equal(bobHome.status, 200);
+  assert.ok((await bobHome.text()).includes('Alice的账本'));
+
+  // 同一邀请码不可重复注册
+  assert.equal((await req(`/join/${invRow.code}`)).status, 410);
+  const reusePost = await req(`/join/${invRow.code}/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({
+      username: 'bob2',
+      display_name: 'Bob2',
+      password: 'bobpassword',
+      password2: 'bobpassword',
+    }),
+  });
+  assert.equal(reusePost.status, 410);
+
+  // 管理员直接在后台新建用户 charlie
+  const adminCreateUser = await req('/admin/users', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      username: 'charlie',
+      display_name: 'Charlie',
+      password: 'charlie123',
+    }),
+  });
+  assert.equal(adminCreateUser.status, 302);
+
+  const charlieLogin = await req('/login', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({ username: 'charlie', password: 'charlie123' }),
+  });
+  assert.equal(charlieLogin.status, 302);
+  const charlieCookie = extractSidCookie(charlieLogin);
+  const charlieHome = await (await req('/', { headers: { Cookie: charlieCookie } })).text();
+  assert.ok(charlieHome.includes('Charlie的账本'));
+  const charlieCsrf = extractCsrf(charlieHome);
+
+  // 5. 归档用户唯一账本后，无活跃账本访问各页面不触发 500
+  const charlieLedger = sqlite
+    .prepare("SELECT id FROM ledgers WHERE name = 'Charlie的账本' ORDER BY id DESC LIMIT 1")
+    .get() as { id: number };
+  const archiveRes = await req(`/ledgers/${charlieLedger.id}/archive`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: charlieCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: charlieCsrf }),
+  });
+  assert.equal(archiveRes.status, 302);
+
+  const noLedgerHome = await req('/', { headers: { Cookie: charlieCookie } });
+  assert.equal(noLedgerHome.status, 200);
+  assert.ok((await noLedgerHome.text()).includes('还没有账本'));
+
+  for (const p of [
+    '/transactions/deleted',
+    '/accounts/1',
+    '/categories',
+    '/tags',
+    '/budgets',
+    '/recurring',
+    '/debts',
+    '/goals',
+    '/subscriptions',
+    '/members',
+    '/export',
+  ]) {
+    const res = await req(p, { redirect: 'manual', headers: { Cookie: charlieCookie } });
+    assert.equal(res.status, 302, `${p} 无账本时应安全重定向至 /`);
+    assert.equal(res.headers.get('location'), '/');
+  }
 });

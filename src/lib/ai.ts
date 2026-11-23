@@ -433,12 +433,12 @@ export function buildUserPrompt({
   ].join('\n');
 }
 
-export async function resolveCategoryId(
+export async function resolveCategory(
   db: Db,
   ledgerId: number,
   nameHint: string | null | undefined,
   kind: 'expense' | 'income',
-): Promise<number | null> {
+): Promise<{ id: number; path: string } | null> {
   if (!nameHint) return null;
   const hint = String(nameHint).trim();
   const rows = await db.all<{ id: number; name: string; kind: string; parent: string | null }>(
@@ -449,24 +449,57 @@ export async function resolveCategoryId(
     kind,
   );
   const norm = (s: string) => String(s || '').replace(/\s/g, '');
+  const pick = (r: { id: number; name: string; parent: string | null }) => ({
+    id: Number(r.id),
+    path: r.parent ? `${r.parent}/${r.name}` : r.name,
+  });
   const target = norm(hint);
   for (const r of rows) {
     const full = r.parent ? `${r.parent}/${r.name}` : r.name;
-    if (norm(full) === target) return Number(r.id);
+    if (norm(full) === target) return pick(r);
   }
-  for (const r of rows) if (norm(r.name) === target) return Number(r.id);
+  for (const r of rows) if (norm(r.name) === target) return pick(r);
   const tail = target.includes('/') ? target.split('/').pop() || target : target;
-  for (const r of rows) if (norm(r.name) === norm(tail)) return Number(r.id);
+  for (const r of rows) if (norm(r.name) === norm(tail)) return pick(r);
   for (const r of rows) {
-    if (norm(r.name).includes(tail) || tail.includes(norm(r.name))) return Number(r.id);
-    if (r.parent && (norm(r.parent).includes(tail) || tail.includes(norm(r.parent)))) return Number(r.id);
+    if (norm(r.name).includes(tail) || tail.includes(norm(r.name))) return pick(r);
+    if (r.parent && (norm(r.parent).includes(tail) || tail.includes(norm(r.parent)))) return pick(r);
   }
   const kw = classifyByKeywords(hint);
   if (kw) {
-    for (const r of rows) if (norm(r.name) === norm(kw.category)) return Number(r.id);
-    for (const r of rows) if (r.parent && norm(r.parent) === norm(kw.category)) return Number(r.id);
+    for (const r of rows) if (norm(r.name) === norm(kw.category)) return pick(r);
+    for (const r of rows) if (r.parent && norm(r.parent) === norm(kw.category)) return pick(r);
   }
   return null;
+}
+
+export async function resolveCategoryId(
+  db: Db,
+  ledgerId: number,
+  nameHint: string | null | undefined,
+  kind: 'expense' | 'income',
+): Promise<number | null> {
+  return (await resolveCategory(db, ledgerId, nameHint, kind))?.id ?? null;
+}
+
+export async function resolveDefaultAccount(
+  db: Db,
+  ledgerId: number,
+  preferredId?: number | null,
+): Promise<{ id: number; name: string } | null> {
+  if (preferredId) {
+    const preferred = await db.get<{ id: number; name: string }>(
+      'SELECT id, name FROM accounts WHERE id = ? AND ledger_id = ? AND is_archived = 0',
+      Number(preferredId),
+      ledgerId,
+    );
+    if (preferred) return { id: Number(preferred.id), name: preferred.name };
+  }
+  const first = await db.get<{ id: number; name: string }>(
+    'SELECT id, name FROM accounts WHERE ledger_id = ? AND is_archived = 0 ORDER BY sort_order, id LIMIT 1',
+    ledgerId,
+  );
+  return first ? { id: Number(first.id), name: first.name } : null;
 }
 
 export async function resolveAccountId(
@@ -503,6 +536,7 @@ export interface NormalizedBillItem {
   note: string | null;
   category_id: number | null;
   category_name: string | null;
+  category_path: string;
   account_id: number | null;
   account_name: string | null;
   confidence: number;
@@ -523,14 +557,15 @@ export async function normalizeItem(
     ? Number(raw.amount_cents)
     : parseAmountToCents(raw.amount);
   const catName = (raw.category_name || raw.category || null) as string | null;
-  let categoryId = await resolveCategoryId(db, ledgerId, catName, kind);
-  if (!categoryId && type !== 'transfer') {
+  let resolvedCat = await resolveCategory(db, ledgerId, catName, kind);
+  if (!resolvedCat && type !== 'transfer') {
     const kw = classifyByKeywords(`${raw.merchant || ''} ${raw.note || ''} ${catName || ''}`);
-    if (kw) categoryId = await resolveCategoryId(db, ledgerId, kw.category, kw.kind === 'income' ? 'income' : kind);
-    if (!categoryId) {
-      categoryId = await resolveCategoryId(db, ledgerId, kind === 'income' ? '其他收入' : '其他支出', kind);
+    if (kw) resolvedCat = await resolveCategory(db, ledgerId, kw.category, kw.kind === 'income' ? 'income' : kind);
+    if (!resolvedCat) {
+      resolvedCat = await resolveCategory(db, ledgerId, kind === 'income' ? '其他收入' : '其他支出', kind);
     }
   }
+  const categoryPath = type === 'transfer' ? '转账' : resolvedCat?.path || catName || '未分类';
   const acctName = (raw.acct || raw.account || raw.account_name || null) as string | null;
   return {
     draft_id: uid(10),
@@ -540,13 +575,33 @@ export async function normalizeItem(
     txn_date: /^\d{4}-\d{2}-\d{2}$/.test(String(raw.txn_date || '')) ? String(raw.txn_date) : todayStr(),
     merchant: raw.merchant ? String(raw.merchant).slice(0, 60) : null,
     note: raw.note ? String(raw.note).slice(0, 200) : null,
-    category_id: categoryId,
+    category_id: resolvedCat?.id ?? null,
     category_name: catName,
+    category_path: categoryPath,
     account_id: await resolveAccountId(db, ledgerId, acctName),
     account_name: acctName,
     confidence: Number.isFinite(Number(raw.confidence)) ? Number(raw.confidence) : 0.8,
     raw,
   };
+}
+
+async function applyDefaultAccountFallback(
+  db: Db,
+  ledgerId: number,
+  items: NormalizedBillItem[],
+  warnings: string[],
+  defaultAccountId?: number | null,
+): Promise<NormalizedBillItem[]> {
+  if (!items.some((it) => it.account_id == null)) return items;
+  const fallback = await resolveDefaultAccount(db, ledgerId, defaultAccountId);
+  if (!fallback) return items;
+  const warnMsg = `未识别出账户，已默认选择「${fallback.name}」`;
+  if (!warnings.includes(warnMsg)) warnings.push(warnMsg);
+  return items.map((it) =>
+    it.account_id == null
+      ? { ...it, account_id: fallback.id, account_name: it.account_name || fallback.name }
+      : it,
+  );
 }
 
 export async function analyzeBill(
@@ -555,10 +610,12 @@ export async function analyzeBill(
     images = [],
     text = '',
     ledgerId,
+    defaultAccountId = null,
   }: {
     images?: Array<string | { dataUrl?: string; url?: string }>;
     text?: string;
     ledgerId: number;
+    defaultAccountId?: number | null;
   },
 ) {
   const cfg = await getAiConfig(db);
@@ -592,12 +649,13 @@ export async function analyzeBill(
       const parsed = extractJson(out) as { items?: unknown[] } | unknown[] | null;
       const items = Array.isArray(parsed) ? parsed : parsed?.items;
       if (Array.isArray(items) && items.length) {
+        const normalized = await Promise.all(
+          items.map((it) => normalizeItem(db, (it || {}) as Record<string, unknown>, ledgerId)),
+        );
         return {
           engine: 'llm' as const,
           model: cfg.model,
-          items: await Promise.all(
-            items.map((it) => normalizeItem(db, (it || {}) as Record<string, unknown>, ledgerId)),
-          ),
+          items: await applyDefaultAccountFallback(db, ledgerId, normalized, warnings, defaultAccountId),
           warnings,
         };
       }
@@ -614,7 +672,14 @@ export async function analyzeBill(
   if (text) {
     const items = parseTextByRules(text, { today }).map((it) => normalizeItem(db, it, ledgerId));
     const done = await Promise.all(items);
-    if (done.length) return { engine: 'rule' as const, model: null, items: done, warnings };
+    if (done.length) {
+      return {
+        engine: 'rule' as const,
+        model: null,
+        items: await applyDefaultAccountFallback(db, ledgerId, done, warnings, defaultAccountId),
+        warnings,
+      };
+    }
   }
   return { engine: 'rule' as const, model: null, items: [], warnings };
 }

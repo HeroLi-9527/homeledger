@@ -253,7 +253,12 @@ openapiRoutes.post('/ai/bill', async (c) => {
       );
     }
 
-    const res = await analyzeBill(db, { images: analyzeImages, text, ledgerId: oa.ledgerId });
+    const res = await analyzeBill(db, {
+      images: analyzeImages,
+      text,
+      ledgerId: oa.ledgerId,
+      defaultAccountId: body.account_id ? Number(body.account_id) : null,
+    });
     const autoSave = body.auto_save !== false;
     const createdIds: number[] = [];
 

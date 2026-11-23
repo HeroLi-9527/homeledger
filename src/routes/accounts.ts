@@ -6,7 +6,7 @@ import { esc, fmtAmount } from '../lib/util.js';
 import type { AccountRow, CategoryRow, HonoEnv } from '../types.js';
 import { accountsPage, categoriesPage, tagsPage } from '../views/accounts.js';
 import { groupList, layout } from '../views/layout.js';
-import { bodyOf, dbOf, requireLogin, requireWrite, setFlash, siteMeta, takeFlash } from './helpers.js';
+import { bodyOf, dbOf, requireLedger, requireLogin, requireWrite, setFlash, siteMeta, takeFlash } from './helpers.js';
 
 export const accountsRoutes = new Hono<HonoEnv>();
 
@@ -161,7 +161,7 @@ accountsRoutes.post('/accounts/:id/adjust', async (c) => {
 });
 
 accountsRoutes.get('/accounts/:id', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
@@ -206,7 +206,7 @@ accountsRoutes.get('/accounts/:id', async (c) => {
 });
 
 accountsRoutes.get('/categories', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
@@ -270,7 +270,7 @@ accountsRoutes.post('/categories/:id/delete', async (c) => {
 });
 
 accountsRoutes.get('/tags', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');

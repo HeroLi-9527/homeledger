@@ -3,12 +3,20 @@ import {
   addLedgerMember,
   allSettings,
   createDefaultAccounts,
+  createDefaultLedger,
   nowStr,
   recalcBalances,
   setSetting,
   todayStr,
 } from '../db.js';
-import { getAiConfig, isMaskedSecret, listModels, testConnection } from '../lib/ai.js';
+import {
+  classifyByKeywords,
+  getAiConfig,
+  isMaskedSecret,
+  listModels,
+  resolveDefaultAccount,
+  testConnection,
+} from '../lib/ai.js';
 import * as attach from '../lib/attachments.js';
 import * as auth from '../lib/auth.js';
 import { EXPORT_HEADER, exportRows, importRecords, parseBill, toCsv, type ParsedBillRecord } from '../lib/importers.js';
@@ -37,6 +45,10 @@ import {
 } from './helpers.js';
 
 export const adminRoutes = new Hono<HonoEnv>();
+
+const USERNAME_RE = /^[A-Za-z0-9_.@-]{3,32}$/;
+const toBoolSetting = (v: unknown): 'true' | 'false' =>
+  v === true || v === 1 || v === '1' || v === 'true' || v === 'on' ? 'true' : 'false';
 
 const BACKUP_TABLES = [
   'users',
@@ -208,9 +220,9 @@ adminRoutes.post('/settings/ai', async (c) => {
 
   await setSetting(db, 'ai.base_url', baseUrl);
   await setSetting(db, 'ai.model', model);
-  await setSetting(db, 'ai.enabled', body.enabled ? '1' : '0');
-  await setSetting(db, 'ai.vision', body['ai.vision'] || body.vision ? '1' : '0');
-  await setSetting(db, 'ai.auto_save', body.auto_save ? '1' : '0');
+  await setSetting(db, 'ai.enabled', toBoolSetting(body.enabled));
+  await setSetting(db, 'ai.vision', toBoolSetting(body['ai.vision'] ?? body.vision));
+  await setSetting(db, 'ai.auto_save', toBoolSetting(body.auto_save));
   if (apiKey && !isMaskedSecret(apiKey)) {
     await setSetting(db, 'ai.api_key', apiKey);
   }
@@ -751,6 +763,11 @@ adminRoutes.post('/api/import/preview', async (c) => {
       sample: parsed.records.slice(0, 60).map((rec) => ({
         ...rec,
         type_label: rec.type === 'income' ? '收入' : rec.type === 'transfer' ? '转账' : '支出',
+        guess_category:
+          rec.category_hint ||
+          classifyByKeywords(rec.text)?.category ||
+          (rec.type === 'transfer' ? '转账' : rec.type === 'income' ? '其他收入' : '其他支出'),
+        guess_account: rec.account_hint || null,
       })),
     });
   } catch (e) {
@@ -781,6 +798,11 @@ adminRoutes.post('/api/import/commit', async (c) => {
   }
 
   try {
+    const defaultAcc = await resolveDefaultAccount(
+      db,
+      Number(ctx.ledger!.id),
+      body.default_account_id ? Number(body.default_account_id) : null,
+    );
     const result = await importRecords(db, {
       ledgerId: Number(ctx.ledger!.id),
       userId: Number(ctx.user!.id),
@@ -790,6 +812,7 @@ adminRoutes.post('/api/import/commit', async (c) => {
       source: payload.source,
       fileName: payload.fileName,
       autoCreateAccount: body.auto_create_account !== false,
+      defaultAccountId: defaultAcc?.id ?? null,
       env,
     });
     previewCache.delete(token);
@@ -1013,9 +1036,58 @@ adminRoutes.get('/admin', async (c) => {
     <form method="post" action="/admin/cleanup-r2" style="display:inline">${csrfInput}<button class="btn" type="submit">手动扫描并清理孤儿 R2 文件</button></form>
   </div>
 </div>
-${simpleTable('站点用户管理', ['用户', '权限', '状态', '最近登录', '操作'], rows)}`,
+${simpleTable('站点用户管理', ['用户', '权限', '状态', '最近登录', '操作'], rows)}
+<div class="card mt16">
+  <div class="card-head"><b>新建用户</b><span class="muted small">关闭自助注册时可由管理员直接开设家庭成员账号</span></div>
+  <form method="post" action="/admin/users">${csrfInput}
+    <div class="grid grid-4">
+      <div class="field"><label>用户名</label><input name="username" required placeholder="3–32 位账号"></div>
+      <div class="field"><label>显示昵称</label><input name="display_name" placeholder="例如：家人"></div>
+      <div class="field"><label>初始密码（≥6 位）</label><input type="password" name="password" required></div>
+      <div class="field" style="justify-content:flex-end"><label class="check"><input type="checkbox" name="is_admin" value="1"> 设为站点管理员</label></div>
+    </div>
+    <button class="btn btn-primary" type="submit">创建用户并初始化账本</button>
+  </form>
+</div>`,
     }),
   );
+});
+
+adminRoutes.post('/admin/users', async (c) => {
+  const r = requireAdmin(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const body = await bodyOf(c);
+  const username = String(body.username || '').trim();
+  const displayName = String(body.display_name || '').trim() || username;
+  const password = String(body.password || '');
+  const isAdmin = body.is_admin ? 1 : 0;
+
+  if (!USERNAME_RE.test(username)) {
+    setFlash(c, 'error', '用户名需 3–32 位，仅支持字母、数字、下划线、点、@ 和短横线');
+    return c.redirect('/admin');
+  }
+  if (password.length < 6) {
+    setFlash(c, 'error', '密码长度至少 6 位');
+    return c.redirect('/admin');
+  }
+  if (await db.get('SELECT id FROM users WHERE username = ?', username)) {
+    setFlash(c, 'error', '该用户名已被占用');
+    return c.redirect('/admin');
+  }
+
+  const info = await db.run(
+    'INSERT INTO users (username, password_hash, display_name, avatar_color, is_admin, token_version, created_at) VALUES (?,?,?,?,?,1,?)',
+    username,
+    await auth.hashPassword(password),
+    displayName.slice(0, 30),
+    u.colorFor(username),
+    isAdmin,
+    nowStr(),
+  );
+  await createDefaultLedger(db, info.lastInsertRowid, displayName);
+  setFlash(c, 'success', `用户「${displayName}」已创建，并初始化默认账本`);
+  return c.redirect('/admin');
 });
 
 adminRoutes.post('/admin/users/:id', async (c) => {

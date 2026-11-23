@@ -410,7 +410,7 @@
           (it.type === 'income' ? '收入' : it.type === 'transfer' ? '转账' : '支出') +
           '</span>' +
           '<span class="chip">' +
-          esc(it.category_path) +
+          esc(it.category_path || it.category_name || '未分类') +
           '</span>' +
           '<span class="confidence ' +
           cls +
@@ -660,9 +660,9 @@
           '</td><td>' +
           esc(r.merchant || r.note || '—') +
           '</td><td class="small muted">' +
-          esc(r.guess_category || '—') +
+          esc(r.guess_category || r.category_hint || '—') +
           '</td><td class="small muted">' +
-          esc(r.guess_account || '—') +
+          esc(r.guess_account || r.account_hint || '—') +
           '</td></tr>';
       });
       html += '</tbody></table></div></div>';

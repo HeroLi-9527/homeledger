@@ -8,7 +8,7 @@ import { esc } from '../lib/util.js';
 import type { HonoEnv } from '../types.js';
 import { layout } from '../views/layout.js';
 import { subscriptionsPage } from '../views/planning.js';
-import { bodyOf, dbOf, requireLogin, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
+import { bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
 
 export const subscriptionsRoutes = new Hono<HonoEnv>();
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -68,7 +68,7 @@ function readSubForm(
 }
 
 subscriptionsRoutes.get('/subscriptions', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
