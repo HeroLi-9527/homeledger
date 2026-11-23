@@ -63,6 +63,8 @@ const BACKUP_TABLES = [
   'transaction_tags',
   'splits',
   'attachments',
+  'session_cards',
+  'session_card_logs',
   'budgets',
   'recurring_rules',
   'goals',

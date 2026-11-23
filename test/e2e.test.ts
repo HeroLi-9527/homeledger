@@ -6,7 +6,7 @@ import test from 'node:test';
 import { makeDb } from '../src/db.js';
 import { app } from '../src/index.js';
 import { getAiConfig } from '../src/lib/ai.js';
-import { runScheduled } from '../src/lib/scheduler.js';
+import { checkCreditAccounts, checkSessionCards, runScheduled } from '../src/lib/scheduler.js';
 import type { Env } from '../src/types.js';
 
 type SQLInputValue = null | number | bigint | string | Uint8Array;
@@ -141,8 +141,14 @@ function createMemoryR2() {
 function setupEnv() {
   const sqlite = new DatabaseSync(':memory:');
   const root = process.cwd();
-  sqlite.exec(fs.readFileSync(path.join(root, 'migrations/0001_init.sql'), 'utf8'));
-  sqlite.exec(fs.readFileSync(path.join(root, 'migrations/0002_seed.sql'), 'utf8'));
+  const migDir = path.join(root, 'migrations');
+  const migFiles = fs
+    .readdirSync(migDir)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
+  for (const f of migFiles) {
+    sqlite.exec(fs.readFileSync(path.join(migDir, f), 'utf8'));
+  }
 
   const DB = createSqliteD1(sqlite);
   const { bucket: ATTACHMENTS, store: r2Store } = createMemoryR2();
@@ -684,6 +690,7 @@ test('P0 回归：AI 配置保存、默认账户兜底、CSV 导入预览、邀�
   for (const p of [
     '/transactions/deleted',
     '/accounts/1',
+    '/session-cards/1',
     '/categories',
     '/tags',
     '/budgets',
@@ -698,4 +705,389 @@ test('P0 回归：AI 配置保存、默认账户兜底、CSV 导入预览、邀�
     assert.equal(res.status, 302, `${p} 无账本时应安全重定向至 /`);
     assert.equal(res.headers.get('location'), '/');
   }
+});
+
+test('Phase 1：账户三层分层、账户编辑、信用额度提醒与次卡全生命周期', async () => {
+  const { sqlite, env } = setupEnv();
+  const db = makeDb(env);
+  const req = (p: string, init: RequestInit = {}) =>
+    app.fetch(new Request(`http://localhost${p}`, init), env);
+
+  // 初始化管理员与账本
+  const setupRes = await req('/setup', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({
+      username: 'alice',
+      display_name: 'Alice',
+      password: 'password123',
+      password2: 'password123',
+      site_name: '家用账本',
+    }),
+  });
+  assert.equal(setupRes.status, 302);
+  const cookieHeader = extractSidCookie(setupRes);
+  const homeHtml = await (await req('/', { headers: { Cookie: cookieHeader } })).text();
+  const csrf = extractCsrf(homeHtml);
+
+  // 1. 新建花呗（信用账户）：正数录入当前待还 320.50 -> 后台自动转为 -32050
+  const createCreditRes = await req('/accounts', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      _include_in_net_present: '1',
+      include_in_net: '1',
+      name: '花呗',
+      type: 'credit',
+      icon: '🟦',
+      balance: '320.50',
+      currency: 'CNY',
+      institution: '支付宝',
+      card_no: '9527',
+      credit_limit: '10000',
+      bill_day: '1',
+      due_day: '10',
+      note: '日常花呗消费',
+    }),
+  });
+  assert.equal(createCreditRes.status, 302);
+  const huabei = sqlite
+    .prepare("SELECT * FROM accounts WHERE name = '花呗' ORDER BY id DESC LIMIT 1")
+    .get() as Record<string, unknown>;
+  assert.equal(huabei.type, 'credit');
+  assert.equal(huabei.initial_cents, -32050);
+  assert.equal(huabei.balance_cents, -32050);
+  assert.equal(huabei.credit_limit, 1000000);
+  assert.equal(huabei.bill_day, 1);
+  assert.equal(huabei.due_day, 10);
+  assert.equal(huabei.institution, '支付宝');
+  assert.equal(huabei.card_no, '9527');
+
+  // 新建充值账户（储值卡）
+  const createPrepaidRes = await req('/accounts', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      _include_in_net_present: '1',
+      include_in_net: '1',
+      name: '山姆储值卡',
+      type: 'prepaid',
+      icon: '🎫',
+      balance: '500.00',
+      currency: 'CNY',
+    }),
+  });
+  assert.equal(createPrepaidRes.status, 302);
+
+  // 验证 /accounts 三层分组展示、去还款链接与详情编辑不改动初始/当前余额
+  const accountsHtml = await (await req('/accounts', { headers: { Cookie: cookieHeader } })).text();
+  assert.ok(accountsHtml.includes('资金账户'));
+  assert.ok(accountsHtml.includes('充值账户与次卡'));
+  assert.ok(accountsHtml.includes('信用账户'));
+  assert.ok(accountsHtml.includes('待还 320.50'));
+  assert.ok(accountsHtml.includes(`/transactions/new?type=transfer&to_account_id=${huabei.id}&amount=320.50`));
+
+  // 验证「去还款」预填转账页不会默认把 account_id 设为目标信用账户且包含 <optgroup>
+  const repayNewHtml = await (
+    await req(`/transactions/new?type=transfer&to_account_id=${huabei.id}&amount=320.50`, {
+      headers: { Cookie: cookieHeader },
+    })
+  ).text();
+  assert.ok(repayNewHtml.includes('<optgroup label="💰 资金账户">'));
+  assert.ok(repayNewHtml.includes('<optgroup label="💳 信用账户">'));
+  assert.ok(!repayNewHtml.includes(`name="account_id"` + `>` + `<option value="${huabei.id}" selected`));
+
+  // 编辑花呗元数据与额度（保持余额不变）
+  const editAccRes = await req(`/accounts/${huabei.id}/edit`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      _include_in_net_present: '1',
+      include_in_net: '1',
+      name: '蚂蚁花呗',
+      type: 'credit',
+      icon: '🟦',
+      currency: 'CNY',
+      institution: '支付宝官方',
+      card_no: '6688',
+      credit_limit: '15000',
+      bill_day: '2',
+      due_day: '10',
+      note: '提额后备注',
+    }),
+  });
+  assert.equal(editAccRes.status, 302);
+  const huabeiEdited = sqlite.prepare('SELECT * FROM accounts WHERE id = ?').get(Number(huabei.id)) as Record<string, unknown>;
+  assert.equal(huabeiEdited.name, '蚂蚁花呗');
+  assert.equal(huabeiEdited.credit_limit, 1500000);
+  assert.equal(huabeiEdited.initial_cents, -32050);
+  assert.equal(huabeiEdited.balance_cents, -32050);
+
+  // 2. CSV 导入自动识别「京东白条」为 credit 类型
+  const csvContent = [
+    '交易时间,交易分类,交易对方,商品说明,收/支,金额(元),收/付款方式,当前状态,交易订单号',
+    '2026-11-20 12:00:00,日用百货,京东自营,纸巾,支出,59.90,京东白条,支付成功,ORD_BT_001',
+  ].join('\n');
+  const prevRes = await req('/api/import/preview', {
+    method: 'POST',
+    headers: {
+      Cookie: cookieHeader,
+      'x-csrf-token': csrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      dataUrl: `data:text/csv;base64,${Buffer.from(csvContent, 'utf8').toString('base64')}`,
+      fileName: 'jd.csv',
+    }),
+  });
+  const prevJson = (await prevRes.json()) as { token: string };
+  await req('/api/import/commit', {
+    method: 'POST',
+    headers: {
+      Cookie: cookieHeader,
+      'x-csrf-token': csrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ token: prevJson.token, auto_create_account: true }),
+  });
+  const baitiao = sqlite
+    .prepare("SELECT type, balance_cents FROM accounts WHERE name = '京东白条'")
+    .get() as { type: string; balance_cents: number };
+  assert.equal(baitiao.type, 'credit');
+  assert.equal(baitiao.balance_cents, -5990);
+
+  // 3. 次卡生命周期：开卡联动支出 vs 存量卡补录、核销防超扣、撤销、续费、删除不删流水
+  const acc1Before = sqlite.prepare('SELECT balance_cents FROM accounts WHERE id = 1').get() as { balance_cents: number };
+  const scCreateRes = await req('/session-cards', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      name: '洗车精洗次卡',
+      icon: '🚿',
+      merchant: '途虎养车',
+      total_sessions: '10',
+      total_cost: '500.00',
+      purchase_date: '2026-11-01',
+      expires_at: '2026-11-28',
+      record_expense: '1',
+      account_id: '1',
+    }),
+  });
+  assert.equal(scCreateRes.status, 302);
+  const acc1AfterCard = sqlite.prepare('SELECT balance_cents FROM accounts WHERE id = 1').get() as { balance_cents: number };
+  assert.equal(acc1AfterCard.balance_cents, acc1Before.balance_cents - 50000);
+
+  const washCard = sqlite
+    .prepare("SELECT * FROM session_cards WHERE name = '洗车精洗次卡' ORDER BY id DESC LIMIT 1")
+    .get() as { id: number; remaining_sessions: number; total_sessions: number; purchase_txn_id: number };
+  assert.equal(washCard.remaining_sessions, 10);
+  assert.ok(washCard.purchase_txn_id > 0);
+
+  // 补录存量老卡（不勾选 record_expense，剩余次数 < 总次数）
+  await req('/session-cards', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      name: '健身私教老卡',
+      total_sessions: '20',
+      remaining_sessions: '2',
+      total_cost: '4000.00',
+      purchase_date: '2026-06-01',
+      expires_at: '2026-11-20',
+    }),
+  });
+  const acc1AfterOldCard = sqlite.prepare('SELECT balance_cents FROM accounts WHERE id = 1').get() as { balance_cents: number };
+  assert.equal(acc1AfterOldCard.balance_cents, acc1AfterCard.balance_cents, '补录存量老卡不应扣减资金账户');
+
+  // 核销 8 次 -> 剩 2 次；再尝试超扣 3 次 -> 400 拒绝且无孤儿核销日志
+  const use8 = await req(`/session-cards/${washCard.id}/use`, {
+    method: 'POST',
+    headers: {
+      Cookie: cookieHeader,
+      'x-csrf-token': csrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ count: 8, used_at: '2026-11-22', note: '朋友同行' }),
+  });
+  assert.equal(use8.status, 200);
+  const use8Json = (await use8.json()) as { ok: boolean; logId: number; card: { remaining_sessions: number } };
+  assert.equal(use8Json.card.remaining_sessions, 2);
+
+  const overUse = await req(`/session-cards/${washCard.id}/use`, {
+    method: 'POST',
+    headers: {
+      Cookie: cookieHeader,
+      'x-csrf-token': csrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ count: 3 }),
+  });
+  assert.equal(overUse.status, 400);
+  const negLogsCount = (
+    sqlite
+      .prepare('SELECT COUNT(*) AS c FROM session_card_logs WHERE card_id = ? AND delta < 0')
+      .get(washCard.id) as { c: number }
+  ).c;
+  assert.equal(negLogsCount, 1, '并发/超扣拒绝不得写入孤儿日志');
+
+  // 撤销刚才 8 次核销 -> 回补到 10 次
+  const undoRes = await req(`/session-cards/${washCard.id}/logs/${use8Json.logId}/undo`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf }),
+  });
+  assert.equal(undoRes.status, 302);
+  const washAfterUndo = sqlite.prepare('SELECT remaining_sessions FROM session_cards WHERE id = ?').get(washCard.id) as {
+    remaining_sessions: number;
+  };
+  assert.equal(washAfterUndo.remaining_sessions, 10);
+
+  // 同卡续费加次（+5次，200元，联动账户1支出）
+  const topupRes = await req(`/session-cards/${washCard.id}/topup`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      add_sessions: '5',
+      add_cost: '200.00',
+      expires_at: '2026-12-31',
+      record_expense: '1',
+      account_id: '1',
+    }),
+  });
+  assert.equal(topupRes.status, 302);
+  const washAfterTopup = sqlite
+    .prepare('SELECT total_sessions, remaining_sessions, total_cost_cents FROM session_cards WHERE id = ?')
+    .get(washCard.id) as { total_sessions: number; remaining_sessions: number; total_cost_cents: number };
+  assert.equal(washAfterTopup.total_sessions, 15);
+  assert.equal(washAfterTopup.remaining_sessions, 15);
+  assert.equal(washAfterTopup.total_cost_cents, 70000);
+
+  // 4. OpenAPI 账户分层、编辑与次卡接口
+  const tokRes = await req('/settings/api-tokens', {
+    method: 'POST',
+    headers: { Cookie: cookieHeader, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Phase1Bot' }),
+  });
+  const { token: apiToken } = (await tokRes.json()) as { token: string };
+
+  const openAccGet = await req('/api/open/accounts', { headers: { Authorization: `Bearer ${apiToken}` } });
+  const openAccJson = (await openAccGet.json()) as {
+    ok: boolean;
+    accounts: Array<{ id: number; group: string; credit: { debtCents: number } | null }>;
+    groups: { credit_debt_cents: number; prepaid_total_cents: number };
+  };
+  assert.equal(openAccJson.ok, true);
+  assert.equal(openAccJson.groups.prepaid_total_cents, 50000);
+  assert.ok(openAccJson.groups.credit_debt_cents >= 32050 + 5990);
+
+  const openPatchAcc = await req(`/api/open/accounts/${huabei.id}`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note: 'API修改备注', credit_limit_cents: 1800000 }),
+  });
+  assert.equal(openPatchAcc.status, 200);
+  const openPatchJson = (await openPatchAcc.json()) as { account: { credit_limit: number; note: string } };
+  assert.equal(openPatchJson.account.credit_limit, 1800000);
+  assert.equal(openPatchJson.account.note, 'API修改备注');
+
+  const openUseCard = await req(`/api/open/session-cards/${washCard.id}/use`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ count: 2, note: '快捷指令核销' }),
+  });
+  assert.equal(openUseCard.status, 200);
+  const openUseJson = (await openUseCard.json()) as { card: { remaining_sessions: number } };
+  assert.equal(openUseJson.card.remaining_sessions, 13);
+
+  const openCreateCard = await req('/api/open/session-cards', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: '咖啡周卡', total_sessions: 7, total_cost_cents: 9900 }),
+  });
+  assert.equal(openCreateCard.status, 201);
+  const openListCards = await req('/api/open/session-cards', {
+    headers: { Authorization: `Bearer ${apiToken}` },
+  });
+  const openListJson = (await openListCards.json()) as { ok: boolean; active_count: number; cards: Array<{ name: string }> };
+  assert.equal(openListJson.ok, true);
+  assert.ok(openListJson.cards.some((c) => c.name === '咖啡周卡'));
+
+  const detailCardRes = await req(`/session-cards/${washCard.id}`, { headers: { Cookie: cookieHeader } });
+  assert.equal(detailCardRes.status, 200);
+  const detailCardHtml = await detailCardRes.text();
+  assert.ok(detailCardHtml.includes('快捷指令核销'));
+
+  // 5. Cron 提醒：信用还款日前 3 天提醒 + 次卡临期/过期/余次不足提醒（及幂等去重）
+  const creditAlerts1 = await checkCreditAccounts(db, '2026-11-08');
+  assert.equal(creditAlerts1, 1);
+  const creditAlerts2 = await checkCreditAccounts(db, '2026-11-08');
+  assert.equal(creditAlerts2, 0, '同周期还款日提醒应幂等去重');
+
+  const scAlerts1 = await checkSessionCards(db, '2026-11-23');
+  assert.equal(scAlerts1, 2, '健身老卡应触发已过期仍有余次 + 余次不足 2 条提醒');
+  const scAlerts2 = await checkSessionCards(db, '2026-11-23');
+  assert.equal(scAlerts2, 0, '次卡提醒应幂等去重');
+
+  // 6. JSON 全库备份与恢复包含 session_cards 与 session_card_logs
+  const exportRes = await req('/export/json', { headers: { Cookie: cookieHeader } });
+  assert.equal(exportRes.status, 200);
+  const dumpJson = (await exportRes.json()) as {
+    tables: { session_cards?: unknown[]; session_card_logs?: unknown[] };
+  };
+  assert.ok((dumpJson.tables.session_cards?.length || 0) >= 2);
+  assert.ok((dumpJson.tables.session_card_logs?.length || 0) >= 3);
+
+  const restoreRes = await req('/backup/restore', {
+    method: 'POST',
+    headers: {
+      Cookie: cookieHeader,
+      'x-csrf-token': csrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ backup: dumpJson }),
+  });
+  assert.equal(restoreRes.status, 200);
+  const restoreJson = (await restoreRes.json()) as { ok: boolean; restored: { session_cards: number } };
+  assert.equal(restoreJson.ok, true);
+  assert.ok(restoreJson.restored.session_cards >= 2);
+
+  // 7. 删除次卡仅删台账与日志，保留已记账的购卡支出流水
+  const delCardRes = await req(`/session-cards/${washCard.id}/delete`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf }),
+  });
+  assert.equal(delCardRes.status, 302);
+  const purchaseTxnStillExists = sqlite
+    .prepare('SELECT id, deleted_at FROM transactions WHERE id = ?')
+    .get(washCard.purchase_txn_id) as { id: number; deleted_at: string | null };
+  assert.equal(purchaseTxnStillExists.id, washCard.purchase_txn_id);
+  assert.equal(purchaseTxnStillExists.deleted_at, null);
+
+  // 8. 首页总览与次卡详情页面可正常渲染
+  const homeAfter = await req('/', { headers: { Cookie: cookieHeader } });
+  assert.equal(homeAfter.status, 200);
+  const homeAfterHtml = await homeAfter.text();
+  assert.ok(homeAfterHtml.includes('账户分层与余额'));
+  assert.ok(homeAfterHtml.includes('有效次卡'));
 });

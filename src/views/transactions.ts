@@ -1,4 +1,5 @@
 import { PRIMARY_TXN_TYPES, TXN_TYPES, TXN_TYPE_MAP } from '../db.js';
+import { accountOptionsHtml } from '../lib/accounts.js';
 import type { AccountRow, CategoryRow } from '../types.js';
 import { esc } from '../lib/util.js';
 
@@ -120,15 +121,13 @@ export function txnFormPage({
       <div class="field">
         <label id="acc-label">账户</label>
         <select name="account_id">
-          <option value="">请选择账户</option>
-          ${form.accounts.map((a) => `<option value="${a.id}" ${Number(t.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.icon)} ${esc(a.name)}（¥${(Number(a.balance_cents) / 100).toFixed(2)}）</option>`).join('')}
+          ${accountOptionsHtml(form.accounts, { selectedId: t.account_id as string | number | undefined, emptyLabel: '请选择账户', showBalance: true })}
         </select>
       </div>
       <div class="field" data-for-type="transfer,invest_buy,invest_sell">
         <label>转入 / 投资账户</label>
         <select name="to_account_id">
-          <option value="">请选择目标账户</option>
-          ${form.accounts.map((a) => `<option value="${a.id}" ${Number(t.to_account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.icon)} ${esc(a.name)}</option>`).join('')}
+          ${accountOptionsHtml(form.accounts, { selectedId: t.to_account_id as string | number | undefined, emptyLabel: '请选择目标账户', showBalance: true })}
         </select>
       </div>
       <div class="field">

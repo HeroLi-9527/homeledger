@@ -1,26 +1,29 @@
 import { Hono } from 'hono';
 import { nowStr, todayStr } from '../db.js';
+import { normalizeAccountWrite } from '../lib/accounts.js';
+import * as fd from '../lib/formdata.js';
+import * as sc from '../lib/session-cards.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
-import { esc, fmtAmount } from '../lib/util.js';
 import type { AccountRow, CategoryRow, HonoEnv } from '../types.js';
-import { accountsPage, categoriesPage, tagsPage } from '../views/accounts.js';
-import { groupList, layout } from '../views/layout.js';
-import { bodyOf, dbOf, requireLedger, requireLogin, requireWrite, setFlash, siteMeta, takeFlash } from './helpers.js';
+import { accountDetailPage, accountsPage, categoriesPage, tagsPage } from '../views/accounts.js';
+import { layout } from '../views/layout.js';
+import { bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
 
 export const accountsRoutes = new Hono<HonoEnv>();
 
 accountsRoutes.get('/accounts', async (c) => {
-  const r = requireLogin(c);
+  const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
-  if (!ctx.ledger) return c.redirect('/');
-  const ledgerId = Number(ctx.ledger.id);
-  const [rows, ov] = await Promise.all([
+  const ledgerId = Number(ctx.ledger!.id);
+  const [rows, ov, sessionCards, expenseCats] = await Promise.all([
     db.all<AccountRow>('SELECT * FROM accounts WHERE ledger_id = ? ORDER BY is_archived, sort_order, id', ledgerId),
     txn.accountOverview(db, ledgerId),
+    sc.listSessionCards(db, ledgerId),
+    fd.flatCategories(db, ledgerId, 'expense'),
   ]);
   return c.html(
     layout({
@@ -31,7 +34,7 @@ accountsRoutes.get('/accounts', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: accountsPage({ accounts: rows, ov, csrf: c.get('csrf') || '' }),
+      body: accountsPage({ accounts: rows, ov, sessionCards, expenseCats, csrf: c.get('csrf') || '' }),
     }),
   );
 });
@@ -42,25 +45,34 @@ accountsRoutes.post('/accounts', async (c) => {
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const body = await bodyOf(c);
-  const name = String(body.name || '').trim();
-  if (!name) {
-    setFlash(c, 'error', '请填写账户名称');
-    return c.redirect('/accounts');
+  try {
+    const data = normalizeAccountWrite(body, { mode: 'create', apiMode: false });
+    await db.run(
+      `INSERT INTO accounts
+       (ledger_id, name, type, icon, currency, initial_cents, balance_cents, credit_limit, bill_day, due_day,
+        institution, card_no, note, include_in_net, sort_order, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      Number(ctx.ledger!.id),
+      data.name,
+      data.type,
+      data.icon,
+      data.currency,
+      data.initial_cents ?? 0,
+      data.balance_cents ?? 0,
+      data.credit_limit,
+      data.bill_day,
+      data.due_day,
+      data.institution,
+      data.card_no,
+      data.note,
+      data.include_in_net,
+      data.sort_order,
+      nowStr(),
+    );
+    setFlash(c, 'success', '账户已创建');
+  } catch (e) {
+    setFlash(c, 'error', toPublicError(e));
   }
-  const opening = u.parseAmountToCents(body.balance);
-  await db.run(
-    'INSERT INTO accounts (ledger_id, name, type, icon, currency, initial_cents, balance_cents, include_in_net, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
-    Number(ctx.ledger!.id),
-    name.slice(0, 30),
-    String(body.type || 'cash'),
-    String(body.icon || '💳'),
-    String(body.currency || 'CNY'),
-    opening,
-    opening,
-    body.include_in_net ? 1 : 0,
-    nowStr(),
-  );
-  setFlash(c, 'success', '账户已创建');
   return c.redirect('/accounts');
 });
 
@@ -192,17 +204,57 @@ accountsRoutes.get('/accounts/:id', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: `<div class="card mb16">
-  <div class="card-head"><b>${esc(acc.icon)} ${esc(acc.name)}</b><span class="amount bold">当前余额 ${fmtAmount(acc.balance_cents)}</span></div>
-  <form method="post" action="/accounts/${id}/adjust" class="row wrap">
-    <input type="hidden" name="_csrf" value="${esc(c.get('csrf') || '')}">
-    <input name="actual_balance" inputmode="decimal" placeholder="校准到（元）" value="${(Number(acc.balance_cents) / 100).toFixed(2)}" style="max-width:200px">
-    <button class="btn btn-primary" type="submit">校准余额</button>
-  </form>
-</div>
-<div class="card">${groupList(groups)}</div>`,
+      body: accountDetailPage({ acc, groups, csrf: c.get('csrf') || '' }),
     }),
   );
+});
+
+accountsRoutes.get('/accounts/:id/edit', async (c) => {
+  const r = requireLedger(c);
+  if (r) return r;
+  return c.redirect(`/accounts/${Number(c.req.param('id'))}#edit`);
+});
+
+accountsRoutes.post('/accounts/:id/edit', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ledgerId = Number(c.get('ctx').ledger!.id);
+  const id = Number(c.req.param('id'));
+  const existing = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, ledgerId);
+  if (!existing) {
+    setFlash(c, 'error', '账户不存在');
+    return c.redirect('/accounts');
+  }
+  const body = await bodyOf(c);
+  try {
+    const data = normalizeAccountWrite(body, { mode: 'edit', existing, apiMode: false });
+    await db.run(
+      `UPDATE accounts
+       SET name = ?, type = ?, icon = ?, currency = ?, include_in_net = ?, sort_order = ?,
+           institution = ?, card_no = ?, note = ?, credit_limit = ?, bill_day = ?, due_day = ?
+       WHERE id = ? AND ledger_id = ?`,
+      data.name,
+      data.type,
+      data.icon,
+      data.currency,
+      data.include_in_net,
+      data.sort_order,
+      data.institution,
+      data.card_no,
+      data.note,
+      data.credit_limit,
+      data.bill_day,
+      data.due_day,
+      id,
+      ledgerId,
+    );
+    setFlash(c, 'success', '账户信息已更新');
+    return c.redirect(`/accounts/${id}`);
+  } catch (e) {
+    setFlash(c, 'error', toPublicError(e));
+    return c.redirect(`/accounts/${id}#edit`);
+  }
 });
 
 accountsRoutes.get('/categories', async (c) => {

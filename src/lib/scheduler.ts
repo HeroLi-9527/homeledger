@@ -1,7 +1,9 @@
 import { balanceDeltaStmts, nowStr, todayStr } from '../db.js';
-import type { BatchStatement, Db, Env } from '../types.js';
+import type { AccountRow, BatchStatement, Db, Env, SessionCardRow } from '../types.js';
+import { nextMonthlyDay } from './accounts.js';
 import { deleteKeysFromR2 } from './attachments.js';
 import { ledgerWriterIds, notify } from './auth.js';
+import { decorateCard } from './session-cards.js';
 import * as subs from './subscriptions.js';
 import { resolveRate } from './txn.js';
 import { pad, toBase } from './util.js';
@@ -527,6 +529,93 @@ export async function checkGoals(db: Db): Promise<number> {
   return n;
 }
 
+export async function checkCreditAccounts(db: Db, today = todayStr()): Promise<number> {
+  const rows = await db.all<
+    Pick<AccountRow, 'id' | 'ledger_id' | 'name' | 'balance_cents' | 'due_day'>
+  >('SELECT id, ledger_id, name, balance_cents, due_day FROM accounts WHERE is_archived = 0 AND due_day BETWEEN 1 AND 31 AND balance_cents < 0');
+  let n = 0;
+  for (const acc of rows) {
+    const due = nextMonthlyDay(acc.due_day, today);
+    if (!due || due.daysUntil > 3) continue;
+    const debt = Math.abs(Number(acc.balance_cents));
+    const dedupeKey = `credit-due:${acc.id}:${due.cycleKey}`;
+    const title = due.daysUntil === 0 ? `今日还款日：${acc.name}` : `即将到还款日：${acc.name}`;
+    const body = `当前待还 ${(debt / 100).toFixed(2)}，还款日 ${due.date}${due.daysUntil === 0 ? '（今日到期）' : `（还有 ${due.daysUntil} 天）`}`;
+    let sent = false;
+    for (const uid of await ledgerWriterIds(db, acc.ledger_id)) {
+      if (
+        await notify(db, uid, {
+          kind: due.daysUntil === 0 ? 'danger' : 'warn',
+          ledgerId: acc.ledger_id,
+          title,
+          body,
+          link: `/accounts/${acc.id}`,
+          dedupeKey,
+        })
+      ) {
+        sent = true;
+      }
+    }
+    if (sent) n++;
+  }
+  return n;
+}
+
+export async function checkSessionCards(db: Db, today = todayStr()): Promise<number> {
+  const rows = await db.all<SessionCardRow>(
+    'SELECT * FROM session_cards WHERE is_archived = 0 AND remaining_sessions > 0',
+  );
+  let n = 0;
+  for (const raw of rows) {
+    const c = decorateCard(raw, today);
+    const alerts: Array<{ kind: 'danger' | 'warn' | 'info'; title: string; body: string; dedupeKey: string }> = [];
+    if (c.isExpiringSoon && c.expires_at) {
+      alerts.push({
+        kind: c.daysUntilExpiry === 0 ? 'danger' : 'warn',
+        title: c.daysUntilExpiry === 0 ? `次卡今日到期：${c.name}` : `次卡即将到期：${c.name}`,
+        body: `剩余 ${c.remaining_sessions}/${c.total_sessions} 次，有效期至 ${c.expires_at}`,
+        dedupeKey: `sc-expiring:${c.id}:${c.expires_at}`,
+      });
+    } else if (c.isExpired && c.expires_at) {
+      alerts.push({
+        kind: 'danger',
+        title: `次卡已过期仍有余次：${c.name}`,
+        body: `剩余 ${c.remaining_sessions}/${c.total_sessions} 次，已于 ${c.expires_at} 到期`,
+        dedupeKey: `sc-expired:${c.id}:${c.expires_at}`,
+      });
+    }
+    if (c.isLowSessions) {
+      alerts.push({
+        kind: 'warn',
+        title: `次卡余次不足：${c.name}`,
+        body: `当前仅剩 ${c.remaining_sessions}/${c.total_sessions} 次${c.expires_at ? `，有效期至 ${c.expires_at}` : ''}`,
+        dedupeKey: `sc-low:${c.id}:${c.total_sessions}`,
+      });
+    }
+    if (!alerts.length) continue;
+    const writers = await ledgerWriterIds(db, c.ledger_id);
+    for (const a of alerts) {
+      let sent = false;
+      for (const uid of writers) {
+        if (
+          await notify(db, uid, {
+            kind: a.kind,
+            ledgerId: c.ledger_id,
+            title: a.title,
+            body: a.body,
+            link: `/session-cards/${c.id}`,
+            dedupeKey: a.dedupeKey,
+          })
+        ) {
+          sent = true;
+        }
+      }
+      if (sent) n++;
+    }
+  }
+  return n;
+}
+
 export async function runSubscriptions(db: Db, today = todayStr()) {
   const r = await subs.runDue(db, today);
   const reminded = await subs.checkReminders(db, today);
@@ -601,6 +690,8 @@ export async function runScheduled(db: Db, env?: Pick<Env, 'ATTACHMENTS'>) {
     budgets: 0,
     debts: 0,
     goals: 0,
+    creditAccounts: 0,
+    sessionCards: 0,
     subscriptions: { charged: 0, renewed: 0, notified: 0 },
   };
   try {
@@ -627,6 +718,16 @@ export async function runScheduled(db: Db, env?: Pick<Env, 'ATTACHMENTS'>) {
     r.goals = await checkGoals(db);
   } catch (e) {
     console.error('[scheduler] 目标检查失败:', e);
+  }
+  try {
+    r.creditAccounts = await checkCreditAccounts(db);
+  } catch (e) {
+    console.error('[scheduler] 信用账户还款提醒失败:', e);
+  }
+  try {
+    r.sessionCards = await checkSessionCards(db);
+  } catch (e) {
+    console.error('[scheduler] 次卡提醒失败:', e);
   }
   await cleanup(db, env);
   return r;

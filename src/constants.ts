@@ -1,8 +1,18 @@
+export type AccountGroupKey = 'funds' | 'prepaid' | 'credit';
+
+export interface AccountGroupMeta {
+  key: AccountGroupKey;
+  label: string;
+  icon: string;
+  desc: string;
+}
+
 export interface AccountTypeMeta {
   key: string;
   label: string;
   icon: string;
   nature: 'asset' | 'liability';
+  group: AccountGroupKey;
 }
 
 export interface TxnTypeMeta {
@@ -16,17 +26,23 @@ export interface TxnTypeMeta {
 
 export type CategorySeedGroup = [topName: string, topIcon: string, color: string, children: string[]];
 
+export const ACCOUNT_GROUPS: AccountGroupMeta[] = [
+  { key: 'funds', label: '资金账户', icon: '💰', desc: '现金、储蓄卡、微信/支付宝、投资与往来' },
+  { key: 'prepaid', label: '充值账户', icon: '🎟️', desc: '储值预付卡与按次核销次卡' },
+  { key: 'credit', label: '信用账户', icon: '💳', desc: '信用卡、花呗、白条、应付与贷款' },
+];
+
 export const ACCOUNT_TYPES: AccountTypeMeta[] = [
-  { key: 'cash', label: '现金', icon: '💵', nature: 'asset' },
-  { key: 'debit', label: '储蓄卡', icon: '🏦', nature: 'asset' },
-  { key: 'credit', label: '信用卡', icon: '💳', nature: 'liability' },
-  { key: 'virtual', label: '虚拟账户（支付宝/微信）', icon: '📱', nature: 'asset' },
-  { key: 'prepaid', label: '储值卡/预付', icon: '🎫', nature: 'asset' },
-  { key: 'investment', label: '投资账户', icon: '📈', nature: 'asset' },
-  { key: 'receivable', label: '应收款（别人欠我）', icon: '📥', nature: 'asset' },
-  { key: 'payable', label: '应付款（我欠别人）', icon: '📤', nature: 'liability' },
-  { key: 'loan', label: '贷款/负债', icon: '🏚️', nature: 'liability' },
-  { key: 'other', label: '其他', icon: '📦', nature: 'asset' },
+  { key: 'cash', label: '现金', icon: '💵', nature: 'asset', group: 'funds' },
+  { key: 'debit', label: '储蓄卡', icon: '🏦', nature: 'asset', group: 'funds' },
+  { key: 'credit', label: '信用卡 / 花呗 / 白条', icon: '💳', nature: 'liability', group: 'credit' },
+  { key: 'virtual', label: '虚拟账户（支付宝/微信）', icon: '📱', nature: 'asset', group: 'funds' },
+  { key: 'prepaid', label: '储值卡/预付', icon: '🎫', nature: 'asset', group: 'prepaid' },
+  { key: 'investment', label: '投资账户', icon: '📈', nature: 'asset', group: 'funds' },
+  { key: 'receivable', label: '应收款（别人欠我）', icon: '📥', nature: 'asset', group: 'funds' },
+  { key: 'payable', label: '应付款（我欠别人）', icon: '📤', nature: 'liability', group: 'credit' },
+  { key: 'loan', label: '贷款/负债', icon: '🏚️', nature: 'liability', group: 'credit' },
+  { key: 'other', label: '其他', icon: '📦', nature: 'asset', group: 'funds' },
 ];
 
 export const TXN_TYPES: TxnTypeMeta[] = [
@@ -79,3 +95,11 @@ export const INCOME_SEED: CategorySeedGroup[] = [
 export const ACCOUNT_TYPE_MAP: Record<string, AccountTypeMeta> = Object.fromEntries(ACCOUNT_TYPES.map((t) => [t.key, t]));
 export const TXN_TYPE_MAP: Record<string, TxnTypeMeta> = Object.fromEntries(TXN_TYPES.map((t) => [t.key, t]));
 export const PRIMARY_TXN_TYPES = ['expense', 'income', 'transfer', 'lend'] as const;
+
+export function accountGroupOf(type?: string | null): AccountGroupKey {
+  return ACCOUNT_TYPE_MAP[type || '']?.group || 'funds';
+}
+
+export function isCreditGroupType(type?: string | null): boolean {
+  return accountGroupOf(type) === 'credit';
+}

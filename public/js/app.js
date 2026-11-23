@@ -890,12 +890,59 @@
     }
   }
 
+  /* ============================ 账户与次卡表单 ============================ */
+  function initAccountForms() {
+    $$('form[data-account-form]').forEach((form) => {
+      const typeSel = $('select[name="type"]', form);
+      const creditBox = $('[data-credit-fields]', form);
+      const balLabel = $('[data-balance-label]', form);
+      const sync = () => {
+        if (!typeSel) return;
+        const isCredit = ['credit', 'payable', 'loan'].includes(typeSel.value);
+        if (creditBox) creditBox.classList.toggle('hidden', !isCredit);
+        if (balLabel) balLabel.textContent = isCredit ? '当前待还金额（元，正数录入，无欠款填 0）' : '初始余额（元）';
+      };
+      sync();
+      if (typeSel) typeSel.addEventListener('change', sync);
+    });
+
+    $$('[data-credit-preset]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const form = $('form[data-account-form]');
+        if (!form) return;
+        const typeSel = $('select[name="type"]', form);
+        const nameIn = $('input[name="name"]', form);
+        const iconIn = $('input[name="icon"]', form);
+        const instIn = $('input[name="institution"]', form);
+        if (typeSel) {
+          typeSel.value = 'credit';
+          typeSel.dispatchEvent(new Event('change'));
+        }
+        if (nameIn) nameIn.value = btn.dataset.name || '';
+        if (iconIn) iconIn.value = btn.dataset.icon || '💳';
+        if (instIn) instIn.value = btn.dataset.inst || '';
+        if (nameIn) nameIn.focus();
+      });
+    });
+
+    $$('form[data-session-card-form]').forEach((form) => {
+      const chk = $('input[name="record_expense"]', form);
+      const box = $('[data-sc-expense-fields]', form);
+      const sync = () => {
+        if (box && chk) box.classList.toggle('hidden', !chk.checked);
+      };
+      sync();
+      if (chk) chk.addEventListener('change', sync);
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     initThemeToggle();
     initMobileNav();
     initUserMenu();
     initAvatarUpload();
     initTxnForm();
+    initAccountForms();
     initAiPage();
     initImportPage();
     initSettings();

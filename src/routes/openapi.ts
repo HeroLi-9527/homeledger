@@ -1,15 +1,17 @@
 import type { Context } from 'hono';
 import { Hono } from 'hono';
-import { nowStr, todayStr } from '../db.js';
+import { accountGroupOf, isCreditGroupType, nowStr, todayStr } from '../db.js';
+import { creditMetrics, groupAccountsSummary, normalizeAccountWrite } from '../lib/accounts.js';
 import { analyzeBill } from '../lib/ai.js';
 import * as attach from '../lib/attachments.js';
 import * as auth from '../lib/auth.js';
 import * as fd from '../lib/formdata.js';
 import { budgetPeriodRange, budgetUsedInRange, effectiveBudget, tzRefDate, type BudgetRow } from '../lib/scheduler.js';
+import * as sc from '../lib/session-cards.js';
 import { decorate as decorateSub, overview as subsOverview, type SubscriptionRow } from '../lib/subscriptions.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
-import type { HonoEnv, Role } from '../types.js';
+import type { AccountRow, HonoEnv, Role } from '../types.js';
 import { dbOf, envOf, toPublicError } from './helpers.js';
 
 export const openapiRoutes = new Hono<HonoEnv>();
@@ -314,37 +316,231 @@ openapiRoutes.get('/attachments/:id', async (c) => {
   return new Response(found.obj.body, { headers });
 });
 
+function enrichAccount(a: AccountRow) {
+  return {
+    ...a,
+    group: accountGroupOf(a.type),
+    credit: isCreditGroupType(a.type) ? creditMetrics(a) : null,
+  };
+}
+
 openapiRoutes.get('/accounts', async (c) => {
   const oa = c.get('openAuth')!;
   const [accounts, ov] = await Promise.all([
     fd.accounts(dbOf(c), oa.ledgerId),
     txn.accountOverview(dbOf(c), oa.ledgerId),
   ]);
-  return c.json({ ok: true, accounts, assets: ov.assets, liabilities: ov.liabilities, net: ov.net });
+  const summary = groupAccountsSummary(accounts);
+  return c.json({
+    ok: true,
+    accounts: accounts.map(enrichAccount),
+    assets: ov.assets,
+    liabilities: ov.liabilities,
+    net: ov.net,
+    groups: {
+      funds_total_cents: summary.fundsTotalCents,
+      prepaid_total_cents: summary.prepaidTotalCents,
+      credit_debt_cents: summary.creditDebtCents,
+      credit_limit_cents: summary.creditLimitCents,
+      credit_available_cents: summary.creditAvailableCents,
+    },
+  });
 });
 
 openapiRoutes.post('/accounts', async (c) => {
   const w = requireWriteApi(c);
   if (w) return w;
   const oa = c.get('openAuth')!;
-  const body = (await c.req.json()) as Record<string, unknown>;
-  const name = String(body.name || '').trim().slice(0, 30);
-  if (!name) return c.json({ ok: false, error: '账户名称不能为空' }, 400);
-  const opening =
-    body.initial_cents != null ? Math.round(Number(body.initial_cents)) : u.parseAmountToCents(body.balance);
-  const res = await dbOf(c).run(
-    'INSERT INTO accounts (ledger_id, name, type, icon, currency, initial_cents, balance_cents, include_in_net, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
-    oa.ledgerId,
-    name,
-    String(body.type || 'cash'),
-    String(body.icon || '💳'),
-    String(body.currency || 'CNY'),
-    opening,
-    opening,
-    body.include_in_net === false ? 0 : 1,
-    nowStr(),
-  );
-  return c.json({ ok: true, id: res.lastInsertRowid }, 201);
+  const db = dbOf(c);
+  try {
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const data = normalizeAccountWrite(body, { mode: 'create', apiMode: true });
+    const res = await db.run(
+      `INSERT INTO accounts
+       (ledger_id, name, type, icon, currency, initial_cents, balance_cents, credit_limit, bill_day, due_day,
+        institution, card_no, note, include_in_net, sort_order, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      oa.ledgerId,
+      data.name,
+      data.type,
+      data.icon,
+      data.currency,
+      data.initial_cents ?? 0,
+      data.balance_cents ?? 0,
+      data.credit_limit,
+      data.bill_day,
+      data.due_day,
+      data.institution,
+      data.card_no,
+      data.note,
+      data.include_in_net,
+      data.sort_order,
+      nowStr(),
+    );
+    const created = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', res.lastInsertRowid, oa.ledgerId);
+    return c.json({ ok: true, id: res.lastInsertRowid, account: created ? enrichAccount(created) : null }, 201);
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+});
+
+async function handleApiAccountUpdate(c: Context<HonoEnv>) {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = Number(c.req.param('id'));
+  try {
+    const existing = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+    if (!existing) return c.json({ ok: false, error: '账户不存在' }, 404);
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const data = normalizeAccountWrite(body, { mode: 'edit', existing, apiMode: true });
+    await db.run(
+      `UPDATE accounts
+       SET name = ?, type = ?, icon = ?, currency = ?, include_in_net = ?, sort_order = ?,
+           institution = ?, card_no = ?, note = ?, credit_limit = ?, bill_day = ?, due_day = ?
+       WHERE id = ? AND ledger_id = ?`,
+      data.name,
+      data.type,
+      data.icon,
+      data.currency,
+      data.include_in_net,
+      data.sort_order,
+      data.institution,
+      data.card_no,
+      data.note,
+      data.credit_limit,
+      data.bill_day,
+      data.due_day,
+      id,
+      oa.ledgerId,
+    );
+    const updated = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+    return c.json({ ok: true, id, account: updated ? enrichAccount(updated) : null });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+}
+
+openapiRoutes.put('/accounts/:id', handleApiAccountUpdate);
+openapiRoutes.patch('/accounts/:id', handleApiAccountUpdate);
+
+openapiRoutes.get('/session-cards', async (c) => {
+  const oa = c.get('openAuth')!;
+  const includeArchived = c.req.query('include_archived') === '1' || c.req.query('include_archived') === 'true';
+  const res = await sc.listSessionCards(dbOf(c), oa.ledgerId);
+  return c.json({
+    ok: true,
+    active_count: res.activeCount,
+    total_remaining: res.totalRemaining,
+    cards: includeArchived ? res.all : res.active,
+  });
+});
+
+openapiRoutes.get('/session-cards/:id', async (c) => {
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = Number(c.req.param('id'));
+  const card = await sc.getSessionCard(db, id, oa.ledgerId);
+  if (!card) return c.json({ ok: false, error: '次卡不存在' }, 404);
+  const logs = await sc.listCardLogs(db, id, oa.ledgerId);
+  return c.json({ ok: true, card, logs });
+});
+
+openapiRoutes.post('/session-cards', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  try {
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const totalCostCents = sc.parseCardCostCents(body, 'total_cost_cents', 'total_cost');
+    const recordExpense =
+      body.record_expense !== undefined
+        ? Boolean(body.record_expense && body.record_expense !== '0' && body.record_expense !== 'false')
+        : Boolean(body.account_id);
+    const id = await sc.createSessionCard(db, oa.ledgerId, oa.userId, {
+      name: String(body.name || ''),
+      icon: body.icon ? String(body.icon) : '🎟️',
+      merchant: body.merchant != null ? String(body.merchant) : null,
+      total_sessions: Number(body.total_sessions),
+      remaining_sessions: body.remaining_sessions != null ? Number(body.remaining_sessions) : null,
+      total_cost_cents: totalCostCents,
+      currency: body.currency ? String(body.currency) : 'CNY',
+      purchase_date: body.purchase_date ? String(body.purchase_date) : undefined,
+      expires_at: body.expires_at != null ? String(body.expires_at) : null,
+      note: body.note != null ? String(body.note) : null,
+      record_expense: recordExpense,
+      account_id: body.account_id != null ? Number(body.account_id) : null,
+      category_id: body.category_id != null ? Number(body.category_id) : null,
+    });
+    const card = await sc.getSessionCard(db, id, oa.ledgerId);
+    return c.json({ ok: true, id, card }, 201);
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+});
+
+openapiRoutes.post('/session-cards/:id/use', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = Number(c.req.param('id'));
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const count = body.count != null ? Number(body.count) : 1;
+    const res = await sc.useSessionCard(db, id, oa.ledgerId, oa.userId, {
+      count,
+      used_at: body.used_at ? String(body.used_at) : undefined,
+      note: body.note != null ? String(body.note) : null,
+    });
+    return c.json({ ok: true, ...res });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+});
+
+openapiRoutes.post('/session-cards/:id/topup', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = Number(c.req.param('id'));
+  try {
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const addCostCents = sc.parseCardCostCents(body, 'add_cost_cents', 'add_cost');
+    const recordExpense =
+      body.record_expense !== undefined
+        ? Boolean(body.record_expense && body.record_expense !== '0' && body.record_expense !== 'false')
+        : Boolean(body.account_id);
+    const card = await sc.topUpSessionCard(db, id, oa.ledgerId, oa.userId, {
+      add_sessions: Number(body.add_sessions),
+      add_cost_cents: addCostCents,
+      topup_date: body.topup_date ? String(body.topup_date) : undefined,
+      expires_at: body.expires_at !== undefined ? (body.expires_at == null ? null : String(body.expires_at)) : undefined,
+      note: body.note != null ? String(body.note) : null,
+      record_expense: recordExpense,
+      account_id: body.account_id != null ? Number(body.account_id) : null,
+      category_id: body.category_id != null ? Number(body.category_id) : null,
+    });
+    return c.json({ ok: true, card });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+});
+
+openapiRoutes.post('/session-cards/:id/logs/:logId/undo', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  try {
+    const res = await sc.undoSessionCardLog(db, Number(c.req.param('id')), Number(c.req.param('logId')), oa.ledgerId);
+    return c.json({ ok: true, ...res });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
 });
 
 openapiRoutes.get('/categories', async (c) => {

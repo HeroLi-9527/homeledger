@@ -12,6 +12,7 @@ import { bodyOf, checkCsrf, cookie, csrfFail, getSessionSecret, requireLogin, to
 import { openapiRoutes } from './routes/openapi.js';
 import { planningRoutes } from './routes/planning.js';
 import { reportsRoutes } from './routes/reports.js';
+import { sessionCardsRoutes } from './routes/session-cards.js';
 import { subscriptionsRoutes } from './routes/subscriptions.js';
 import { txnRoutes } from './routes/transactions.js';
 import type { Env, HonoEnv } from './types.js';
@@ -150,6 +151,7 @@ app.route('/', authRoutes);
 app.route('/', dashboardRoutes);
 app.route('/', txnRoutes);
 app.route('/', accountsRoutes);
+app.route('/', sessionCardsRoutes);
 app.route('/', planningRoutes);
 app.route('/', subscriptionsRoutes);
 app.route('/', aiRoutes);

@@ -1,6 +1,8 @@
+import { isCreditGroupType } from '../db.js';
+import { groupAccountsSummary } from '../lib/accounts.js';
 import { donutChart, donutLegend, progressBar } from '../lib/charts.js';
 import type { TxnDateGroup } from '../lib/txn.js';
-import { addMonths, compactMoney, esc, fmtAmount } from '../lib/util.js';
+import { addMonths, compactMoney, esc, fmtAmount, money } from '../lib/util.js';
 import type { AccountRow } from '../types.js';
 import { groupList } from './layout.js';
 
@@ -16,6 +18,7 @@ export interface DashboardViewData {
   goals: Array<{ id: number; name: string; icon: string; saved_cents: number; target_cents: number }>;
   pendingReimburse: { count: number; sum: number };
   subs: { monthlyTotal: number; live: unknown[] };
+  sessionCards: { activeCount: number; totalRemaining: number };
   aiReady: boolean;
   month: string;
   monthLabel: string;
@@ -104,12 +107,27 @@ export function dashboardPage(d: DashboardViewData): string {
   </div>
   <div class="grid" style="align-content:start">
     <div class="card">
-      <div class="card-head"><b>主要账户余额</b><a class="btn btn-sm btn-ghost" href="/accounts">管理 →</a></div>
+      <div class="card-head"><b>账户分层与余额</b><a class="btn btn-sm btn-ghost" href="/accounts">管理 →</a></div>
+      ${(() => {
+        const g = groupAccountsSummary(d.overview.accounts);
+        return `<div class="tiny muted mb8" style="padding-bottom:8px;border-bottom:1px solid var(--border)">
+  <div class="between" style="padding:2px 0"><span>💰 资金账户</span><span class="amount bold">${money(g.fundsTotalCents)}</span></div>
+  <div class="between" style="padding:2px 0"><span>🎟️ 充值账户</span><span class="amount bold">${money(g.prepaidTotalCents)}</span></div>
+  <div class="between" style="padding:2px 0"><span>💳 信用待还</span><span class="amount bold ${g.creditDebtCents > 0 ? 'expense' : ''}">${money(g.creditDebtCents)}</span></div>
+  ${
+    d.sessionCards.activeCount > 0
+      ? `<div class="between" style="padding:2px 0"><a href="/accounts#session-cards">🎟️ 有效次卡（${d.sessionCards.activeCount} 张）</a><a href="/accounts#session-cards" class="amount bold">余 ${d.sessionCards.totalRemaining} 次</a></div>`
+      : ''
+  }
+</div>`;
+      })()}
       ${d.overview.accounts
         .slice(0, 5)
-        .map(
-          (a) => `<div class="between"><span>${esc(a.icon || '💳')} ${esc(a.name)}</span><span class="amount bold">${fmtAmount(a.balance_cents)}</span></div>`,
-        )
+        .map((a) => {
+          const b = Number(a.balance_cents || 0);
+          const isDebt = isCreditGroupType(a.type) && b < 0;
+          return `<div class="between"><span>${esc(a.icon || '💳')} ${esc(a.name)}</span><span class="amount bold ${isDebt ? 'expense' : ''}">${isDebt ? `待还 ${fmtAmount(Math.abs(b))}` : fmtAmount(b)}</span></div>`;
+        })
         .join('') || '<div class="empty">暂无账户</div>'}
     </div>
     <div class="card">

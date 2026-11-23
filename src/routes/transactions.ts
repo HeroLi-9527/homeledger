@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
-import { todayStr, TXN_TYPE_MAP } from '../db.js';
+import { isCreditGroupType, todayStr, TXN_TYPE_MAP } from '../db.js';
+import { accountOptionsHtml } from '../lib/accounts.js';
 import * as fd from '../lib/formdata.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
@@ -112,7 +113,7 @@ txnRoutes.get('/transactions', async (c) => {
     <div class="row wrap">
       <span class="small">已选 <b id="bulk-count">0</b> 笔：</span>
       <button class="btn btn-sm btn-danger" type="submit">批量删除</button>
-      <select name="account_id" style="width:auto"><option value="">报销入账账户…</option>${form.accounts.map((a) => `<option value="${a.id}">${esc(a.icon || '')} ${esc(a.name)}</option>`).join('')}</select>
+      <select name="account_id" style="width:auto">${accountOptionsHtml(form.accounts, { emptyLabel: '报销入账账户…' })}</select>
       <button class="btn btn-sm btn-primary" type="submit" formaction="/transactions/bulk-reimburse">报销入账</button>
     </div>
   </div>
@@ -133,13 +134,21 @@ txnRoutes.get('/transactions/new', async (c) => {
   const q = c.req.query();
   const type = TXN_TYPE_MAP[q.type] ? q.type : 'expense';
   const form = await fd.txFormData(db, ledgerId);
+  const toAccountId = q.to_account_id ? String(q.to_account_id) : '';
+  let defaultAccountId = q.account_id || (form.accounts[0] ? String(form.accounts[0].id) : '');
+  if (!q.account_id && type === 'transfer' && toAccountId) {
+    const fallback =
+      form.accounts.find((a) => String(a.id) !== toAccountId && !isCreditGroupType(a.type)) ||
+      form.accounts.find((a) => String(a.id) !== toAccountId);
+    defaultAccountId = fallback ? String(fallback.id) : '';
+  }
   const prefill = {
     type,
     amount: q.amount || '',
     txn_date: q.date || todayStr(),
     category_id: q.category_id || '',
-    account_id: q.account_id || (form.accounts[0] ? form.accounts[0].id : ''),
-    to_account_id: '',
+    account_id: defaultAccountId,
+    to_account_id: toAccountId,
     note: q.note || '',
     merchant: '',
     tags: '',

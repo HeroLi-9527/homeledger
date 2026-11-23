@@ -190,3 +190,35 @@ export interface TxnRow {
   is_income?: boolean;
   is_expense?: boolean;
 }
+
+export interface SessionCardRow {
+  id: number;
+  ledger_id: number;
+  name: string;
+  icon: string;
+  merchant: string | null;
+  total_sessions: number;
+  remaining_sessions: number;
+  total_cost_cents: number;
+  currency: string;
+  purchase_date: string;
+  expires_at: string | null;
+  purchase_txn_id: number | null;
+  is_archived: number;
+  note: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SessionCardLogRow {
+  id: number;
+  card_id: number;
+  ledger_id: number;
+  user_id: number;
+  delta: number;
+  used_at: string;
+  note: string | null;
+  txn_id: number | null;
+  created_at: string;
+  member_name?: string | null;
+}

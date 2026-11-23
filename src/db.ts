@@ -1,7 +1,27 @@
-import { ACCOUNT_TYPES, ACCOUNT_TYPE_MAP, TXN_TYPES, TXN_TYPE_MAP, PRIMARY_TXN_TYPES } from './constants.js';
+import {
+  ACCOUNT_GROUPS,
+  ACCOUNT_TYPES,
+  ACCOUNT_TYPE_MAP,
+  TXN_TYPES,
+  TXN_TYPE_MAP,
+  PRIMARY_TXN_TYPES,
+  accountGroupOf,
+  isCreditGroupType,
+  type AccountGroupKey,
+} from './constants.js';
 import type { BatchStatement, Db, Env, Role } from './types.js';
 
-export { ACCOUNT_TYPES, ACCOUNT_TYPE_MAP, TXN_TYPES, TXN_TYPE_MAP, PRIMARY_TXN_TYPES };
+export {
+  ACCOUNT_GROUPS,
+  ACCOUNT_TYPES,
+  ACCOUNT_TYPE_MAP,
+  TXN_TYPES,
+  TXN_TYPE_MAP,
+  PRIMARY_TXN_TYPES,
+  accountGroupOf,
+  isCreditGroupType,
+  type AccountGroupKey,
+};
 
 let TZ = 'Asia/Shanghai';
 export function setTimezone(tz: string): void {

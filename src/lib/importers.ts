@@ -341,8 +341,16 @@ async function ensureAccount(
   if (!name) return null;
   const id = resolveAccount(name);
   if (id) return id;
-  const type = /信用/.test(name) ? 'credit' : /支付宝|微信|京东|云闪付/.test(name) ? 'virtual' : /银行|卡/.test(name) ? 'debit' : 'other';
-  const icon = type === 'credit' ? '💳' : type === 'virtual' ? '📱' : type === 'debit' ? '🏦' : '📦';
+  const type = /信用|花呗|白条|分期/.test(name)
+    ? 'credit'
+    : /储值|充值|预付|会员卡|礼品卡/.test(name)
+      ? 'prepaid'
+      : /支付宝|微信|京东|云闪付/.test(name)
+        ? 'virtual'
+        : /银行|卡/.test(name)
+          ? 'debit'
+          : 'other';
+  const icon = type === 'credit' ? '💳' : type === 'prepaid' ? '🎟️' : type === 'virtual' ? '📱' : type === 'debit' ? '🏦' : '📦';
   const r = await db.run(
     `INSERT INTO accounts (ledger_id, name, type, icon, currency, initial_cents, balance_cents, sort_order, note, created_at)
      VALUES (?,?,?,?,?,0,0,999,?,?)`,

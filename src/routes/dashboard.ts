@@ -1,10 +1,12 @@
 import { Hono } from 'hono';
 import { todayStr } from '../db.js';
+import { accountOptionsHtml } from '../lib/accounts.js';
 import { isAiUsable } from '../lib/ai.js';
 import { attachCounts } from '../lib/attachments.js';
 import { barChart, heatmapChart } from '../lib/charts.js';
 import * as fd from '../lib/formdata.js';
 import { budgetPeriodRange, budgetUsedInRange, effectiveBudget, type BudgetRow } from '../lib/scheduler.js';
+import { listSessionCards } from '../lib/session-cards.js';
 import { overview as subsOverview } from '../lib/subscriptions.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
@@ -60,6 +62,7 @@ dashboardRoutes.get('/', async (c) => {
     pendingReimburse,
     aiReady,
     subs,
+    sessionCards,
   ] = await Promise.all([
     txn.summary(db, ledgerId, `${month}-01`, u.monthEnd(month)),
     txn.summary(db, ledgerId, `${prevMonth}-01`, u.monthEnd(prevMonth)),
@@ -87,6 +90,7 @@ dashboardRoutes.get('/', async (c) => {
     ),
     isAiUsable(db),
     subsOverview(db, ledgerId),
+    listSessionCards(db, ledgerId),
   ]);
 
   const recent = recentRes.rows;
@@ -146,6 +150,7 @@ dashboardRoutes.get('/', async (c) => {
         goals,
         pendingReimburse: { count: Number(pendingReimburse?.c || 0), sum: Number(pendingReimburse?.s || 0) },
         subs,
+        sessionCards: { activeCount: sessionCards.activeCount, totalRemaining: sessionCards.totalRemaining },
         aiReady,
         month,
         monthLabel: u.monthLabel(month),
@@ -261,7 +266,7 @@ dashboardRoutes.get('/search', async (c) => {
   <input name="q" value="${esc(f.keyword)}" placeholder="关键词：商家 / 备注 / 分类">
   <select name="type"><option value="">全部类型</option>${['expense', 'income', 'transfer', 'lend', 'borrow', 'adjust'].map((t) => `<option value="${t}" ${f.type === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
   <select name="category_id"><option value="">全部分类</option>${cats.map((cc) => `<option value="${cc.id}" ${f.categoryId === cc.id ? 'selected' : ''}>${esc(cc.path)}</option>`).join('')}</select>
-  <select name="account_id"><option value="">全部账户</option>${form.accounts.map((a) => `<option value="${a.id}" ${f.accountId === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
+  <select name="account_id">${accountOptionsHtml(form.accounts, { selectedId: f.accountId, emptyLabel: '全部账户' })}</select>
   <input type="date" name="from" value="${esc(f.from)}">
   <input type="date" name="to" value="${esc(f.to)}">
 </div>
