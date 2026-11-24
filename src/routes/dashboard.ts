@@ -195,6 +195,7 @@ dashboardRoutes.get('/', async (c) => {
         subs,
         sessionCards: { activeCount: sessionCards.activeCount, totalRemaining: sessionCards.totalRemaining },
         aiReady,
+        writable: auth.canWrite(ctx.ledger.role),
         month,
         monthLabel: u.monthLabel(month),
       }),
@@ -244,6 +245,7 @@ dashboardRoutes.get('/calendar', async (c) => {
     )
     .join('');
 
+  const writable = auth.canWrite(ctx.ledger.role);
   return c.html(
     layout({
       title: '记账日历',
@@ -266,7 +268,7 @@ dashboardRoutes.get('/calendar', async (c) => {
     <div class="chart-box">${heatmapChart({ month, days, valueUnit: '元' })}</div>
   </div>
 </div>
-<div class="card mt16"><div class="card-head"><b>${esc(selected)} 当日明细</b></div>${groupList(selectedGroups)}</div>`,
+<div class="card mt16"><div class="card-head"><b>${esc(selected)} 当日明细</b></div>${groupList(selectedGroups, { writable })}</div>`,
     }),
   );
 });
@@ -282,6 +284,11 @@ dashboardRoutes.get('/search', async (c) => {
   const q = c.req.query();
   const minRaw = q.min ? Math.abs(u.parseAmountToCents(q.min)) : 0;
   const maxRaw = q.max ? Math.abs(u.parseAmountToCents(q.max)) : 0;
+  const SORT_KEYS = ['date_desc', 'date_asc', 'amount_desc', 'amount_asc'] as const;
+  type TxnSort = (typeof SORT_KEYS)[number];
+  const sort: TxnSort = SORT_KEYS.includes(String(q.sort || '') as TxnSort)
+    ? (String(q.sort) as TxnSort)
+    : 'date_desc';
   const f: txn.TxnFilter = {
     keyword: String(q.q || '').trim(),
     type: q.type || '',
@@ -294,11 +301,23 @@ dashboardRoutes.get('/search', async (c) => {
     maxCents: maxRaw > 0 ? maxRaw : undefined,
     from: q.from || '',
     to: q.to || '',
+    sort,
     page: Number(q.page || 1),
     pageSize: 30,
   };
   const hasFilter = Boolean(
-    f.keyword || f.type || f.categoryId || f.accountId || f.memberId || f.tagId || f.source || f.minCents || f.maxCents || f.from || f.to,
+    f.keyword ||
+      f.type ||
+      f.categoryId ||
+      f.accountId ||
+      f.memberId ||
+      f.tagId ||
+      f.source ||
+      f.minCents ||
+      f.maxCents ||
+      f.from ||
+      f.to ||
+      sort !== 'date_desc',
   );
   const [result, form, cats] = await Promise.all([
     hasFilter ? txn.listTransactions(db, ledgerId, f) : Promise.resolve({ rows: [], total: 0, page: 1, pageSize: 30, pages: 1, sum: { income: 0, expense: 0 } }),
@@ -317,7 +336,14 @@ dashboardRoutes.get('/search', async (c) => {
     max: q.max || undefined,
     from: f.from || undefined,
     to: f.to || undefined,
+    sort: sort !== 'date_desc' ? sort : undefined,
   };
+  const SORT_OPTS: Array<[string, string]> = [
+    ['date_desc', '日期从新到旧'],
+    ['date_asc', '日期从旧到新'],
+    ['amount_desc', '金额从大到小'],
+    ['amount_asc', '金额从小到大'],
+  ];
   const SOURCE_OPTS: Array<[string, string]> = [
     ['manual', '手工记账'],
     ['ai_screenshot', 'AI 截图'],
@@ -327,6 +353,7 @@ dashboardRoutes.get('/search', async (c) => {
     ['subscription', '订阅扣费'],
     ['openapi', '开放 API'],
   ];
+  const writable = auth.canWrite(ctx.ledger.role);
   return c.html(
     layout({
       title: '搜索筛选',
@@ -348,10 +375,11 @@ dashboardRoutes.get('/search', async (c) => {
   <input name="max" value="${esc(q.max || '')}" placeholder="最大金额（元）" inputmode="decimal">
   <input type="date" name="from" value="${esc(f.from)}" title="开始日期">
   <input type="date" name="to" value="${esc(f.to)}" title="结束日期">
+  <select name="sort" title="排序方式">${SORT_OPTS.map(([k, lbl]) => `<option value="${k}" ${sort === k ? 'selected' : ''}>${lbl}</option>`).join('')}</select>
 </div>
-<div class="row mt12"><button class="btn btn-primary" type="submit">搜索</button>${hasFilter ? `<a class="btn" href="/search">清空</a><span class="muted small">共 ${result.total} 笔</span>` : ''}</div>
+<div class="row mt12 wrap"><button class="btn btn-primary" type="submit">搜索</button>${hasFilter ? `<a class="btn" href="/search">清空</a><span class="muted small">共 ${result.total} 笔 · 收入 <b class="income">+${u.fmtAmount(result.sum.income)}</b> · 支出 <b class="expense">-${u.fmtAmount(result.sum.expense)}</b></span>` : ''}</div>
 </form></div>
-<div class="card mt16">${hasFilter ? groupList(await txn.groupByDate(result.rows, db)) : '<div class="empty">输入条件后搜索账单</div>'}</div>
+<div class="card mt16">${hasFilter ? groupList(await txn.groupByDate(result.rows, db), { writable }) : '<div class="empty">输入条件后搜索账单</div>'}</div>
 ${hasFilter ? paginationHtml('/search', searchQuery, result.page, result.pages, result.total) : ''}`,
     }),
   );

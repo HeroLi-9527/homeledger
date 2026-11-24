@@ -754,10 +754,12 @@
       commitBtn.addEventListener('click', async () => {
         commitBtn.disabled = true;
         commitBtn.textContent = '导入中…';
+        const defAccEl = $('#imp-default-acc');
         const r = await postJson('/api/import/commit', {
           token: state.token,
           auto_create_account: $('#imp-auto-acc').checked,
           include_neutral: !!(neutralChk && neutralChk.checked),
+          default_account_id: defAccEl && defAccEl.value ? Number(defAccEl.value) : null,
         });
         const resBox = $('#import-commit-result');
         if (r.ok) {
@@ -1260,6 +1262,32 @@
     });
   }
 
+  function initSubscriptionPresets() {
+    const form = document.querySelector('form[action="/subscriptions"]');
+    if (!form) return;
+    $$('[data-sub-preset]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        let p = null;
+        try {
+          p = JSON.parse(btn.dataset.subPreset || 'null');
+        } catch {
+          p = null;
+        }
+        if (!p) return;
+        const set = (name, val) => {
+          const el = form.querySelector(`[name="${name}"]`);
+          if (el && val !== undefined) el.value = String(val);
+        };
+        set('name', p.name);
+        set('icon', p.icon);
+        set('amount', p.amount);
+        set('currency', p.currency);
+        set('cycle', p.cycle);
+        set('plan', p.plan || '');
+      });
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     initThemeToggle();
     initMobileNav();
@@ -1272,6 +1300,7 @@
     initTxnAttachments();
     initRecurringForm();
     initAccountForms();
+    initSubscriptionPresets();
     initAiPage();
     initImportPage();
     initSettings();

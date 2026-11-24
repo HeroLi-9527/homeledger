@@ -36,16 +36,19 @@ planningRoutes.get('/budgets', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
-  const [rows, cats, accounts, baseCurrency] = await Promise.all([
+  const ref = tzRefDate();
+  const today = todayStr();
+  const curMonth = today.slice(0, 7);
+  const [rows, cats, accounts, baseCurrency, monthSum] = await Promise.all([
     db.all<BudgetRow & { category_name?: string | null }>(
       'SELECT b.*, c.name AS category_name FROM budgets b LEFT JOIN categories c ON c.id = b.category_id AND (c.ledger_id IS NULL OR c.ledger_id = b.ledger_id) WHERE b.ledger_id = ? ORDER BY b.is_active DESC, b.id',
       lid,
     ),
-    db.all<CategoryRow>("SELECT * FROM categories WHERE (ledger_id IS NULL OR ledger_id = ?) AND kind = 'expense' ORDER BY sort_order", lid),
+    fd.flatCategories(db, lid),
     db.all<AccountRow>('SELECT * FROM accounts WHERE ledger_id = ? AND is_archived = 0', lid),
     getSetting(db, 'site.currency', 'CNY'),
+    txn.summary(db, lid, `${curMonth}-01`, u.monthEnd(curMonth)),
   ]);
-  const ref = tzRefDate();
   const items = await Promise.all(
     rows.map(async (b) => {
       const r2 = budgetPeriodRange(b, ref);
@@ -56,9 +59,28 @@ planningRoutes.get('/budgets', async (c) => {
       ]);
       const catLabel = b.category_id ? b.category_name || '分类已删除' : '全部';
       const rangeLabel = isUnset ? '周期未设置' : r2.label;
+      const remainingCents = used == null ? null : Number(eff.amount) - Number(used);
+      let remainingDays: number | null = null;
+      if (!isUnset && r2.end) {
+        if (today > r2.end) remainingDays = 0;
+        else {
+          const effStart = today > r2.start ? today : r2.start;
+          remainingDays = Math.max(
+            0,
+            Math.round((Date.parse(`${r2.end}T00:00:00Z`) - Date.parse(`${effStart}T00:00:00Z`)) / 86400000) + 1,
+          );
+        }
+      }
+      const dailyAvailCents =
+        remainingCents != null && remainingDays != null && remainingDays > 0
+          ? Math.floor(Math.max(0, remainingCents) / remainingDays)
+          : null;
       return {
         ...b,
         used,
+        remainingCents,
+        remainingDays,
+        dailyAvailCents,
         orig_amount_cents: Number(b.amount_cents),
         baseCurrency: String(baseCurrency || 'CNY').toUpperCase(),
         amount_cents: eff.amount,
@@ -78,7 +100,14 @@ planningRoutes.get('/budgets', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: budgetsPage({ items, cats, accounts, csrf: c.get('csrf') || '' }),
+      body: budgetsPage({
+        items,
+        cats,
+        accounts,
+        monthSum,
+        baseCurrency: String(baseCurrency || 'CNY').toUpperCase(),
+        csrf: c.get('csrf') || '',
+      }),
     }),
   );
 });

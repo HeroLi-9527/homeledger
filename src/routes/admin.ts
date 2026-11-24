@@ -8,10 +8,13 @@ import {
   recalcBalances,
   setSetting,
   todayStr,
+  TXN_TYPE_MAP,
 } from '../db.js';
+import { accountOptionsHtml } from '../lib/accounts.js';
 import {
   classifyByKeywords,
   getAiConfig,
+  isHeaderSafe,
   isMaskedSecret,
   listModels,
   resolveDefaultAccount,
@@ -19,6 +22,7 @@ import {
 } from '../lib/ai.js';
 import * as attach from '../lib/attachments.js';
 import * as auth from '../lib/auth.js';
+import * as fd from '../lib/formdata.js';
 import {
   BACKUP_TABLES,
   MAX_BACKUP_BYTES,
@@ -30,7 +34,7 @@ import { cleanupOrphanR2, runScheduled } from '../lib/scheduler.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
 import { esc } from '../lib/util.js';
-import type { BatchStatement, HonoEnv, LedgerRow, Role, UserRow } from '../types.js';
+import type { AccountRow, BatchStatement, HonoEnv, LedgerRow, Role, UserRow } from '../types.js';
 import { membersPage, settingsPage } from '../views/admin.js';
 import { layout, simpleTable } from '../views/layout.js';
 import {
@@ -53,6 +57,14 @@ import {
 export const adminRoutes = new Hono<HonoEnv>();
 
 const USERNAME_RE = /^[A-Za-z0-9_.@-]{3,32}$/;
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+const LEDGER_KINDS: Record<string, string> = {
+  family: '家庭共享',
+  personal: '个人私账',
+  trip: '旅行专项',
+  business: '生意经营',
+  project: '项目专项',
+};
 const toBoolSetting = (v: unknown): 'true' | 'false' =>
   v === true || v === 1 || v === '1' || v === 'true' || v === 'on' ? 'true' : 'false';
 
@@ -116,6 +128,7 @@ adminRoutes.post('/settings/profile', async (c) => {
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
+  const user = ctx.user!;
   const body = await bodyOf(c);
   const displayName = String(body.display_name || '').trim().slice(0, 24);
   const email = body.email ? String(body.email).trim().slice(0, 80) : null;
@@ -123,7 +136,31 @@ adminRoutes.post('/settings/profile', async (c) => {
     setFlash(c, 'error', '显示名称不能为空');
     return c.redirect('/settings');
   }
-  await db.run('UPDATE users SET display_name = ?, email = ? WHERE id = ?', displayName, email, ctx.user!.id);
+  let username = user.username;
+  if (body.username !== undefined) {
+    username = String(body.username || '').trim();
+    if (!USERNAME_RE.test(username)) {
+      setFlash(c, 'error', '用户名需 3–32 位，仅支持字母、数字、下划线、点、@ 和短横线');
+      return c.redirect('/settings');
+    }
+    if (username !== user.username) {
+      const dup = await db.get<{ id: number }>('SELECT id FROM users WHERE username = ? AND id != ?', username, user.id);
+      if (dup) {
+        setFlash(c, 'error', '该用户名已被占用');
+        return c.redirect('/settings');
+      }
+    }
+  }
+  const colorRaw = String(body.avatar_color || '').trim();
+  const avatarColor = HEX_COLOR_RE.test(colorRaw) ? colorRaw.toLowerCase() : user.avatar_color || '#4f7cff';
+  await db.run(
+    'UPDATE users SET username = ?, display_name = ?, email = ?, avatar_color = ? WHERE id = ?',
+    username,
+    displayName,
+    email,
+    avatarColor,
+    user.id,
+  );
   setFlash(c, 'success', '个人资料已更新');
   return c.redirect('/settings');
 });
@@ -199,16 +236,50 @@ adminRoutes.post('/settings/ai', async (c) => {
   if (r) return r;
   const db = dbOf(c);
   const body = await bodyOf(c);
-  const baseUrl = String(body.base_url || '').trim().replace(/\/+$/, '');
-  const model = String(body.model || '').trim();
-  const apiKey = String(body.api_key || '').trim();
+  const rawBaseUrl = String(body.base_url ?? '');
+  const rawModel = String(body.model ?? '');
+  const rawApiKey = String(body.api_key ?? '');
+  const clearApiKey = toBoolSetting(body.clear_api_key) === 'true';
+
+  if (!clearApiKey && rawApiKey && !isMaskedSecret(rawApiKey.trim()) && !isHeaderSafe(rawApiKey)) {
+    setFlash(c, 'error', 'API Key 含有非法字符（如中文、全角符号或换行），请在「设置 → AI 模型配置」重新粘贴');
+    return c.redirect('/settings#ai');
+  }
+  if (rawBaseUrl && !isHeaderSafe(rawBaseUrl)) {
+    setFlash(c, 'error', '接口地址含有非法字符，请检查后重试');
+    return c.redirect('/settings#ai');
+  }
+  if (rawModel && !isHeaderSafe(rawModel)) {
+    setFlash(c, 'error', '模型名称含有非法字符，请检查后重试');
+    return c.redirect('/settings#ai');
+  }
+
+  const baseUrl = rawBaseUrl.trim().replace(/\/+$/, '');
+  const model = rawModel.trim();
+  const apiKey = rawApiKey.trim();
+
+  const rawTimeout = body.timeout_ms ?? body['ai.timeout_ms'];
+  let timeoutMsToSave: number | null = null;
+  if (rawTimeout !== undefined && String(rawTimeout).trim() !== '') {
+    const n = Number(String(rawTimeout).trim());
+    if (!Number.isFinite(n) || n <= 0) {
+      setFlash(c, 'error', '请求超时需为大于 0 的毫秒数（建议 5000–300000）');
+      return c.redirect('/settings#ai');
+    }
+    timeoutMsToSave = Math.max(5000, Math.min(300000, Math.round(n)));
+  }
 
   await setSetting(db, 'ai.base_url', baseUrl);
   await setSetting(db, 'ai.model', model);
   await setSetting(db, 'ai.enabled', toBoolSetting(body.enabled));
   await setSetting(db, 'ai.vision', toBoolSetting(body['ai.vision'] ?? body.vision));
   await setSetting(db, 'ai.auto_save', toBoolSetting(body.auto_save));
-  if (apiKey && !isMaskedSecret(apiKey)) {
+  if (timeoutMsToSave !== null) {
+    await setSetting(db, 'ai.timeout_ms', String(timeoutMsToSave));
+  }
+  if (clearApiKey) {
+    await setSetting(db, 'ai.api_key', '');
+  } else if (apiKey && !isMaskedSecret(apiKey)) {
     await setSetting(db, 'ai.api_key', apiKey);
   }
   setFlash(c, 'success', 'AI 配置已保存');
@@ -366,10 +437,18 @@ adminRoutes.get('/ledgers', async (c) => {
     kind: string;
     currency: string;
     icon: string;
+    color: string;
+    note: string | null;
     is_archived: number;
     role: string;
+    txn_cnt: number;
+    member_cnt: number;
+    acc_cnt: number;
   }>(
-    `SELECT l.id, l.name, l.kind, l.currency, l.icon, l.is_archived, m.role
+    `SELECT l.id, l.name, l.kind, l.currency, l.icon, l.color, l.note, l.is_archived, m.role,
+            (SELECT COUNT(*) FROM transactions t WHERE t.ledger_id = l.id AND t.deleted_at IS NULL) AS txn_cnt,
+            (SELECT COUNT(*) FROM ledger_members lm WHERE lm.ledger_id = l.id) AS member_cnt,
+            (SELECT COUNT(*) FROM accounts a WHERE a.ledger_id = l.id AND a.is_archived = 0) AS acc_cnt
      FROM ledgers l JOIN ledger_members m ON m.ledger_id = l.id
      WHERE m.user_id = ? ORDER BY l.is_archived, l.sort_order, l.id`,
     ctx.user!.id,
@@ -378,8 +457,14 @@ adminRoutes.get('/ledgers', async (c) => {
   const tableRows = rows
     .map(
       (l) => `<tr>
-  <td>${esc(l.icon)} <b>${esc(l.name)}</b> ${Number(ctx.ledger?.id) === Number(l.id) ? '<span class="chip income">当前</span>' : ''} ${l.is_archived ? '<span class="chip">已归档</span>' : ''}</td>
+  <td>
+    <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${esc(l.color || '#4f7cff')};vertical-align:middle"></span>
+    ${esc(l.icon)} <b>${esc(l.name)}</b> ${Number(ctx.ledger?.id) === Number(l.id) ? '<span class="chip income">当前</span>' : ''} ${l.is_archived ? '<span class="chip">已归档</span>' : ''}
+    ${l.note ? `<div class="tiny muted">${esc(l.note)}</div>` : ''}
+  </td>
+  <td><span class="chip">${esc(LEDGER_KINDS[l.kind] || l.kind)}</span></td>
   <td>${esc(l.currency)}</td>
+  <td class="tiny muted">${Number(l.txn_cnt || 0)} 笔 · ${Number(l.member_cnt || 0)} 人 · ${Number(l.acc_cnt || 0)} 户</td>
   <td>${esc(auth.ROLE_LABEL[l.role as Role] || l.role)}</td>
   <td><div class="row wrap">
     <form method="post" action="/ledgers/switch" style="display:inline">${csrfInput}<input type="hidden" name="ledger_id" value="${l.id}"><button class="btn btn-sm" type="submit">切换</button></form>
@@ -400,18 +485,23 @@ adminRoutes.get('/ledgers', async (c) => {
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
       body: `<div class="grid grid-2">
-  <div>${simpleTable('我的账本', ['账本名称', '币种', '我的角色', '操作'], tableRows || '<tr><td colspan="4">暂无账本</td></tr>')}</div>
+  <div>${simpleTable('我的账本', ['账本名称', '类型', '币种', '统计', '我的角色', '操作'], tableRows || '<tr><td colspan="6">暂无账本</td></tr>')}</div>
   <div class="card">
     <div class="card-head"><b>新建账本</b></div>
     <form method="post" action="/ledgers">
       ${csrfInput}
       <div class="field"><label>账本名称</label><input name="name" required placeholder="例如：家庭共同账本"></div>
       <div class="grid grid-2">
-        <div class="field"><label>类型</label><select name="kind"><option value="family">家庭共享</option><option value="personal">个人私账</option><option value="trip">旅行专项</option></select></div>
+        <div class="field"><label>类型</label><select name="kind">${Object.entries(LEDGER_KINDS).map(([k, lbl]) => `<option value="${k}">${lbl}</option>`).join('')}</select></div>
         <div class="field"><label>本位币</label><input name="currency" value="${esc(meta.baseCurrency)}"></div>
       </div>
-      <div class="field"><label>图标</label><input name="icon" value="📒"></div>
-      <button class="btn btn-primary btn-block" type="submit">创建账本并初始化默认账户</button>
+      <div class="grid grid-2">
+        <div class="field"><label>图标</label><input name="icon" value="📒"></div>
+        <div class="field"><label>标识颜色</label><input name="color" type="color" value="#4f7cff" style="height:38px;padding:2px"></div>
+      </div>
+      <div class="field"><label>备注（可选）</label><input name="note" maxlength="200" placeholder="账本用途或说明"></div>
+      <label class="check mb12"><input type="checkbox" name="skip_default_accounts" value="1"> 跳过初始化默认账户（稍后自行添加）</label>
+      <button class="btn btn-primary btn-block" type="submit">创建账本</button>
     </form>
   </div>
 </div>`,
@@ -431,20 +521,29 @@ adminRoutes.post('/ledgers', async (c) => {
     return c.redirect('/ledgers');
   }
   const currency = String(body.currency || 'CNY').trim().toUpperCase().slice(0, 8) || 'CNY';
-  const kind = ['family', 'personal', 'trip'].includes(String(body.kind)) ? String(body.kind) : 'family';
+  const kind = body.kind && LEDGER_KINDS[String(body.kind)] ? String(body.kind) : 'family';
   const icon = String(body.icon || '📒').slice(0, 8) || '📒';
+  const colorRaw = String(body.color || '').trim();
+  const color = HEX_COLOR_RE.test(colorRaw) ? colorRaw.toLowerCase() : '#4f7cff';
+  const note = String(body.note || '').trim().slice(0, 200) || null;
+  const skipDefaults = toBoolSetting(body.skip_default_accounts) === 'true';
+
   const res = await db.run(
-    'INSERT INTO ledgers (name, kind, currency, icon, owner_id, created_at) VALUES (?,?,?,?,?,?)',
+    'INSERT INTO ledgers (name, kind, currency, icon, color, owner_id, note, created_at) VALUES (?,?,?,?,?,?,?,?)',
     name,
     kind,
     currency,
     icon,
+    color,
     ctx.user!.id,
+    note,
     nowStr(),
   );
   const ledgerId = Number(res.lastInsertRowid);
   await addLedgerMember(db, ledgerId, ctx.user!.id, 'owner');
-  await createDefaultAccounts(db, ledgerId, currency);
+  if (!skipDefaults) {
+    await createDefaultAccounts(db, ledgerId, currency);
+  }
 
   const sess = c.get('sess');
   if (sess) {
@@ -473,7 +572,6 @@ adminRoutes.get('/ledgers/:id/edit', async (c) => {
   }
   const csrf = c.get('csrf') || '';
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
-  const kindLabel = { family: '家庭共享', personal: '个人私账', trip: '旅行专项' };
 
   return c.html(
     layout({
@@ -491,10 +589,13 @@ adminRoutes.get('/ledgers/:id/edit', async (c) => {
       ${csrfInput}
       <div class="field"><label>账本名称</label><input name="name" value="${esc(ledger.name)}" maxlength="30" required></div>
       <div class="grid grid-2">
-        <div class="field"><label>类型</label><select name="kind">${Object.entries(kindLabel).map(([k, lbl]) => `<option value="${k}" ${ledger.kind === k ? 'selected' : ''}>${lbl}</option>`).join('')}</select></div>
+        <div class="field"><label>类型</label><select name="kind">${Object.entries(LEDGER_KINDS).map(([k, lbl]) => `<option value="${k}" ${ledger.kind === k ? 'selected' : ''}>${lbl}</option>`).join('')}</select></div>
         <div class="field"><label>本位币（创建后不可改）</label><input value="${esc(ledger.currency)}" disabled></div>
       </div>
-      <div class="field"><label>图标</label><input name="icon" value="${esc(ledger.icon || '📒')}" maxlength="8"></div>
+      <div class="grid grid-2">
+        <div class="field"><label>图标</label><input name="icon" value="${esc(ledger.icon || '📒')}" maxlength="8"></div>
+        <div class="field"><label>标识颜色</label><input name="color" type="color" value="${esc(ledger.color || '#4f7cff')}" style="height:38px;padding:2px"></div>
+      </div>
       <div class="field"><label>备注（可选）</label><input name="note" value="${esc(ledger.note || '')}" maxlength="200"></div>
       <button class="btn btn-primary" type="submit">保存账本信息</button>
     </form>
@@ -540,11 +641,21 @@ adminRoutes.post('/ledgers/:id', async (c) => {
   }
   const icon = body.icon !== undefined && String(body.icon).trim() ? String(body.icon).trim().slice(0, 8) : ledger.icon;
   const kind =
-    body.kind !== undefined && ['family', 'personal', 'trip'].includes(String(body.kind))
+    body.kind !== undefined && LEDGER_KINDS[String(body.kind)]
       ? String(body.kind)
       : ledger.kind;
+  const colorRaw = String(body.color || '').trim();
+  const color = body.color !== undefined && HEX_COLOR_RE.test(colorRaw) ? colorRaw.toLowerCase() : ledger.color || '#4f7cff';
   const note = body.note !== undefined ? String(body.note).trim().slice(0, 200) || null : ledger.note;
-  await db.run('UPDATE ledgers SET name = ?, icon = ?, kind = ?, note = ? WHERE id = ?', name, icon, kind, note, id);
+  await db.run(
+    'UPDATE ledgers SET name = ?, icon = ?, kind = ?, color = ?, note = ? WHERE id = ?',
+    name,
+    icon,
+    kind,
+    color,
+    note,
+    id,
+  );
   setFlash(c, 'success', '账本已更新');
   return c.redirect('/ledgers');
 });
@@ -664,9 +775,10 @@ adminRoutes.get('/members', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const ledgerId = Number(ctx.ledger!.id);
-  const [members, invites] = await Promise.all([
-    db.all<{ id: number; user_id: number; role: string; username: string; display_name: string; joined_at: string }>(
-      `SELECT m.id, m.user_id, m.role, m.joined_at, u.username, u.display_name
+  const curMonth = todayStr().slice(0, 7);
+  const [rawMembers, invites, mStats] = await Promise.all([
+    db.all<{ id: number; user_id: number; role: string; nickname: string | null; username: string; display_name: string; joined_at: string }>(
+      `SELECT m.id, m.user_id, m.role, m.nickname, m.joined_at, u.username, u.display_name
        FROM ledger_members m JOIN users u ON u.id = m.user_id
        WHERE m.ledger_id = ?
        ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END, m.id`,
@@ -676,7 +788,18 @@ adminRoutes.get('/members', async (c) => {
       'SELECT id, code, role, expires_at FROM ledger_invites WHERE ledger_id = ? AND used_by IS NULL ORDER BY id DESC',
       ledgerId,
     ),
+    txn.memberBreakdown(db, ledgerId, `${curMonth}-01`, u.monthEnd(curMonth)),
   ]);
+  const statMap = new Map(mStats.map((s) => [Number(s.id), s]));
+  const members = rawMembers.map((m) => {
+    const st = statMap.get(Number(m.user_id));
+    return {
+      ...m,
+      month_cnt: st?.cnt ?? 0,
+      month_expense: st?.expense ?? 0,
+      month_income: st?.income ?? 0,
+    };
+  });
   const csrf = c.get('csrf') || '';
   return c.html(
     layout({
@@ -690,6 +813,33 @@ adminRoutes.get('/members', async (c) => {
       body: membersPage({ ctx, members, invites, csrf }),
     }),
   );
+});
+
+adminRoutes.post('/members/:id/nickname', async (c) => {
+  const r = requireLedger(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const ledgerId = Number(ctx.ledger!.id);
+  const mid = Number(c.req.param('id'));
+  const target = await db.get<{ id: number; user_id: number }>(
+    'SELECT id, user_id FROM ledger_members WHERE id = ? AND ledger_id = ?',
+    mid,
+    ledgerId,
+  );
+  if (!target) {
+    setFlash(c, 'error', '成员不存在');
+    return c.redirect('/members');
+  }
+  if (Number(target.user_id) !== Number(ctx.user!.id) && !auth.canManage(ctx.ledger!.role)) {
+    setFlash(c, 'error', '无权修改该成员账本昵称');
+    return c.redirect('/members');
+  }
+  const body = await bodyOf(c);
+  const nickname = String(body.nickname || '').trim().slice(0, 24) || null;
+  await db.run('UPDATE ledger_members SET nickname = ? WHERE id = ? AND ledger_id = ?', nickname, mid, ledgerId);
+  setFlash(c, 'success', nickname ? `账本昵称已更新为「${nickname}」` : '账本昵称已清空');
+  return c.redirect('/members');
 });
 
 adminRoutes.post('/members/invite', async (c) => {
@@ -782,17 +932,21 @@ adminRoutes.get('/import', async (c) => {
   const meta = await siteMeta(c);
   if (!ctx.ledger) return c.redirect('/');
 
-  const jobs = await db.all<{
-    id: number;
-    source: string;
-    file_name: string | null;
-    total: number;
-    imported: number;
-    skipped: number;
-    failed: number;
-    message: string | null;
-    created_at: string;
-  }>('SELECT * FROM import_jobs WHERE ledger_id = ? ORDER BY id DESC LIMIT 15', Number(ctx.ledger.id));
+  const ledgerId = Number(ctx.ledger.id);
+  const [jobs, accounts] = await Promise.all([
+    db.all<{
+      id: number;
+      source: string;
+      file_name: string | null;
+      total: number;
+      imported: number;
+      skipped: number;
+      failed: number;
+      message: string | null;
+      created_at: string;
+    }>('SELECT * FROM import_jobs WHERE ledger_id = ? ORDER BY id DESC LIMIT 15', ledgerId),
+    fd.accounts(db, ledgerId),
+  ]);
 
   const jobRows = jobs
     .map(
@@ -817,6 +971,17 @@ adminRoutes.get('/import', async (c) => {
       flash: takeFlash(c),
       body: `<div class="card mb16">
   <div class="card-head"><b>导入支付宝 / 微信账单（CSV）</b><span class="muted small">自动识别 UTF-8 / GBK 编码与订单号去重</span></div>
+  <div class="field mb12">
+    <label for="imp-default-acc">默认入账账户（账单支付方式缺失或关闭自动建户时使用）</label>
+    <select id="imp-default-acc" name="default_account_id">${accountOptionsHtml(accounts, { emptyLabel: '自动按名称匹配或建户（否则用默认账户）' })}</select>
+  </div>
+  <details class="notice mb12">
+    <summary class="bold" style="cursor:pointer">📖 如何从支付宝 / 微信导出账单 CSV？</summary>
+    <div class="small mt8">
+      <div><b>支付宝：</b>打开支付宝 App → 我的 → 账单 → 右上角「…」→ 开具交易流水证明 → 用于个人对账 → 选择时间范围后下载解压得到的 <code>.csv</code> 文件。</div>
+      <div class="mt4"><b>微信：</b>打开微信 → 我 → 服务 → 钱包 → 账单 → 常见问题 → 下载账单 → 用于个人对账 → 选择时间范围，通过邮箱/微信文件传输接收并解压得到 <code>.csv</code> 文件（微信新版部分导出为 <code>.xlsx</code>，需在电子表格软件中另存为 CSV 后上传）。</div>
+    </div>
+  </details>
   <div id="import-dropzone" class="dropzone">
     <div style="font-size:24px;margin-bottom:4px">📥</div>
     <div>拖放支付宝 / 微信 CSV 账单文件到这里，或点击选择文件</div>
@@ -988,12 +1153,47 @@ adminRoutes.get('/import/failures/:jobId', async (c) => {
 
 /* ============================ 导出与全量备份恢复 ============================ */
 
+const EXPORT_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseExportFilter(q: Record<string, string | undefined>): txn.TxnFilter {
+  const validDay = (s: string) => {
+    if (!EXPORT_DAY_RE.test(s)) return '';
+    const d = new Date(`${s}T00:00:00Z`);
+    return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s ? s : '';
+  };
+  let from = validDay(String(q.from || '').trim());
+  let to = validDay(String(q.to || '').trim());
+  if (from && to && from > to) [from, to] = [to, from];
+  const type = q.type && TXN_TYPE_MAP[q.type] ? q.type : undefined;
+  const kind = q.kind === 'expense' || q.kind === 'income' ? q.kind : undefined;
+  const accNum = Number(q.account_id);
+  const accountId = Number.isInteger(accNum) && accNum > 0 ? accNum : undefined;
+  return {
+    ...(from ? { from } : {}),
+    ...(to ? { to } : {}),
+    ...(type ? { type } : {}),
+    ...(kind ? { kind } : {}),
+    ...(accountId ? { accountId } : {}),
+  };
+}
+
 adminRoutes.get('/export', async (c) => {
   const r = requireLedger(c);
   if (r) return r;
+  const db = dbOf(c);
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const csrf = c.get('csrf') || '';
+  const ledgerId = Number(ctx.ledger!.id);
+  const accounts = await db.all<AccountRow>(
+    'SELECT * FROM accounts WHERE ledger_id = ? ORDER BY is_archived, sort_order, id',
+    ledgerId,
+  );
+  const typeOptions = Object.entries(TXN_TYPE_MAP)
+    .map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`)
+    .join('');
+  const accOptions = accountOptionsHtml(accounts, { emptyLabel: '全部账户' });
+
   return c.html(
     layout({
       title: '数据导出与备份',
@@ -1006,14 +1206,41 @@ adminRoutes.get('/export', async (c) => {
       body: `<div class="grid grid-2">
   <div class="card">
     <div class="card-head"><b>导出账单流水（CSV）</b></div>
-    <p class="muted small mb12">导出当前账本全部未删除流水，带 UTF-8 BOM，可直接用 Excel 或 WPS 打开。</p>
-    <a class="btn btn-primary" href="/export/csv">下载 CSV 流水明细</a>
+    <p class="muted small mb12">支持按起止日期、交易类型、账户筛选导出未删除流水，带 UTF-8 BOM，可直接用 Excel 或 WPS 打开。</p>
+    <form method="get" action="/export/csv">
+      <div class="grid grid-2">
+        <div class="field"><label>开始日期（可选）</label><input type="date" name="from"></div>
+        <div class="field"><label>结束日期（可选）</label><input type="date" name="to"></div>
+        <div class="field"><label>交易类型</label><select name="type"><option value="">全部类型</option>${typeOptions}</select></div>
+        <div class="field"><label>账户</label><select name="account_id">${accOptions}</select></div>
+      </div>
+      <div class="row wrap mt8">
+        <button class="btn btn-primary" type="submit">下载筛选 CSV</button>
+        <a class="btn" href="/export/csv">导出全部 CSV</a>
+      </div>
+    </form>
   </div>
   <div class="card">
-    <div class="card-head"><b>整库 JSON 备份与恢复</b></div>
-    <p class="muted small mb12">${ctx.isAdmin ? '管理员可导出全库 JSON 快照并在必要时覆盖恢复。' : '仅站点管理员可执行全库 JSON 备份与恢复。'}</p>
-    ${ctx.isAdmin ? `<div class="row wrap"><a class="btn btn-primary" href="/export/json">下载全库 JSON 备份</a><label class="btn" style="cursor:pointer">从 JSON 恢复<input type="file" id="restore-file" accept=".json,application/json" class="hidden"></label></div>` : ''}
+    <div class="card-head"><b>导出当前账本结构化 JSON</b><span class="chip">成员可用</span></div>
+    <p class="muted small mb12">导出当前账本（${esc(ctx.ledger!.name)}）的账户、分类、标签、预算、周期账单、订阅、借贷、储蓄目标、次卡与流水明细（支持按条件筛选流水）。</p>
+    <form method="get" action="/export/ledger.json">
+      <div class="grid grid-2">
+        <div class="field"><label>流水开始日期</label><input type="date" name="from"></div>
+        <div class="field"><label>流水结束日期</label><input type="date" name="to"></div>
+        <div class="field"><label>交易类型</label><select name="type"><option value="">全部类型</option>${typeOptions}</select></div>
+        <div class="field"><label>账户</label><select name="account_id">${accOptions}</select></div>
+      </div>
+      <div class="row wrap mt8">
+        <button class="btn btn-primary" type="submit">下载当前账本 JSON</button>
+        <a class="btn" href="/export/ledger.json">全量账本 JSON</a>
+      </div>
+    </form>
   </div>
+</div>
+<div class="card mt16">
+  <div class="card-head"><b>整库 JSON 备份与恢复（站点管理员）</b></div>
+  <p class="muted small mb12">${ctx.isAdmin ? '管理员可导出全库（含所有用户与账本）JSON 快照并在必要时覆盖恢复。' : '仅站点管理员可执行全库级 JSON 备份与恢复；普通账本成员请使用上方「导出当前账本结构化 JSON」。'}</p>
+  ${ctx.isAdmin ? `<div class="row wrap"><a class="btn btn-primary" href="/export/json">下载全库 JSON 备份</a><label class="btn" style="cursor:pointer">从 JSON 恢复<input type="file" id="restore-file" accept=".json,application/json" class="hidden"></label></div>` : ''}
 </div>`,
     }),
   );
@@ -1024,12 +1251,13 @@ adminRoutes.get('/export/csv', async (c) => {
   if (r) return r;
   const db = dbOf(c);
   const ledgerId = Number(c.get('ctx').ledger!.id);
+  const filter = parseExportFilter(c.req.query());
   const enc = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
         controller.enqueue(enc.encode(`\uFEFF${csvLine(EXPORT_HEADER)}`));
-        for await (const batch of txn.iterateAllForExport(db, ledgerId)) {
+        for await (const batch of txn.iterateAllForExport(db, ledgerId, 1000, filter)) {
           const rows = exportRows(ledgerId, batch);
           let chunk = '';
           for (const row of rows) chunk += csvLine(row);
@@ -1041,12 +1269,82 @@ adminRoutes.get('/export/csv', async (c) => {
       }
     },
   });
+  const suffix = filter.from || filter.to ? `-${filter.from || 'start'}_${filter.to || 'end'}` : `-${todayStr()}`;
   return new Response(stream, {
     headers: {
       'Content-Type': 'text/csv; charset=utf-8',
-      'Content-Disposition': `attachment; filename="homeledger-${todayStr()}.csv"`,
+      'Content-Disposition': `attachment; filename="homeledger${suffix}.csv"`,
+      'Cache-Control': 'no-store',
     },
   });
+});
+
+adminRoutes.get('/export/ledger.json', async (c) => {
+  const r = requireLedger(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const ledgerId = Number(ctx.ledger!.id);
+  const filter = parseExportFilter(c.req.query());
+  const [
+    ledger,
+    accounts,
+    categories,
+    tags,
+    budgets,
+    recurring_rules,
+    subscriptions,
+    debts,
+    goals,
+    session_cards,
+    session_card_logs,
+    transactions,
+  ] = await Promise.all([
+    db.get('SELECT id, name, kind, currency, icon, color, note, is_archived, created_at FROM ledgers WHERE id = ?', ledgerId),
+    db.all('SELECT * FROM accounts WHERE ledger_id = ? ORDER BY sort_order, id', ledgerId),
+    db.all(
+      'SELECT * FROM categories WHERE ledger_id IS NULL OR ledger_id = ? ORDER BY kind, sort_order, id',
+      ledgerId,
+    ),
+    db.all('SELECT * FROM tags WHERE ledger_id = ? ORDER BY id', ledgerId),
+    db.all('SELECT * FROM budgets WHERE ledger_id = ? ORDER BY id', ledgerId),
+    db.all('SELECT * FROM recurring_rules WHERE ledger_id = ? ORDER BY id', ledgerId),
+    db.all('SELECT * FROM subscriptions WHERE ledger_id = ? ORDER BY id', ledgerId),
+    db.all('SELECT * FROM debts WHERE ledger_id = ? ORDER BY id', ledgerId),
+    db.all('SELECT * FROM goals WHERE ledger_id = ? ORDER BY id', ledgerId),
+    db.all('SELECT * FROM session_cards WHERE ledger_id = ? ORDER BY id', ledgerId),
+    db.all('SELECT * FROM session_card_logs WHERE ledger_id = ? ORDER BY id', ledgerId),
+    txn.listAllForExport(db, ledgerId, 1000, filter),
+  ]);
+
+  const payload = JSON.stringify(
+    {
+      app: 'homeledger',
+      scope: 'ledger',
+      exported_at: nowStr(),
+      ledger_id: ledgerId,
+      filter,
+      ledger,
+      accounts,
+      categories,
+      tags,
+      budgets,
+      recurring_rules,
+      subscriptions,
+      debts,
+      goals,
+      session_cards,
+      session_card_logs,
+      transactions,
+      total_transactions: transactions.length,
+    },
+    null,
+    2,
+  );
+  c.header('Content-Type', 'application/json; charset=utf-8');
+  c.header('Content-Disposition', `attachment; filename="homeledger-ledger-${ledgerId}-${todayStr()}.json"`);
+  c.header('Cache-Control', 'no-store');
+  return c.body(payload);
 });
 
 adminRoutes.get('/export/json', async (c) => {
@@ -1142,9 +1440,17 @@ adminRoutes.get('/admin', async (c) => {
     ),
   ]);
 
+  const activeReceivers = users.filter((x) => x.status === 'active');
   const rows = users
-    .map(
-      (usr) => `<tr>
+    .map((usr) => {
+      const receiverOpts = activeReceivers
+        .filter((x) => Number(x.id) !== Number(usr.id))
+        .map(
+          (x) =>
+            `<option value="${x.id}" ${Number(x.id) === Number(ctx.user!.id) ? 'selected' : ''}>转交→${esc(x.display_name)}(@${esc(x.username)})</option>`,
+        )
+        .join('');
+      return `<tr>
   <td><b>${esc(usr.display_name)}</b> <span class="tiny muted">@${esc(usr.username)}</span></td>
   <td>${usr.is_admin ? '<span class="chip primary">站点管理员</span>' : '普通用户'}</td>
   <td><span class="chip ${usr.status === 'active' ? 'income' : 'expense'}">${usr.status === 'active' ? '正常' : '已停用'}</span></td>
@@ -1155,11 +1461,12 @@ adminRoutes.get('/admin', async (c) => {
          <form method="post" action="/admin/users/${usr.id}" style="display:inline">${csrfInput}<input type="hidden" name="action" value="toggle_status"><button class="btn btn-sm" type="submit">${usr.status === 'active' ? '停用' : '启用'}</button></form>
          <form method="post" action="/admin/users/${usr.id}" style="display:inline">${csrfInput}<input type="hidden" name="action" value="toggle_admin"><button class="btn btn-sm" type="submit">${usr.is_admin ? '取消管理' : '设为管理'}</button></form>
          <form method="post" action="/admin/users/${usr.id}" style="display:inline-flex;gap:4px;align-items:center" data-confirm="确认重置 @${esc(usr.username)} 的密码并令其全部登录失效？">${csrfInput}<input type="hidden" name="action" value="reset_password"><input type="password" name="password" placeholder="新密码(留空随机)" minlength="6" style="width:130px;padding:3px 7px;font-size:12px"><button class="btn btn-sm btn-danger" type="submit">重置密码</button></form>
+         ${receiverOpts ? `<form method="post" action="/admin/users/${usr.id}" style="display:inline-flex;gap:4px;align-items:center" data-confirm="确认永久删除 @${esc(usr.username)} 并将其拥有的账本及记账流水转交给所选用户？">${csrfInput}<input type="hidden" name="action" value="delete_user"><select name="transfer_to_user_id" style="width:auto;padding:3px 6px;font-size:12px">${receiverOpts}</select><button class="btn btn-sm btn-danger" type="submit">删除并转交</button></form>` : ''}
          </div>`
       : '<span class="tiny muted">当前账号</span>'
   }</td>
-</tr>`,
-    )
+</tr>`;
+    })
     .join('');
 
   return c.html(
@@ -1237,6 +1544,90 @@ adminRoutes.post('/admin/users', async (c) => {
   return c.redirect('/admin');
 });
 
+async function deleteUserAndTransfer(
+  db: ReturnType<typeof dbOf>,
+  env: ReturnType<typeof envOf>,
+  target: UserRow,
+  rawTransferTo: unknown,
+): Promise<{ ok: true; receiverUsername: string; avatarCleanupFailed: boolean } | { ok: false; error: string }> {
+  const id = Number(target.id);
+  const transferToId = Number(rawTransferTo || 0);
+  if (!Number.isInteger(transferToId) || transferToId <= 0 || transferToId === id) {
+    return { ok: false, error: '请选择除被删除用户外的有效接收人' };
+  }
+  const receiver = await db.get<{ id: number; username: string; status: string }>(
+    'SELECT id, username, status FROM users WHERE id = ?',
+    transferToId,
+  );
+  if (!receiver || receiver.status !== 'active') {
+    return { ok: false, error: '转交接收人不存在或已被停用' };
+  }
+  const stamp = nowStr();
+  await db.batch([
+    [
+      'UPDATE ledger_members SET role = ? WHERE user_id = ? AND ledger_id IN (SELECT id FROM ledgers WHERE owner_id = ?)',
+      ['owner', transferToId, id],
+    ],
+    [
+      'INSERT OR IGNORE INTO ledger_members (ledger_id, user_id, role, joined_at) SELECT id, ?, ?, ? FROM ledgers WHERE owner_id = ?',
+      [transferToId, 'owner', stamp, id],
+    ],
+    ['UPDATE ledgers SET owner_id = ? WHERE owner_id = ?', [transferToId, id]],
+    ['UPDATE transactions SET user_id = ? WHERE user_id = ?', [transferToId, id]],
+    ['UPDATE attachments SET user_id = ? WHERE user_id = ?', [transferToId, id]],
+    ['UPDATE session_card_logs SET user_id = ? WHERE user_id = ?', [transferToId, id]],
+    ['UPDATE import_jobs SET user_id = ? WHERE user_id = ?', [transferToId, id]],
+    ['UPDATE recurring_rules SET created_by_user_id = ? WHERE created_by_user_id = ?', [transferToId, id]],
+    ['UPDATE subscriptions SET created_by_user_id = ? WHERE created_by_user_id = ?', [transferToId, id]],
+    ['UPDATE ledger_invites SET created_by = ? WHERE created_by = ?', [transferToId, id]],
+    ['UPDATE ledger_invites SET used_by = NULL WHERE used_by = ?', [id]],
+    ['UPDATE splits SET user_id = NULL WHERE user_id = ?', [id]],
+    ['DELETE FROM ledger_members WHERE user_id = ?', [id]],
+    ['DELETE FROM api_tokens WHERE user_id = ?', [id]],
+    ['DELETE FROM notifications WHERE user_id = ?', [id]],
+    ['DELETE FROM users WHERE id = ?', [id]],
+  ]);
+  let avatarCleanupFailed = false;
+  if (target.avatar_path) {
+    try {
+      await attach.removeAvatar(env, target.avatar_path, { throwOnError: true });
+    } catch (e) {
+      avatarCleanupFailed = true;
+      console.error('removeAvatar failed after delete user', id, e);
+    }
+  }
+  return { ok: true, receiverUsername: receiver.username, avatarCleanupFailed };
+}
+
+adminRoutes.post('/admin/users/:id/delete', async (c) => {
+  const r = requireAdmin(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const id = Number(c.req.param('id'));
+  if (id === Number(c.get('ctx').user!.id)) {
+    setFlash(c, 'error', '不可删除当前登录管理员自身账号');
+    return c.redirect('/admin');
+  }
+  const target = await db.get<UserRow>('SELECT * FROM users WHERE id = ?', id);
+  if (!target) {
+    setFlash(c, 'error', '用户不存在');
+    return c.redirect('/admin');
+  }
+  const body = await bodyOf(c);
+  const res = await deleteUserAndTransfer(db, envOf(c), target, body.transfer_to_user_id);
+  if (!res.ok) setFlash(c, 'error', res.error);
+  else if (res.avatarCleanupFailed) {
+    setFlash(
+      c,
+      'warn',
+      `用户 @${target.username} 已删除并将账本转交给 @${res.receiverUsername}，但 R2 头像清理失败，请稍后运行「手动清理 R2 孤儿附件」`,
+    );
+  } else {
+    setFlash(c, 'success', `用户 @${target.username} 已删除，其账本与记录已转交给 @${res.receiverUsername}`);
+  }
+  return c.redirect('/admin');
+});
+
 adminRoutes.post('/admin/users/:id', async (c) => {
   const r = requireAdmin(c);
   if (r) return r;
@@ -1267,6 +1658,18 @@ adminRoutes.post('/admin/users/:id', async (c) => {
   } else if (action === 'toggle_admin') {
     await db.run('UPDATE users SET is_admin = ? WHERE id = ?', target.is_admin ? 0 : 1, id);
     setFlash(c, 'success', '管理员权限已更新');
+  } else if (action === 'delete_user') {
+    const res = await deleteUserAndTransfer(db, envOf(c), target, body.transfer_to_user_id);
+    if (!res.ok) setFlash(c, 'error', res.error);
+    else if (res.avatarCleanupFailed) {
+      setFlash(
+        c,
+        'warn',
+        `用户 @${target.username} 已删除并将账本转交给 @${res.receiverUsername}，但 R2 头像清理失败，请稍后运行「手动清理 R2 孤儿附件」`,
+      );
+    } else {
+      setFlash(c, 'success', `用户 @${target.username} 已删除，其账本与记录已转交给 @${res.receiverUsername}`);
+    }
   } else if (action === 'reset_password') {
     const rawPwd = String(body.password || '').trim();
     if (rawPwd && rawPwd.length < 6) {

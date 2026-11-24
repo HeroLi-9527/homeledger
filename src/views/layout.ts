@@ -205,8 +205,7 @@ ${g.items
       </div>
       <div class="spacer"></div>
       <a class="btn btn-sm" href="/search" title="搜索">🔍</a>
-      <a class="btn btn-sm" href="/ai">🤖 AI 截图记账</a>
-      <a class="btn btn-sm btn-primary" href="/transactions/new">+ 记一笔</a>
+      ${writable ? '<a class="btn btn-sm" href="/ai">🤖 AI 截图记账</a><a class="btn btn-sm btn-primary" href="/transactions/new">+ 记一笔</a>' : ''}
       <a class="btn btn-sm" href="/notifications" title="通知中心">🔔${ctx.unreadCount > 0 ? ` <span class="chip expense" style="padding:0 5px">${ctx.unreadCount}</span>` : ''}</a>
       <button class="btn btn-sm" id="theme-toggle-btn" type="button" title="切换主题">🌙</button>
       ${
@@ -291,7 +290,10 @@ export function simpleTable(title: string, headers: string[], rowsHtml: string, 
 </div>`;
 }
 
-export function groupList(groups: TxnDateGroup[], opts: { bulk?: boolean; csrf?: string } = {}): string {
+export function groupList(
+  groups: TxnDateGroup[],
+  opts: { bulk?: boolean; csrf?: string; writable?: boolean } = {},
+): string {
   if (!groups.length) return '<div class="empty">暂无流水记录</div>';
   return groups
     .map(
@@ -304,16 +306,16 @@ ${g.items.map((t) => txnRowHtml(t, opts)).join('')}`,
     .join('');
 }
 
-function txnRowHtml(t: TxnRow, opts: { bulk?: boolean }): string {
+function txnRowHtml(t: TxnRow, opts: { bulk?: boolean; writable?: boolean }): string {
   const isIncome = t.is_income;
   const isExpense = t.is_expense;
   const cls = isIncome ? 'income' : isExpense ? 'expense' : 'neutral';
   const sign = isIncome ? '+' : isExpense ? '-' : '';
   const meta = TXN_TYPE_MAP[t.type];
   const title = t.merchant || t.category_name || meta?.label || t.type;
-  const checkboxName = t.is_reimbursable && !t.reimbursed_at && (t.type === 'expense' || t.type === 'fee') ? 'ids' : 'del_ids';
+  const writable = opts.writable !== false;
   return `<div class="txn">
-  ${opts.bulk ? `<input type="checkbox" class="bulk-item" name="${checkboxName}" value="${t.id}">` : ''}
+  ${opts.bulk && writable ? `<input type="checkbox" class="bulk-item" name="ids" value="${t.id}">` : ''}
   <div class="txn-ico">${esc(t.category_icon || t.type_icon || '💳')}</div>
   <div class="txn-main">
     <div class="txn-title">
@@ -331,10 +333,14 @@ function txnRowHtml(t: TxnRow, opts: { bulk?: boolean }): string {
   </div>
   <div class="txn-right">
     <div class="txn-amt amount ${cls}">${sign}${fmtAmount(t.amount_base_cents)}</div>
-    <div class="row mt8" style="justify-content:flex-end">
+    ${
+      writable
+        ? `<div class="row mt8" style="justify-content:flex-end">
       <a class="btn btn-sm btn-ghost" href="/transactions/${t.id}/edit">编辑</a>
       <button class="btn btn-sm btn-ghost" type="button" data-del-txn="${t.id}">删除</button>
-    </div>
+    </div>`
+        : ''
+    }
   </div>
 </div>`;
 }

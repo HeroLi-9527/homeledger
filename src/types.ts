@@ -7,6 +7,7 @@ export interface Env {
   SESSION_SECRET?: string;
   COOKIE_SECURE?: string;
   ALLOW_REGISTER?: string;
+  HOMELEDGER_GITHUB_REPO?: string;
 }
 
 export interface RunResult {

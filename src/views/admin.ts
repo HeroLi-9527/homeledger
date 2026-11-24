@@ -2,7 +2,7 @@ import { todayStr } from '../db.js';
 import type { AiConfig } from '../lib/ai.js';
 import { ROLE_LABEL } from '../lib/auth.js';
 import type { AppContext } from '../types.js';
-import { esc, initials } from '../lib/util.js';
+import { esc, fmtAmount, initials } from '../lib/util.js';
 import { avatarHtml, simpleTable } from './layout.js';
 
 export function settingsPage({
@@ -38,8 +38,12 @@ export function settingsPage({
     </div>
     <form method="post" action="/settings/profile">
       ${csrfInput}
-      <div class="field"><label>显示名称</label><input name="display_name" value="${esc(user.display_name)}"></div>
-      <div class="field"><label>邮箱</label><input name="email" type="email" value="${esc(user.email || '')}"></div>
+      <div class="field"><label>用户名（3–32 位账号）</label><input name="username" value="${esc(user.username)}" required></div>
+      <div class="field"><label>显示名称</label><input name="display_name" value="${esc(user.display_name)}" required></div>
+      <div class="grid grid-2">
+        <div class="field"><label>邮箱</label><input name="email" type="email" value="${esc(user.email || '')}"></div>
+        <div class="field"><label>默认头像颜色</label><input name="avatar_color" type="color" value="${esc(user.avatar_color || '#4f7cff')}" style="height:38px;padding:2px"></div>
+      </div>
       <button class="btn btn-primary" type="submit">保存资料</button>
     </form>
     <form method="post" action="/settings/password" class="mt16">
@@ -56,8 +60,16 @@ export function settingsPage({
     ${ctx.isAdmin ? `<form method="post" action="/settings/ai">
       ${csrfInput}
       <div class="field"><label>接口地址（Base URL）</label><input name="base_url" id="ai-base-url" value="${esc(cfg.baseUrl)}" placeholder="https://api.openai.com/v1"></div>
-      <div class="field"><label>API Key</label><input name="api_key" id="ai-api-key" type="password" value="${cfg.apiKey ? '••••••••' : ''}" placeholder="sk-…（留空表示不改）"></div>
-      <div class="field"><label>模型名称</label><input name="model" id="ai-model" value="${esc(cfg.model)}" placeholder="gpt-4o-mini"></div>
+      <div class="field">
+        <label>API Key${cfg.apiKey ? ' <span class="chip income">已配置</span>' : ''}</label>
+        <input name="api_key" id="ai-api-key" type="password" value="" autocomplete="new-password" placeholder="${cfg.apiKey ? '已保存密钥（留空保持不变）' : 'sk-…（本地模型可留空）'}">
+        ${cfg.apiKeyInvalid ? '<div class="tiny" style="color:var(--expense)">检测到当前保存的 API Key 含非法字符，请重新粘贴或勾选清除</div>' : ''}
+        <label class="check mt8"><input type="checkbox" name="clear_api_key" value="1"> 清除已保存的 API Key</label>
+      </div>
+      <div class="grid grid-2">
+        <div class="field"><label>模型名称</label><input name="model" id="ai-model" value="${esc(cfg.model)}" placeholder="gpt-4o-mini"></div>
+        <div class="field"><label>请求超时（毫秒）</label><input name="timeout_ms" type="number" min="5000" max="300000" step="1000" value="${Number(cfg.timeoutMs || 90000)}" placeholder="90000"></div>
+      </div>
       <div class="row wrap mb12">
         <label class="check"><input type="checkbox" name="enabled" value="1" ${cfg.enabled ? 'checked' : ''}> 启用 AI</label>
         <label class="check"><input type="checkbox" name="ai.vision" value="1" ${cfg.vision ? 'checked' : ''}> 支持视觉识图</label>
@@ -142,16 +154,33 @@ export function membersPage({
   csrf,
 }: {
   ctx: AppContext;
-  members: Array<{ id: number; user_id: number; role: string; username: string; display_name: string; joined_at: string }>;
+  members: Array<{
+    id: number;
+    user_id: number;
+    role: string;
+    nickname?: string | null;
+    username: string;
+    display_name: string;
+    joined_at: string;
+    month_cnt?: number;
+    month_expense?: number;
+    month_income?: number;
+  }>;
   invites: Array<{ id: number; code: string; role: string; expires_at: string | null }>;
   csrf: string;
 }): string {
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
   const canManage = ctx.ledger?.role === 'owner' || ctx.ledger?.role === 'admin';
   const rows = members
-    .map(
-      (m) => `<tr>
-  <td><b>${esc(m.display_name)}</b> <span class="tiny muted">@${esc(m.username)}</span></td>
+    .map((m) => {
+      const canEditNick = canManage || Number(m.user_id) === Number(ctx.user?.id);
+      const nickCell = canEditNick
+        ? `<form method="post" action="/members/${m.id}/nickname" class="row" style="display:inline-flex;gap:4px">${csrfInput}<input name="nickname" value="${esc(m.nickname || '')}" placeholder="账本内昵称" maxlength="24" style="width:110px;padding:3px 7px;font-size:12px"><button class="btn btn-sm" type="submit">保存</button></form>`
+        : esc(m.nickname || '—');
+      return `<tr>
+  <td><b>${esc(m.nickname || m.display_name)}</b>${m.nickname ? ` <span class="tiny muted">(${esc(m.display_name)})</span>` : ''} <span class="tiny muted">@${esc(m.username)}</span></td>
+  <td>${nickCell}</td>
+  <td class="tiny">${Number(m.month_cnt || 0)} 笔 · <span class="income amount">+${fmtAmount(Number(m.month_income || 0))}</span> / <span class="expense amount">-${fmtAmount(Number(m.month_expense || 0))}</span></td>
   <td><span class="chip">${esc(ROLE_LABEL[m.role as keyof typeof ROLE_LABEL] || m.role)}</span></td>
   <td class="tiny muted">${esc(m.joined_at)}</td>
   <td>${
@@ -159,12 +188,12 @@ export function membersPage({
       ? `<form method="post" action="/members/${m.id}" style="display:inline">${csrfInput}<select name="role" style="width:auto">${(['admin', 'member', 'viewer'] as const).map((k) => `<option value="${k}" ${m.role === k ? 'selected' : ''}>${ROLE_LABEL[k]}</option>`).join('')}</select><button class="btn btn-sm" type="submit">改角色</button></form> <form method="post" action="/members/${m.id}/remove" style="display:inline">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">移出</button></form>`
       : ''
   }</td>
-</tr>`,
-    )
+</tr>`;
+    })
     .join('');
 
   return (
-    simpleTable('账本成员与四档角色', ['成员', '角色', '加入时间', '操作'], rows) +
+    simpleTable('账本成员与四档角色', ['成员', '账本昵称', '本月统计', '角色', '加入时间', '操作'], rows) +
     (canManage
       ? `<div class="card mt16"><div class="card-head"><b>邀请家庭成员</b></div>
 <form method="post" action="/members/invite" class="row wrap mb12">${csrfInput}

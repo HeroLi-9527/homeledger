@@ -154,7 +154,9 @@ export function lineChart({
     }
   });
 
+  const labelStep = count > 16 ? Math.ceil(count / 15) : 1;
   labels.forEach((lab, i) => {
+    if (labelStep > 1 && i % labelStep !== 0 && i !== count - 1) return;
     s += `<text x="${xOf(i).toFixed(1)}" y="${H - 10}" font-size="11" fill="${C.axis}" text-anchor="middle">${esc(lab)}</text>`;
   });
   if (showLegend) {

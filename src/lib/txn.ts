@@ -14,7 +14,9 @@ let stampSeq = 0;
 const stampMs = (): string => {
   const d = new Date();
   stampSeq = (stampSeq + 1) % 100000;
-  return `${nowStr(d)}.${String(d.getMilliseconds()).padStart(3, '0')}-${String(stampSeq).padStart(5, '0')}`;
+  const rnd = new Uint16Array(1);
+  crypto.getRandomValues(rnd);
+  return `${nowStr(d)}.${String(d.getMilliseconds()).padStart(3, '0')}-${String(stampSeq).padStart(5, '0')}-${rnd[0]!.toString(16).padStart(4, '0')}`;
 };
 
 export const INCOME_TYPES = ['income', 'interest', 'refund', 'reimburse'] as const;
@@ -533,20 +535,22 @@ export async function softDelete(
     ? await db.all<{ rel_path: string }>('SELECT rel_path FROM attachments WHERE txn_id = ? AND ledger_id = ?', id, ledgerId)
     : [];
   const stamp = stampMs();
+  const delGuardSql = ' AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at = ? AND updated_at = ?)';
+  const delGuardParams = [id, ledgerId, stamp, stamp];
   const stmts: BatchStatement[] = [
     [
       'UPDATE transactions SET deleted_at = ?, updated_at = ? WHERE id = ? AND ledger_id = ? AND deleted_at IS NULL AND updated_at = ?',
       [stamp, stamp, id, ledgerId, pre.updated_at],
     ],
-    ...balanceDeltaStmts([[pre, -1]]),
-    ['DELETE FROM transaction_tags WHERE transaction_id = ?', [id]],
-    ['DELETE FROM attachments WHERE txn_id = ? AND ledger_id = ?', [id, ledgerId]],
+    ...balanceDeltaStmts([[pre, -1]]).map(([sql, params = []]): BatchStatement => [`${sql}${delGuardSql}`, [...params, ...delGuardParams]]),
+    [`DELETE FROM transaction_tags WHERE transaction_id = ?${delGuardSql}`, [id, ...delGuardParams]],
+    [`DELETE FROM attachments WHERE txn_id = ? AND ledger_id = ?${delGuardSql}`, [id, ledgerId, ...delGuardParams]],
   ];
-  if (pre.group_id) stmts.push(['DELETE FROM splits WHERE group_id = ?', [pre.group_id]]);
+  if (pre.group_id) stmts.push([`DELETE FROM splits WHERE group_id = ?${delGuardSql}`, [pre.group_id, ...delGuardParams]]);
   if (pre.type === 'reimburse') {
     stmts.push([
-      'UPDATE transactions SET reimbursed_at = NULL, related_id = NULL WHERE related_id = ? AND ledger_id = ?',
-      [id, ledgerId],
+      `UPDATE transactions SET reimbursed_at = NULL, related_id = NULL WHERE related_id = ? AND ledger_id = ?${delGuardSql}`,
+      [id, ledgerId, ...delGuardParams],
     ]);
   }
   const results = await db.batch(stmts);
@@ -616,9 +620,14 @@ export async function restoreTransaction(db: Db, id: number, ledgerId: number): 
     if (acc.is_archived) throw new Error('原账户已归档，无法恢复');
   }
   const stamp = stampMs();
+  const restoreGuardSql = ' AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at IS NULL AND updated_at = ?)';
+  const balStmts: BatchStatement[] = balanceDeltaStmts([[t, 1]]).map(([sql, params = []]): BatchStatement => [
+    `${sql}${restoreGuardSql}`,
+    [...params, id, ledgerId, stamp],
+  ]);
   const results = await db.batch([
     ['UPDATE transactions SET deleted_at = NULL, updated_at = ? WHERE id = ? AND ledger_id = ? AND deleted_at IS NOT NULL', [stamp, id, ledgerId]],
-    ...balanceDeltaStmts([[t, 1]]),
+    ...balStmts,
   ]);
   if (Number(results[0]?.meta?.changes || 0) !== 1) throw new Error('记录已被恢复或删除，请刷新后重试');
   try {
@@ -627,6 +636,159 @@ export async function restoreTransaction(db: Db, id: number, ledgerId: number): 
     console.error('syncDebts failed after restore txn', id, e);
   }
   return true;
+}
+
+export async function bulkRestore(db: Db, ids: number[], ledgerId: number) {
+  let n = 0;
+  const skipped: Array<{ id: number; reason: string }> = [];
+  for (const id of ids) {
+    try {
+      if (await restoreTransaction(db, Number(id), ledgerId)) n++;
+    } catch (e) {
+      skipped.push({ id: Number(id), reason: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  return { restored: n, skipped };
+}
+
+export async function bulkUpdateCategory(
+  db: Db,
+  ids: number[],
+  ledgerId: number,
+  categoryId: number,
+) {
+  if (!ids.length) throw new Error('请先选择流水');
+  if (!categoryId) throw new Error('请选择目标分类');
+  const cat = await db.get<{ id: number; kind: 'expense' | 'income'; is_archived: number }>(
+    'SELECT id, kind, is_archived FROM categories WHERE id = ? AND (ledger_id IS NULL OR ledger_id = ?)',
+    categoryId,
+    ledgerId,
+  );
+  if (!cat || cat.is_archived) throw new Error('目标分类不存在或已归档');
+
+  const rows = await db.all<{ id: number; type: string; deleted_at: string | null }>(
+    `SELECT id, type, deleted_at FROM transactions WHERE ledger_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+    ledgerId,
+    ...ids,
+  );
+  const byId = new Map(rows.map((r) => [Number(r.id), r]));
+  const targetIds: number[] = [];
+  const skipped: Array<{ id: number; reason: string }> = [];
+  for (const id of ids) {
+    const row = byId.get(Number(id));
+    if (!row || row.deleted_at) {
+      skipped.push({ id: Number(id), reason: '记录不存在或已删除' });
+      continue;
+    }
+    const kind = kindOfType(row.type);
+    if (kind !== cat.kind) {
+      skipped.push({ id: Number(id), reason: '交易类型与目标分类收支类型不匹配' });
+      continue;
+    }
+    targetIds.push(Number(id));
+  }
+  if (targetIds.length) {
+    await db.run(
+      `UPDATE transactions SET category_id = ?, updated_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND id IN (${targetIds.map(() => '?').join(',')})`,
+      Number(cat.id),
+      stampMs(),
+      ledgerId,
+      ...targetIds,
+    );
+  }
+  return { updated: targetIds.length, skipped };
+}
+
+export async function bulkAddTags(
+  db: Db,
+  ids: number[],
+  ledgerId: number,
+  tagsInput: string,
+) {
+  if (!ids.length) throw new Error('请先选择流水');
+  const names = String(tagsInput || '')
+    .split(/[,，\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  if (!names.length) throw new Error('请输入或选择至少一个标签');
+
+  const rows = await db.all<{ id: number; deleted_at: string | null }>(
+    `SELECT id, deleted_at FROM transactions WHERE ledger_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+    ledgerId,
+    ...ids,
+  );
+  const byId = new Map(rows.map((r) => [Number(r.id), r]));
+  const targetIds: number[] = [];
+  const skipped: Array<{ id: number; reason: string }> = [];
+  for (const id of ids) {
+    const row = byId.get(Number(id));
+    if (!row || row.deleted_at) {
+      skipped.push({ id: Number(id), reason: '记录不存在或已删除' });
+      continue;
+    }
+    targetIds.push(Number(id));
+  }
+  const cleanTags = names.join(' ');
+  for (const tid of targetIds) {
+    await applyTags(db, tid, ledgerId, cleanTags, false);
+  }
+  if (targetIds.length) {
+    await db.run(
+      `UPDATE transactions SET updated_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND id IN (${targetIds.map(() => '?').join(',')})`,
+      stampMs(),
+      ledgerId,
+      ...targetIds,
+    );
+  }
+  return { updated: targetIds.length, skipped };
+}
+
+export async function bulkMarkReimbursable(
+  db: Db,
+  ids: number[],
+  ledgerId: number,
+) {
+  if (!ids.length) throw new Error('请先选择流水');
+  const rows = await db.all<{
+    id: number;
+    type: string;
+    deleted_at: string | null;
+    reimbursed_at: string | null;
+    is_reimbursable: number;
+  }>(
+    `SELECT id, type, deleted_at, reimbursed_at, is_reimbursable FROM transactions WHERE ledger_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+    ledgerId,
+    ...ids,
+  );
+  const byId = new Map(rows.map((r) => [Number(r.id), r]));
+  const targetIds: number[] = [];
+  const skipped: Array<{ id: number; reason: string }> = [];
+  for (const id of ids) {
+    const row = byId.get(Number(id));
+    if (!row || row.deleted_at) {
+      skipped.push({ id: Number(id), reason: '记录不存在或已删除' });
+      continue;
+    }
+    if (row.reimbursed_at) {
+      skipped.push({ id: Number(id), reason: '已完成报销入账' });
+      continue;
+    }
+    if (!(EXPENSE_TYPES as readonly string[]).includes(row.type)) {
+      skipped.push({ id: Number(id), reason: '仅支出或手续费可标记待报销' });
+      continue;
+    }
+    targetIds.push(Number(id));
+  }
+  if (targetIds.length) {
+    await db.run(
+      `UPDATE transactions SET is_reimbursable = 1, updated_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND reimbursed_at IS NULL AND id IN (${targetIds.map(() => '?').join(',')})`,
+      stampMs(),
+      ledgerId,
+      ...targetIds,
+    );
+  }
+  return { updated: targetIds.length, skipped };
 }
 
 export async function markReimbursed(
@@ -1121,19 +1283,21 @@ export async function* iterateAllForExport(
   db: Db,
   ledgerId: number,
   chunkSize = 1000,
+  filter: TxnFilter = {},
 ): AsyncGenerator<TxnRow[]> {
+  const { sql, params } = buildWhere(ledgerId, filter);
   let cursorDate: string | null = null;
   let cursorId = 0;
   while (true) {
     const rows: TxnRow[] = cursorDate === null
       ? await db.all<TxnRow>(
-          `${TXN_SELECT} WHERE t.ledger_id = ? AND t.deleted_at IS NULL ORDER BY t.txn_date DESC, t.id DESC LIMIT ?`,
-          ledgerId,
+          `${TXN_SELECT} WHERE ${sql} ORDER BY t.txn_date DESC, t.id DESC LIMIT ?`,
+          ...params,
           chunkSize,
         )
       : await db.all<TxnRow>(
-          `${TXN_SELECT} WHERE t.ledger_id = ? AND t.deleted_at IS NULL AND (t.txn_date < ? OR (t.txn_date = ? AND t.id < ?)) ORDER BY t.txn_date DESC, t.id DESC LIMIT ?`,
-          ledgerId,
+          `${TXN_SELECT} WHERE ${sql} AND (t.txn_date < ? OR (t.txn_date = ? AND t.id < ?)) ORDER BY t.txn_date DESC, t.id DESC LIMIT ?`,
+          ...params,
           cursorDate,
           cursorDate,
           cursorId,
@@ -1148,9 +1312,14 @@ export async function* iterateAllForExport(
   }
 }
 
-export async function listAllForExport(db: Db, ledgerId: number, chunkSize = 1000): Promise<TxnRow[]> {
+export async function listAllForExport(
+  db: Db,
+  ledgerId: number,
+  chunkSize = 1000,
+  filter: TxnFilter = {},
+): Promise<TxnRow[]> {
   const all: TxnRow[] = [];
-  for await (const batch of iterateAllForExport(db, ledgerId, chunkSize)) {
+  for await (const batch of iterateAllForExport(db, ledgerId, chunkSize, filter)) {
     all.push(...batch);
   }
   return all;

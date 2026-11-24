@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { nowStr, todayStr } from '../db.js';
 import { deleteAccountIfUnreferenced, normalizeAccountWrite } from '../lib/accounts.js';
+import * as auth from '../lib/auth.js';
 import * as fd from '../lib/formdata.js';
 import * as sc from '../lib/session-cards.js';
 import * as txn from '../lib/txn.js';
@@ -183,7 +184,23 @@ accountsRoutes.get('/accounts/:id', async (c) => {
       404,
     );
   }
-  const result = await txn.listTransactions(db, Number(ctx.ledger!.id), { accountId: id, page: 1, pageSize: 30 });
+  const q = c.req.query();
+  const validDay = (s: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return '';
+    const d = new Date(`${s}T00:00:00Z`);
+    return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s ? s : '';
+  };
+  let from = validDay(String(q.from || '').trim());
+  let to = validDay(String(q.to || '').trim());
+  if (from && to && from > to) [from, to] = [to, from];
+  const page = Math.max(1, Number(q.page) || 1);
+  const result = await txn.listTransactions(db, Number(ctx.ledger!.id), {
+    accountId: id,
+    from: from || undefined,
+    to: to || undefined,
+    page,
+    pageSize: 30,
+  });
   const groups = await txn.groupByDate(result.rows, db);
   return c.html(
     layout({
@@ -194,7 +211,15 @@ accountsRoutes.get('/accounts/:id', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: accountDetailPage({ acc, groups, csrf: c.get('csrf') || '' }),
+      body: accountDetailPage({
+        acc,
+        groups,
+        result,
+        from,
+        to,
+        writable: auth.canWrite(ctx.ledger!.role),
+        csrf: c.get('csrf') || '',
+      }),
     }),
   );
 });
@@ -247,19 +272,49 @@ accountsRoutes.post('/accounts/:id/edit', async (c) => {
   }
 });
 
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+const pickHexColor = (v: unknown): string | null => {
+  const s = String(v || '').trim();
+  return HEX_COLOR_RE.test(s) ? s.toLowerCase() : null;
+};
+
 accountsRoutes.get('/categories', async (c) => {
   const r = requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
-  const rows = await db.all<CategoryRow>(
-    'SELECT * FROM categories WHERE ledger_id IS NULL OR ledger_id = ? ORDER BY kind, sort_order, id',
-    Number(ctx.ledger!.id),
-  );
+  const ledgerId = Number(ctx.ledger!.id);
+  const since = u.addDays(todayStr(), -365);
+  const [rows, statsRows] = await Promise.all([
+    db.all<CategoryRow>(
+      'SELECT * FROM categories WHERE ledger_id IS NULL OR ledger_id = ? ORDER BY kind, sort_order, id',
+      ledgerId,
+    ),
+    db.all<{ category_id: number; cnt: number; total: number }>(
+      `SELECT category_id, COUNT(*) AS cnt, COALESCE(SUM(amount_base_cents), 0) AS total
+       FROM transactions
+       WHERE ledger_id = ? AND deleted_at IS NULL AND txn_date >= ? AND category_id IS NOT NULL
+       GROUP BY category_id`,
+      ledgerId,
+      since,
+    ),
+  ]);
+  const statMap = new Map(statsRows.map((s) => [Number(s.category_id), { cnt: Number(s.cnt), total: Number(s.total) }]));
   const tree = rows
     .filter((x) => !x.parent_id)
-    .map((root) => ({ ...root, children: rows.filter((x) => Number(x.parent_id) === Number(root.id)) }));
+    .map((root) => {
+      const children = rows
+        .filter((x) => Number(x.parent_id) === Number(root.id))
+        .map((ch) => {
+          const st = statMap.get(Number(ch.id)) || { cnt: 0, total: 0 };
+          return { ...ch, year_cnt: st.cnt, year_total_cents: st.total };
+        });
+      const own = statMap.get(Number(root.id)) || { cnt: 0, total: 0 };
+      const yearCnt = own.cnt + children.reduce((s, ch) => s + ch.year_cnt, 0);
+      const yearTotal = own.total + children.reduce((s, ch) => s + ch.year_total_cents, 0);
+      return { ...root, year_cnt: yearCnt, year_total_cents: yearTotal, children };
+    });
   return c.html(
     layout({
       title: '分类管理',
@@ -287,7 +342,7 @@ accountsRoutes.post('/categories', async (c) => {
   }
   let parentId: number | null = body.parent_id ? Number(body.parent_id) : null;
   let kind: 'expense' | 'income' = body.kind === 'income' ? 'income' : 'expense';
-  let color = '#8c8c8c';
+  let color = pickHexColor(body.color) || u.colorFor(name);
   if (parentId) {
     const parent = await db.get<CategoryRow>(
       'SELECT id, kind, parent_id, color FROM categories WHERE id = ? AND (ledger_id IS NULL OR ledger_id = ?)',
@@ -303,7 +358,7 @@ accountsRoutes.post('/categories', async (c) => {
       return c.redirect('/categories');
     }
     kind = parent.kind;
-    color = parent.color || color;
+    color = pickHexColor(body.color) || parent.color || color;
     parentId = Number(parent.id);
   }
   await db.run(
@@ -342,10 +397,12 @@ accountsRoutes.post('/categories/:id', async (c) => {
   }
   const iconRaw = body.icon !== undefined ? String(body.icon || '').trim() : '';
   const icon = (iconRaw || cat.icon || '🏷️').slice(0, 8);
+  const color = pickHexColor(body.color) || cat.color || u.colorFor(name);
   await db.run(
-    'UPDATE categories SET name = ?, icon = ? WHERE id = ? AND ledger_id = ? AND is_system = 0',
+    'UPDATE categories SET name = ?, icon = ?, color = ? WHERE id = ? AND ledger_id = ? AND is_system = 0',
     name,
     icon,
+    color,
     id,
     ledgerId,
   );
@@ -405,8 +462,16 @@ accountsRoutes.get('/tags', async (c) => {
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
-  const rows = await db.all<{ id: number; name: string; cnt: number }>(
-    'SELECT t.id, t.name, (SELECT COUNT(*) FROM transaction_tags tt WHERE tt.tag_id = t.id) AS cnt FROM tags t WHERE t.ledger_id = ? ORDER BY t.name',
+  const rows = await db.all<{ id: number; name: string; color: string; cnt: number; total_cents: number }>(
+    `SELECT t.id, t.name, t.color,
+            COUNT(tx.id) AS cnt,
+            COALESCE(SUM(tx.amount_base_cents), 0) AS total_cents
+     FROM tags t
+     LEFT JOIN transaction_tags tt ON tt.tag_id = t.id
+     LEFT JOIN transactions tx ON tx.id = tt.transaction_id AND tx.ledger_id = t.ledger_id AND tx.deleted_at IS NULL
+     WHERE t.ledger_id = ?
+     GROUP BY t.id
+     ORDER BY t.name`,
     Number(ctx.ledger!.id),
   );
   return c.html(
@@ -427,13 +492,15 @@ accountsRoutes.post('/tags', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
   const db = dbOf(c);
-  const name = String((await bodyOf(c)).name || '').trim();
+  const body = await bodyOf(c);
+  const name = String(body.name || '').trim().slice(0, 20);
   if (name) {
+    const color = pickHexColor(body.color) || u.colorFor(name);
     await db.run(
       'INSERT OR IGNORE INTO tags (ledger_id, name, color) VALUES (?,?,?)',
       Number(c.get('ctx').ledger!.id),
-      name.slice(0, 20),
-      '#0F766E',
+      name,
+      color,
     );
   }
   return c.redirect('/tags');
@@ -445,8 +512,8 @@ accountsRoutes.post('/tags/:id', async (c) => {
   const db = dbOf(c);
   const ledgerId = Number(c.get('ctx').ledger!.id);
   const id = Number(c.req.param('id'));
-  const tag = await db.get<{ id: number; name: string }>(
-    'SELECT id, name FROM tags WHERE id = ? AND ledger_id = ?',
+  const tag = await db.get<{ id: number; name: string; color: string }>(
+    'SELECT id, name, color FROM tags WHERE id = ? AND ledger_id = ?',
     id,
     ledgerId,
   );
@@ -454,7 +521,8 @@ accountsRoutes.post('/tags/:id', async (c) => {
     setFlash(c, 'error', '标签不存在');
     return c.redirect('/tags');
   }
-  const name = String((await bodyOf(c)).name || '').trim().slice(0, 20);
+  const body = await bodyOf(c);
+  const name = String(body.name || '').trim().slice(0, 20);
   if (!name) {
     setFlash(c, 'error', '标签名称不能为空');
     return c.redirect('/tags');
@@ -469,7 +537,8 @@ accountsRoutes.post('/tags/:id', async (c) => {
     setFlash(c, 'error', `标签「${name}」已存在`);
     return c.redirect('/tags');
   }
-  await db.run('UPDATE tags SET name = ? WHERE id = ? AND ledger_id = ?', name, id, ledgerId);
+  const color = pickHexColor(body.color) || tag.color || u.colorFor(name);
+  await db.run('UPDATE tags SET name = ?, color = ? WHERE id = ? AND ledger_id = ?', name, color, id, ledgerId);
   setFlash(c, 'success', '标签已更新');
   return c.redirect('/tags');
 });

@@ -219,6 +219,8 @@ openapiRoutes.get('/ping', (c) => {
   const oa = c.get('openAuth')!;
   return c.json({
     ok: true,
+    app: 'homeledger',
+    today: todayStr(),
     user: { id: oa.userId, username: oa.username, display_name: oa.displayName, is_admin: oa.isAdmin },
     ledger_id: oa.ledgerId,
     role: oa.role,
@@ -230,8 +232,33 @@ openapiRoutes.get('/ping', (c) => {
 openapiRoutes.get('/transactions/recent', async (c) => {
   const oa = c.get('openAuth')!;
   const limit = Math.max(1, Math.min(100, Number(c.req.query('limit') || 15)));
-  const res = await txn.listTransactions(dbOf(c), oa.ledgerId, { page: 1, pageSize: limit });
-  return c.json({ ok: true, ledger_id: oa.ledgerId, items: res.rows, total: res.total });
+  const db = dbOf(c);
+  const res = await txn.listTransactions(db, oa.ledgerId, { page: 1, pageSize: limit });
+  const imgMap = await attach.listByTxnIds(
+    db,
+    res.rows.map((r) => Number(r.id)),
+  );
+  const rowsWithImages = res.rows.map((row) => ({
+    ...row,
+    images: (imgMap.get(Number(row.id)) || []).map((img) => ({
+      id: img.id,
+      url: img.url || attach.webUrl(img.rel_path),
+      path: img.rel_path,
+      api_url: `/api/open/attachments/${img.id}`,
+      file_name: img.file_name,
+      mime: img.mime,
+      size: img.size,
+      txn_id: img.txn_id,
+    })),
+  }));
+  return c.json({
+    ok: true,
+    ledger_id: oa.ledgerId,
+    items: rowsWithImages,
+    transactions: rowsWithImages,
+    total: res.total,
+    count: rowsWithImages.length,
+  });
 });
 
 openapiRoutes.get('/transactions', async (c) => {
@@ -281,13 +308,17 @@ openapiRoutes.post('/transactions', async (c) => {
     await txn.resolveRate(db, currency, (body.rate as string | number | null) ?? null);
 
     let toAccountId: string | number | null = (body.to_account_id as string | number | null) ?? null;
+    let pendingAutoToAccName: string | null = null;
     if (!toAccountId) {
-      const toAccName = String(body.to_account ?? body.to_account_name ?? '').trim();
+      const toAccName = String(body.to_account ?? body.to_account_name ?? '').trim().slice(0, 30);
       if (toAccName) {
-        const cleanTo = toAccName.slice(0, 30);
-        const foundTo = await lookupAccountIdByName(db, oa.ledgerId, cleanTo);
-        if (!foundTo) throw new Error(`账户「${cleanTo}」不存在`);
-        toAccountId = foundTo;
+        const foundTo = await lookupAccountIdByName(db, oa.ledgerId, toAccName);
+        if (foundTo) {
+          toAccountId = foundTo;
+        } else {
+          if (body.auto_create_account === false) throw new Error(`账户「${toAccName}」不存在`);
+          pendingAutoToAccName = toAccName;
+        }
       }
     }
 
@@ -306,8 +337,16 @@ openapiRoutes.post('/transactions', async (c) => {
       }
     }
 
-    if ((type === 'transfer' || type === 'invest_buy' || type === 'invest_sell') && !toAccountId) {
+    if ((type === 'transfer' || type === 'invest_buy' || type === 'invest_sell') && !toAccountId && !pendingAutoToAccName) {
       throw new Error(type === 'transfer' ? '转账需要选择转出与转入账户' : '投资交易需要选择资金账户与投资账户');
+    }
+    if ((type === 'transfer' || type === 'invest_buy' || type === 'invest_sell')) {
+      if (accountId && toAccountId && Number(accountId) === Number(toAccountId)) {
+        throw new Error(type === 'transfer' ? '转出与转入账户不能相同' : '资金账户与投资账户不能相同');
+      }
+      if (pendingAutoAccName && pendingAutoToAccName && normName(pendingAutoAccName) === normName(pendingAutoToAccName)) {
+        throw new Error(type === 'transfer' ? '转出与转入账户不能相同' : '资金账户与投资账户不能相同');
+      }
     }
 
     let categoryId: string | number | null = (body.category_id as string | number | null) ?? null;
@@ -321,14 +360,23 @@ openapiRoutes.post('/transactions', async (c) => {
     const txnDate = String(body.txn_date ?? body.date ?? todayStr()).trim() || todayStr();
 
     const createdAccounts: string[] = [];
-    let autoCreatedAccountId: number | null = null;
-    if (!accountId && pendingAutoAccName) {
-      autoCreatedAccountId = await createAutoAccount(db, oa.ledgerId, pendingAutoAccName, createdAccounts);
-      accountId = autoCreatedAccountId;
-    }
-
+    const autoCreatedAccountIds: number[] = [];
     let id: number;
     try {
+      if (!accountId && pendingAutoAccName) {
+        const newAccId = await createAutoAccount(db, oa.ledgerId, pendingAutoAccName, createdAccounts);
+        autoCreatedAccountIds.push(newAccId);
+        accountId = newAccId;
+      }
+      if (!toAccountId && pendingAutoToAccName) {
+        if (pendingAutoAccName && normName(pendingAutoAccName) === normName(pendingAutoToAccName) && autoCreatedAccountIds[0]) {
+          toAccountId = autoCreatedAccountIds[0];
+        } else {
+          const newToAccId = await createAutoAccount(db, oa.ledgerId, pendingAutoToAccName, createdAccounts);
+          autoCreatedAccountIds.push(newToAccId);
+          toAccountId = newToAccId;
+        }
+      }
       id = await txn.createTransaction(db, oa.ledgerId, oa.userId, {
         type,
         amount_cents: amountCents,
@@ -346,10 +394,10 @@ openapiRoutes.post('/transactions', async (c) => {
         source: String(body.source || 'openapi').slice(0, 30),
       });
     } catch (err) {
-      if (autoCreatedAccountId) {
-        await db.run('DELETE FROM accounts WHERE id = ? AND ledger_id = ?', autoCreatedAccountId, oa.ledgerId).catch(() => {});
-        createdAccounts.length = 0;
+      for (const accId of autoCreatedAccountIds) {
+        await db.run('DELETE FROM accounts WHERE id = ? AND ledger_id = ?', accId, oa.ledgerId).catch(() => {});
       }
+      createdAccounts.length = 0;
       throw err;
     }
     const created = await txn.getTransaction(db, id, oa.ledgerId);
@@ -358,6 +406,14 @@ openapiRoutes.post('/transactions', async (c) => {
         ok: true,
         id,
         transaction: created,
+        accounts_created: createdAccounts,
+        category_resolved: created?.category_id
+          ? {
+              id: Number(created.category_id),
+              name: created.category_name || null,
+              path: created.category_path || null,
+            }
+          : null,
         ...(createdAccounts.length ? { created_accounts: createdAccounts } : {}),
       },
       201,
@@ -432,6 +488,15 @@ openapiRoutes.post('/ai/bill', async (c) => {
   const env = envOf(c);
   let savedImages: SavedAiImage[] = [];
   const createdIds: number[] = [];
+  const createdAccounts: string[] = [];
+  let autoCreatedDefaultAccId: number | null = null;
+  const cleanupAutoDefaultAcc = async () => {
+    if (autoCreatedDefaultAccId) {
+      await db.run('DELETE FROM accounts WHERE id = ? AND ledger_id = ?', autoCreatedDefaultAccId, oa.ledgerId).catch(() => {});
+      autoCreatedDefaultAccId = null;
+      createdAccounts.length = 0;
+    }
+  };
   try {
     const body = (await c.req.json()) as Record<string, unknown>;
     const rawImages = extractRawImages(body);
@@ -444,16 +509,52 @@ openapiRoutes.post('/ai/bill', async (c) => {
     }
 
     const validImages = validateRawImages(rawImages);
+    const shouldSave =
+      (body.confirm === undefined || parseBoolFlag(body.confirm, 1) === 1) &&
+      (body.auto_save === undefined || parseBoolFlag(body.auto_save, 1) === 1);
+    const saveImages = parseBoolFlag(body.save_images, 1) === 1;
+
+    let defaultAccountId = parseOptionalRefId(body.default_account_id ?? body.account_id, null, '默认账户 ID');
+    const defaultAccName = String(body.default_account ?? body.default_account_name ?? '').trim().slice(0, 30);
+    let pendingAutoDefaultAccName: string | null = null;
+    if (!defaultAccountId && defaultAccName) {
+      const foundDefault = await lookupAccountIdByName(db, oa.ledgerId, defaultAccName);
+      if (foundDefault) {
+        defaultAccountId = foundDefault;
+      } else {
+        if (body.auto_create_account === false) {
+          return c.json({ ok: false, error: `账户「${defaultAccName}」不存在` }, 400);
+        }
+        pendingAutoDefaultAccName = defaultAccName;
+      }
+    }
+
+    if (shouldSave && pendingAutoDefaultAccName) {
+      autoCreatedDefaultAccId = await createAutoAccount(db, oa.ledgerId, pendingAutoDefaultAccName, createdAccounts);
+      defaultAccountId = autoCreatedDefaultAccId;
+    }
+
     const res = await analyzeBill(db, {
       images: validImages,
       text,
       ledgerId: oa.ledgerId,
-      defaultAccountId: body.account_id ? Number(body.account_id) : null,
+      defaultAccountId,
+      skipDefaultAccountFallback: !shouldSave && Boolean(pendingAutoDefaultAccName),
     });
 
     const warnings = [...res.warnings];
+    const items =
+      !shouldSave && pendingAutoDefaultAccName
+        ? res.items.map((it) =>
+            it.account_id == null ? { ...it, account_name: it.account_name || pendingAutoDefaultAccName } : it,
+          )
+        : res.items;
+    if (!shouldSave && pendingAutoDefaultAccName && items.some((it) => it.account_id == null)) {
+      warnings.push(`默认账户「${pendingAutoDefaultAccName}」将在确认入库时自动创建`);
+    }
+
     let imageSaveFailed = false;
-    if (res.items.length > 0 && validImages.length > 0) {
+    if (shouldSave && saveImages && items.length > 0 && validImages.length > 0) {
       const saved = await saveAiImagesBestEffort(db, env, {
         ledgerId: oa.ledgerId,
         userId: oa.userId,
@@ -465,14 +566,14 @@ openapiRoutes.post('/ai/bill', async (c) => {
       if (imageSaveFailed) warnings.push('部分凭证图片保存失败');
     }
 
-    const autoSave = body.auto_save !== false;
     const source = String(body.source || (validImages.length ? 'ai_screenshot' : 'openapi')).slice(0, 30);
     let duplicates = 0;
     const errors: string[] = [];
+    const linkedMap = new Map<number, number>();
 
-    if (autoSave && res.items.length) {
-      for (let i = 0; i < res.items.length; i++) {
-        const it = res.items[i];
+    if (shouldSave && items.length) {
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
         if (!(it.amount_cents > 0)) continue;
         const currency = String(it.currency || 'CNY').trim().toUpperCase().slice(0, 8) || 'CNY';
         const dupId = await findDuplicateAiTxn(
@@ -513,37 +614,58 @@ openapiRoutes.post('/ai/bill', async (c) => {
         }
       }
       if (createdIds.length && savedImages.length) {
-        await attach.linkImagesToTxns(db, {
+        const pairs = await attach.linkImagesToTxns(db, {
           ledgerId: oa.ledgerId,
           imageIds: savedImages.map((s) => s.id),
           txnIds: createdIds,
           aiStatus: 'linked',
         });
+        for (const p of pairs) linkedMap.set(p.image_id, p.txn_id);
       } else if (!createdIds.length && savedImages.length) {
         await cleanupSavedAiImages(db, env, oa.ledgerId, savedImages);
         savedImages = [];
       }
+      if (!createdIds.length) {
+        await cleanupAutoDefaultAcc();
+      }
       if (!createdIds.length && errors.length && duplicates === 0) {
         return c.json({ ok: false, error: errors[0], errors }, 400);
       }
+    } else if (shouldSave && !items.length) {
+      await cleanupAutoDefaultAcc();
     }
+
+    const imagesOut = savedImages.map((img) => {
+      const txnId = linkedMap.get(img.id) ?? img.txn_id ?? null;
+      return {
+        ...img,
+        path: img.rel,
+        api_url: `/api/open/attachments/${img.id}`,
+        txn_id: txnId,
+      };
+    });
 
     return c.json({
       ok: true,
+      confirmed: shouldSave,
       engine: res.engine,
       model: res.model,
-      items: res.items,
+      items,
+      drafts: items,
       created: createdIds.length,
       duplicates,
       ids: createdIds,
       warnings,
-      images: savedImages,
+      images: imagesOut,
+      accounts_created: createdAccounts,
+      ...(createdAccounts.length ? { created_accounts: createdAccounts } : {}),
       ...(errors.length ? { errors } : {}),
       ...(imageSaveFailed ? { imageSaveFailed: true } : {}),
     });
   } catch (e) {
-    if (!createdIds.length && savedImages.length) {
-      await cleanupSavedAiImages(db, env, oa.ledgerId, savedImages);
+    if (!createdIds.length) {
+      await cleanupAutoDefaultAcc();
+      if (savedImages.length) await cleanupSavedAiImages(db, env, oa.ledgerId, savedImages);
     }
     return c.json({ ok: false, error: toPublicError(e) }, 400);
   }

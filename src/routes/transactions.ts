@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { isCreditGroupType, todayStr, TXN_TYPE_MAP } from '../db.js';
 import { accountOptionsHtml } from '../lib/accounts.js';
 import * as attach from '../lib/attachments.js';
+import * as auth from '../lib/auth.js';
 import * as fd from '../lib/formdata.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
@@ -12,6 +13,27 @@ import { txnFormPage } from '../views/transactions.js';
 import { bodyOf, dbOf, envOf, requireLedger, requireLogin, requireWrite, setFlash, siteMeta, takeFlash, toPublicError, wantsJson } from './helpers.js';
 
 export const txnRoutes = new Hono<HonoEnv>();
+
+const TXN_SOURCE_OPTS: Array<[string, string]> = [
+  ['manual', '手工记账'],
+  ['ai_screenshot', 'AI 截图'],
+  ['ai_text', 'AI 文字'],
+  ['import', '账单导入'],
+  ['recurring', '周期账单'],
+  ['subscription', '订阅扣费'],
+  ['openapi', '开放 API'],
+];
+
+const TXN_SORT_OPTS: Array<[NonNullable<txn.TxnFilter['sort']>, string]> = [
+  ['date_desc', '日期从新到旧'],
+  ['date_asc', '日期从旧到新'],
+  ['amount_desc', '金额从大到小'],
+  ['amount_asc', '金额从小到大'],
+];
+
+function collectBulkIds(body: Record<string, unknown>): number[] {
+  return [...new Set(([] as unknown[]).concat(body.ids || [], body.del_ids || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+}
 
 function readForm(body: Record<string, unknown>): txn.TxnWriteInput {
   const splits: txn.SplitInput[] = [];
@@ -51,6 +73,8 @@ txnRoutes.get('/transactions', async (c) => {
   if (!ctx.ledger) return c.redirect('/');
   const ledgerId = Number(ctx.ledger.id);
   const q = c.req.query();
+  const sort: txn.TxnFilter['sort'] =
+    q.sort === 'date_asc' || q.sort === 'amount_desc' || q.sort === 'amount_asc' ? q.sort : 'date_desc';
   const f: txn.TxnFilter = {
     type: q.type || undefined,
     kind: q.kind === 'expense' || q.kind === 'income' ? q.kind : undefined,
@@ -64,7 +88,7 @@ txnRoutes.get('/transactions', async (c) => {
     to: q.to || undefined,
     keyword: q.q || undefined,
     reimbursable: q.reimbursable === 'yes' || q.reimbursable === 'done' ? q.reimbursable : undefined,
-    sort: (q.sort as txn.TxnFilter['sort']) || 'date_desc',
+    sort,
     page: Number(q.page) || 1,
     pageSize: 40,
   };
@@ -74,6 +98,7 @@ txnRoutes.get('/transactions', async (c) => {
     fd.txFormData(db, ledgerId),
   ]);
   const groups = await txn.groupByDate(result.rows, db);
+  const writable = auth.canWrite(ctx.ledger.role);
   const filterQuery: Record<string, string | number | undefined> = {
     type: f.type,
     kind: f.kind,
@@ -89,18 +114,37 @@ txnRoutes.get('/transactions', async (c) => {
     reimbursable: f.reimbursable,
     sort: q.sort || undefined,
   };
+  const qHref = (patch: Record<string, string | number | undefined>) => {
+    const sp = new URLSearchParams();
+    for (const [k, v] of Object.entries({ ...filterQuery, ...patch })) {
+      if (v === undefined || v === null || v === '') continue;
+      sp.set(k, String(v));
+    }
+    const qs = sp.toString();
+    return qs ? `/transactions?${qs}` : '/transactions';
+  };
+  const today = todayStr();
+  const curMonth = today.slice(0, 7);
+  const prevMonth = u.addMonths(curMonth, -1);
+  const todayUtc = new Date(`${today}T00:00:00Z`);
+  const weekOffset = (todayUtc.getUTCDay() + 6) % 7;
+  const weekStart = u.addDays(today, -weekOffset);
+  const weekEnd = u.addDays(weekStart, 6);
+  const last30Start = u.addDays(today, -29);
+  const isTodayActive = f.from === today && f.to === today && !f.month;
+  const isWeekActive = f.from === weekStart && f.to === weekEnd && !f.month;
+  const isMonthActive = f.month === curMonth && !f.from && !f.to;
+  const isPrevMonthActive = f.month === prevMonth && !f.from && !f.to;
+  const isLast30Active = f.from === last30Start && f.to === today && !f.month;
+  const isAllTimeActive = !f.month && !f.from && !f.to;
   const hasAnyFilter = Object.values(filterQuery).some((v) => v !== undefined && v !== '');
   const hiddenFilters = [
     f.kind ? ['kind', f.kind] : null,
-    f.accountId ? ['account_id', String(f.accountId)] : null,
-    f.memberId ? ['member_id', String(f.memberId)] : null,
-    f.tagId ? ['tag_id', String(f.tagId)] : null,
-    f.source ? ['source', f.source] : null,
-    f.from ? ['from', f.from] : null,
-    f.to ? ['to', f.to] : null,
     f.reimbursable ? ['reimbursable', f.reimbursable] : null,
-    q.sort ? ['sort', q.sort] : null,
   ].filter((x): x is [string, string] => Boolean(x));
+
+  const csrf = c.get('csrf') || '';
+  const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
 
   return c.html(
     layout({
@@ -108,43 +152,81 @@ txnRoutes.get('/transactions', async (c) => {
       activeNav: 'transactions',
       ctx,
       siteName: meta.siteName,
-      csrf: c.get('csrf') || '',
+      csrf,
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
       body: `<div class="card"><form method="get" action="/transactions">
   ${hiddenFilters.map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`).join('')}
+  <div class="row wrap mb8" style="gap:6px">
+    <span class="tiny muted">时间：</span>
+    <a class="chip ${isAllTimeActive ? 'primary' : ''}" href="${esc(qHref({ month: undefined, from: undefined, to: undefined }))}">全部</a>
+    <a class="chip ${isTodayActive ? 'primary' : ''}" href="${esc(qHref({ month: undefined, from: today, to: today }))}">今天</a>
+    <a class="chip ${isWeekActive ? 'primary' : ''}" href="${esc(qHref({ month: undefined, from: weekStart, to: weekEnd }))}">本周</a>
+    <a class="chip ${isMonthActive ? 'primary' : ''}" href="${esc(qHref({ month: curMonth, from: undefined, to: undefined }))}">本月</a>
+    <a class="chip ${isPrevMonthActive ? 'primary' : ''}" href="${esc(qHref({ month: prevMonth, from: undefined, to: undefined }))}">上月</a>
+    <a class="chip ${isLast30Active ? 'primary' : ''}" href="${esc(qHref({ month: undefined, from: last30Start, to: today }))}">近 30 天</a>
+  </div>
+  <div class="row wrap mb8" style="gap:6px">
+    <span class="tiny muted">类型：</span>
+    <a class="chip ${!f.type && !f.kind && !f.reimbursable ? 'primary' : ''}" href="${esc(qHref({ type: undefined, kind: undefined, reimbursable: undefined }))}">全部</a>
+    <a class="chip ${f.kind === 'expense' && !f.type ? 'primary' : ''}" href="${esc(qHref({ kind: 'expense', type: undefined, reimbursable: undefined }))}">支出</a>
+    <a class="chip ${f.kind === 'income' && !f.type ? 'primary' : ''}" href="${esc(qHref({ kind: 'income', type: undefined, reimbursable: undefined }))}">收入</a>
+    <a class="chip ${f.type === 'transfer' ? 'primary' : ''}" href="${esc(qHref({ type: 'transfer', kind: undefined, reimbursable: undefined }))}">转账</a>
+    <a class="chip ${f.reimbursable === 'yes' ? 'primary' : ''}" href="${esc(qHref({ reimbursable: 'yes', type: undefined, kind: undefined }))}">待报销</a>
+  </div>
+  <div class="row wrap mb12" style="gap:6px">
+    <span class="tiny muted">来源：</span>
+    <a class="chip ${!f.source ? 'primary' : ''}" href="${esc(qHref({ source: undefined }))}">全部</a>
+    ${TXN_SOURCE_OPTS.map(([k, lbl]) => `<a class="chip ${f.source === k ? 'primary' : ''}" href="${esc(qHref({ source: k }))}">${esc(lbl)}</a>`).join('')}
+  </div>
   <div class="grid grid-4">
     <select name="type"><option value="">全部类型</option>${Object.entries(TXN_TYPE_MAP).map(([k, v]) => `<option value="${k}" ${f.type === k ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}</select>
-    <select name="category_id"><option value="">全部分类</option>${cats.map((cc) => `<option value="${cc.id}" ${f.categoryId === cc.id ? 'selected' : ''}>${esc(cc.path)}</option>`).join('')}</select>
-    <input type="month" name="month" value="${esc(f.month || '')}">
-    <input name="q" value="${esc(f.keyword || '')}" placeholder="关键词">
+    <select name="category_id"><option value="">全部分类</option>${cats.map((cc) => `<option value="${cc.id}" ${f.categoryId === cc.id ? 'selected' : ''}>${cc.kind === 'income' ? '[收] ' : ''}${esc(cc.path)}</option>`).join('')}</select>
+    <select name="account_id">${accountOptionsHtml(form.accounts, { selectedId: f.accountId, emptyLabel: '全部账户' })}</select>
+    <select name="member_id"><option value="">全部成员</option>${form.members.map((m) => `<option value="${m.user_id}" ${f.memberId === Number(m.user_id) ? 'selected' : ''}>${esc(m.nickname || m.display_name)}</option>`).join('')}</select>
+    <select name="tag_id"><option value="">全部标签</option>${form.tags.map((tg) => `<option value="${tg.id}" ${f.tagId === Number(tg.id) ? 'selected' : ''}>#${esc(tg.name)}</option>`).join('')}</select>
+    <select name="source"><option value="">全部来源</option>${TXN_SOURCE_OPTS.map(([k, lbl]) => `<option value="${k}" ${f.source === k ? 'selected' : ''}>${esc(lbl)}</option>`).join('')}</select>
+    <input type="month" name="month" value="${esc(f.month || '')}" title="按月份">
+    <input type="date" name="from" value="${esc(f.from || '')}" title="开始日期">
+    <input type="date" name="to" value="${esc(f.to || '')}" title="结束日期">
+    <select name="sort">${TXN_SORT_OPTS.map(([k, lbl]) => `<option value="${k}" ${sort === k ? 'selected' : ''}>${esc(lbl)}</option>`).join('')}</select>
+    <input name="q" value="${esc(f.keyword || '')}" placeholder="关键词：商家 / 备注 / 分类">
   </div>
   <div class="row mt12 wrap">
     <button class="btn btn-primary" type="submit">筛选</button>
-    <a class="btn" href="/transactions?reimbursable=yes">待报销</a>
     ${hasAnyFilter ? '<a class="btn" href="/transactions">清空筛选</a>' : ''}
     <span class="muted small amount">共 ${result.total} 笔 · 收入 +${u.fmtAmount(result.sum.income)} · 支出 -${u.fmtAmount(result.sum.expense)}</span>
   </div>
 </form></div>
 <div class="mt16">
-<form id="bulk-form" method="post" action="/transactions/bulk-delete">
-  <input type="hidden" name="_csrf" value="${esc(c.get('csrf') || '')}">
+<form id="bulk-form" method="post" action="/transactions/bulk">
+  ${csrfInput}
   <div class="card">
     <div class="row mb12">
-      <label class="check"><input type="checkbox" id="bulk-all"> 全选本页</label>
+      ${writable ? '<label class="check"><input type="checkbox" id="bulk-all"> 全选本页</label>' : '<span class="muted small">只读预览</span>'}
       <span class="spacer"></span>
       <a class="btn btn-sm btn-ghost" href="/transactions/deleted">已删除 →</a>
     </div>
-    ${groupList(groups, { bulk: true })}
+    ${groupList(groups, { bulk: writable, writable })}
   </div>
-  <div class="card hidden mt12" id="bulk-bar" style="position:sticky;bottom:10px;z-index:40">
-    <div class="row wrap">
+  ${
+    writable
+      ? `<div class="card hidden mt12" id="bulk-bar" style="position:sticky;bottom:10px;z-index:40">
+    <div class="row wrap" style="gap:8px">
       <span class="small">已选 <b id="bulk-count">0</b> 笔：</span>
-      <button class="btn btn-sm btn-danger" type="submit">批量删除</button>
+      <button class="btn btn-sm btn-danger" type="submit" name="action" value="delete">批量删除</button>
+      <select name="category_id" style="width:auto"><option value="">批量改分类…</option>${cats.map((cc) => `<option value="${cc.id}">${cc.kind === 'income' ? '[收] ' : ''}${esc(cc.path)}</option>`).join('')}</select>
+      <button class="btn btn-sm" type="submit" name="action" value="category">改分类</button>
+      <input name="tags" list="bulk-tag-list" placeholder="批量加标签…" style="width:130px">
+      <datalist id="bulk-tag-list">${form.tags.map((tg) => `<option value="${esc(tg.name)}">`).join('')}</datalist>
+      <button class="btn btn-sm" type="submit" name="action" value="tag">加标签</button>
+      <button class="btn btn-sm" type="submit" name="action" value="mark_reimbursable">标记待报销</button>
       <select name="account_id" style="width:auto">${accountOptionsHtml(form.accounts, { emptyLabel: '报销入账账户…' })}</select>
-      <button class="btn btn-sm btn-primary" type="submit" formaction="/transactions/bulk-reimburse">报销入账</button>
+      <button class="btn btn-sm btn-primary" type="submit" name="action" value="reimburse">报销入账</button>
     </div>
-  </div>
+  </div>`
+      : ''
+  }
 </form>
 </div>
 ${paginationHtml('/transactions', filterQuery, result.page, result.pages, result.total)}`,
@@ -247,21 +329,117 @@ txnRoutes.post('/transactions', async (c) => {
   }
 });
 
+txnRoutes.post('/transactions/bulk', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const ledgerId = Number(ctx.ledger!.id);
+  const body = await bodyOf(c);
+  const ids = collectBulkIds(body);
+  const action = String(body.action || '').trim();
+  const isJson = body._json === '1' || wantsJson(c);
+  const fallbackBack = action === 'restore' ? '/transactions/deleted' : '/transactions';
+  const back = u.safeInternalPath(body.back, fallbackBack);
+
+  try {
+    if (!ids.length) throw new Error('请先选择要操作的流水');
+    if (action === 'delete') {
+      const res = await txn.bulkDelete(db, ids, ledgerId, { env: envOf(c) });
+      if (isJson) return c.json({ ok: true, action, ...res });
+      const reasons = [...new Set(res.skipped.map((s) => s.reason))];
+      setFlash(
+        c,
+        'success',
+        `已删除 ${res.deleted} 笔${res.skipped.length ? `，${res.skipped.length} 笔跳过（${reasons.join('；')}）` : ''}`,
+      );
+      return c.redirect(back);
+    }
+    if (action === 'reimburse') {
+      const accountId = body.account_id ? Number(body.account_id) : 0;
+      const res = await txn.markReimbursed(db, ids, ledgerId, ctx.user!.id, accountId);
+      if (isJson) return c.json({ ok: true, action, ...res });
+      const reasons = [...new Set(res.skipped.map((s) => s.reason))];
+      setFlash(
+        c,
+        'success',
+        `已标记 ${res.count} 笔为已报销，生成入账 ${(res.total / 100).toFixed(2)}${res.skipped.length ? `，${res.skipped.length} 笔跳过（${reasons.join('；')}）` : ''}`,
+      );
+      return c.redirect(back);
+    }
+    if (action === 'category') {
+      const categoryId = body.category_id ? Number(body.category_id) : 0;
+      const res = await txn.bulkUpdateCategory(db, ids, ledgerId, categoryId);
+      if (isJson) return c.json({ ok: true, action, ...res });
+      const reasons = [...new Set(res.skipped.map((s) => s.reason))];
+      setFlash(
+        c,
+        res.updated > 0 ? 'success' : 'warn',
+        `已批量修改分类 ${res.updated} 笔${res.skipped.length ? `，${res.skipped.length} 笔跳过（${reasons.join('；')}）` : ''}`,
+      );
+      return c.redirect(back);
+    }
+    if (action === 'tag') {
+      let tagsInput = String(body.tags ?? body.tag_name ?? '').trim();
+      if (!tagsInput && body.tag_id) {
+        const tagRow = await db.get<{ name: string }>(
+          'SELECT name FROM tags WHERE id = ? AND ledger_id = ?',
+          Number(body.tag_id),
+          ledgerId,
+        );
+        tagsInput = tagRow?.name || '';
+      }
+      const res = await txn.bulkAddTags(db, ids, ledgerId, tagsInput);
+      if (isJson) return c.json({ ok: true, action, ...res });
+      setFlash(
+        c,
+        'success',
+        `已为 ${res.updated} 笔添加标签${res.skipped.length ? `，${res.skipped.length} 笔跳过` : ''}`,
+      );
+      return c.redirect(back);
+    }
+    if (action === 'mark_reimbursable') {
+      const res = await txn.bulkMarkReimbursable(db, ids, ledgerId);
+      if (isJson) return c.json({ ok: true, action, ...res });
+      const reasons = [...new Set(res.skipped.map((s) => s.reason))];
+      setFlash(
+        c,
+        res.updated > 0 ? 'success' : 'warn',
+        `已标记 ${res.updated} 笔为待报销${res.skipped.length ? `，${res.skipped.length} 笔跳过（${reasons.join('；')}）` : ''}`,
+      );
+      return c.redirect(back);
+    }
+    if (action === 'restore') {
+      const res = await txn.bulkRestore(db, ids, ledgerId);
+      if (isJson) return c.json({ ok: true, action, ...res });
+      const reasons = [...new Set(res.skipped.map((s) => s.reason))];
+      setFlash(
+        c,
+        res.restored > 0 ? 'success' : 'warn',
+        `已恢复 ${res.restored} 笔流水与余额${res.skipped.length ? `，${res.skipped.length} 笔跳过（${reasons.join('；')}）` : ''}`,
+      );
+      return c.redirect(back);
+    }
+    throw new Error('不支持的批量操作类型');
+  } catch (e) {
+    if (isJson) return c.json({ ok: false, error: toPublicError(e) }, 400);
+    setFlash(c, 'error', toPublicError(e));
+    return c.redirect(back);
+  }
+});
+
 txnRoutes.post('/transactions/bulk-delete', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const body = await bodyOf(c);
-  const ids = ([] as unknown[])
-    .concat(body.ids || [], body.del_ids || [])
-    .map(Number)
-    .filter(Boolean);
+  const ids = collectBulkIds(body);
   const res = await txn.bulkDelete(db, ids, Number(ctx.ledger!.id), { env: envOf(c) });
   if (body._json === '1' || wantsJson(c)) return c.json({ ok: true, ...res });
   const reasons = [...new Set(res.skipped.map((s) => s.reason))];
   setFlash(c, 'success', `已删除 ${res.deleted} 笔${res.skipped.length ? `，${res.skipped.length} 笔跳过（${reasons.join('；')}）` : ''}`);
-  return c.redirect(String(body.back || '/transactions'));
+  return c.redirect(u.safeInternalPath(body.back, '/transactions'));
 });
 
 txnRoutes.post('/transactions/bulk-reimburse', async (c) => {
@@ -270,7 +448,7 @@ txnRoutes.post('/transactions/bulk-reimburse', async (c) => {
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const body = await bodyOf(c);
-  const ids = ([] as unknown[]).concat(body.ids || []).map(Number).filter(Boolean);
+  const ids = collectBulkIds(body);
   const accountId = body.account_id ? Number(body.account_id) : 0;
   const isJson = body._json === '1' || wantsJson(c);
   try {
@@ -317,6 +495,7 @@ txnRoutes.get('/transactions/deleted', async (c) => {
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
+  const writable = auth.canWrite(ctx.ledger!.role);
   const rows = await db.all<{ id: number; txn_date: string; type: string; amount_cents: number; note: string | null; merchant: string | null; category_name: string | null; deleted_at: string }>(
     `SELECT t.*, c.name AS category_name FROM transactions t
      LEFT JOIN categories c ON c.id = t.category_id
@@ -333,18 +512,32 @@ txnRoutes.get('/transactions/deleted', async (c) => {
       csrf,
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: `<div class="card"><div class="card-head"><b>已删除的记账</b><a class="btn btn-sm" href="/transactions">返回账单 →</a></div>
+      body: `<form id="bulk-form" method="post" action="/transactions/bulk">
+  <input type="hidden" name="_csrf" value="${esc(csrf)}">
+  <input type="hidden" name="back" value="/transactions/deleted">
+  <div class="card"><div class="card-head"><b>已删除的记账</b><a class="btn btn-sm" href="/transactions">返回账单 →</a></div>
 ${
   rows.length
-    ? `<table class="table"><thead><tr><th>日期</th><th>类型</th><th>金额</th><th>备注</th><th>删除时间</th><th>操作</th></tr></thead><tbody>
+    ? `<div class="scroll-x"><table class="table"><thead><tr>${writable ? '<th style="width:32px"><input type="checkbox" id="bulk-all" title="全选"></th>' : ''}<th>日期</th><th>类型</th><th>金额</th><th>备注</th><th>删除时间</th>${writable ? '<th>操作</th>' : ''}</tr></thead><tbody>
 ${rows
   .map(
-    (t) => `<tr><td>${esc(t.txn_date)}</td><td>${esc(TXN_TYPE_MAP[t.type]?.label || t.type)}</td><td class="amount">${esc(u.fmtAmount(t.amount_cents))}</td><td>${esc(t.note || t.merchant || t.category_name || '')}</td><td class="tiny muted">${esc(u.fmtDateTime(t.deleted_at))}</td>
-<td><form method="post" action="/transactions/${t.id}/restore" style="display:inline"><input type="hidden" name="_csrf" value="${esc(csrf)}"><button class="btn btn-sm" type="submit">恢复</button></form></td></tr>`,
+    (t) => `<tr>${writable ? `<td><input type="checkbox" class="bulk-item" name="ids" value="${t.id}"></td>` : ''}<td>${esc(t.txn_date)}</td><td>${esc(TXN_TYPE_MAP[t.type]?.label || t.type)}</td><td class="amount">${esc(u.fmtAmount(t.amount_cents))}</td><td>${esc(t.note || t.merchant || t.category_name || '')}</td><td class="tiny muted">${esc(u.fmtDateTime(t.deleted_at))}</td>
+${writable ? `<td><button class="btn btn-sm" type="submit" formaction="/transactions/${t.id}/restore">恢复</button></td>` : ''}</tr>`,
   )
-  .join('')}</tbody></table>`
+  .join('')}</tbody></table></div>`
     : '<div class="empty">没有已删除的记账</div>'
-}</div>`,
+}</div>
+  ${
+    writable && rows.length
+      ? `<div class="card hidden mt12" id="bulk-bar" style="position:sticky;bottom:10px;z-index:40">
+    <div class="row wrap">
+      <span class="small">已选 <b id="bulk-count">0</b> 笔：</span>
+      <button class="btn btn-sm btn-primary" type="submit" name="action" value="restore">批量恢复</button>
+    </div>
+  </div>`
+      : ''
+  }
+</form>`,
     }),
   );
 });

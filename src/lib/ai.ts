@@ -164,7 +164,10 @@ export const isMaskedSecret = (v: unknown): boolean => MASKED_SECRET.test(String
 
 export function isHeaderSafe(v: unknown): boolean {
   const s = String(v == null ? '' : v);
-  for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) > 255) return false;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code < 32 || code === 127 || code > 255) return false;
+  }
   return true;
 }
 
@@ -322,6 +325,8 @@ export async function getAiConfig(db: Db): Promise<AiConfig> {
   for (const r of rows) map[r.key] = r.value;
   const rawKey = String(map['ai.api_key'] || '').trim();
   const apiKey = sanitizeSecret(rawKey);
+  const rawTimeout = Number(map['ai.timeout_ms'] || '90000');
+  const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? Math.max(5000, Math.min(300000, Math.round(rawTimeout))) : 90000;
   return {
     enabled: String(map['ai.enabled'] || 'false') === 'true',
     baseUrl: String(map['ai.base_url'] || '').replace(/\/+$/, ''),
@@ -330,7 +335,7 @@ export async function getAiConfig(db: Db): Promise<AiConfig> {
     model: String(map['ai.model'] || '').trim(),
     vision: String(map['ai.vision'] ?? 'true') === 'true',
     autoSave: String(map['ai.auto_save'] || 'false') === 'true',
-    timeoutMs: Number(map['ai.timeout_ms'] || '90000') || 90000,
+    timeoutMs,
   };
 }
 
@@ -611,11 +616,13 @@ export async function analyzeBill(
     text = '',
     ledgerId,
     defaultAccountId = null,
+    skipDefaultAccountFallback = false,
   }: {
     images?: Array<string | { dataUrl?: string; url?: string }>;
     text?: string;
     ledgerId: number;
     defaultAccountId?: number | null;
+    skipDefaultAccountFallback?: boolean;
   },
 ) {
   const cfg = await getAiConfig(db);
@@ -655,7 +662,9 @@ export async function analyzeBill(
         return {
           engine: 'llm' as const,
           model: cfg.model,
-          items: await applyDefaultAccountFallback(db, ledgerId, normalized, warnings, defaultAccountId),
+          items: skipDefaultAccountFallback
+            ? normalized
+            : await applyDefaultAccountFallback(db, ledgerId, normalized, warnings, defaultAccountId),
           warnings,
         };
       }
@@ -676,7 +685,9 @@ export async function analyzeBill(
       return {
         engine: 'rule' as const,
         model: null,
-        items: await applyDefaultAccountFallback(db, ledgerId, done, warnings, defaultAccountId),
+        items: skipDefaultAccountFallback
+          ? done
+          : await applyDefaultAccountFallback(db, ledgerId, done, warnings, defaultAccountId),
         warnings,
       };
     }

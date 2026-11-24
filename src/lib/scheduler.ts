@@ -704,13 +704,18 @@ export async function cleanupOrphanR2(db: Db, env: Pick<Env, 'ATTACHMENTS'>) {
   }
   deletedImports = staleImports.length;
 
-  const [listed, rows] = await Promise.all([
+  const [listed, rows, avatarRows] = await Promise.all([
     listAllObjects(env.ATTACHMENTS, 'uploads/'),
     db.all<{ rel_path: string }>('SELECT rel_path FROM attachments'),
+    db.all<{ avatar_path: string }>('SELECT avatar_path FROM users WHERE avatar_path IS NOT NULL'),
   ]);
   const known = new Set(rows.map((r) => r.rel_path));
+  for (const uRow of avatarRows) {
+    const clean = String(uRow.avatar_path || '').replace(/^uploads\/avatars\//, '');
+    if (clean && !clean.includes('..')) known.add(`uploads/avatars/${clean}`);
+  }
   const orphans = listed
-    .filter((o) => !o.key.startsWith('uploads/avatars/') && !known.has(o.key) && o.uploaded.getTime() < cutoff)
+    .filter((o) => !known.has(o.key) && o.uploaded.getTime() < cutoff)
     .map((o) => o.key);
   for (let i = 0; i < orphans.length; i += 1000) {
     await env.ATTACHMENTS.delete(orphans.slice(i, i + 1000));

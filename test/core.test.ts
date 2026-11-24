@@ -12,12 +12,13 @@ import {
   verifyPassword,
   verifySession,
 } from '../src/lib/auth.js';
-import { APP, CHANGELOG, FEATURES, TECH, issuesUrl, repoUrl } from '../src/lib/about.js';
+import { APP, CHANGELOG, FEATURES, TECH, fmtBytes, issuesUrl, repoLabel, repoUrl } from '../src/lib/about.js';
 import { barChart, donutChart, heatmapChart, lineChart } from '../src/lib/charts.js';
 import { advanceDate } from '../src/lib/scheduler.js';
 import { decorateCard } from '../src/lib/session-cards.js';
 import { advance, firstChargeDate } from '../src/lib/subscriptions.js';
 import { BACKUP_TABLES, MAX_SQL_PARAMS, validateAndBuildRestorePlan, type TableColumnInfo } from '../src/lib/backup.js';
+import { csvEscape } from '../src/lib/importers.js';
 import { safeInternalPath } from '../src/lib/util.js';
 import { parseReportRange } from '../src/routes/reports.js';
 
@@ -430,7 +431,24 @@ test('about 模块常量与 GitHub Issues 链接推导', () => {
   assert.equal(issuesUrl({ HOMELEDGER_GITHUB_REPO: 'https://gitlab.example.com/org/repo' }), null);
   assert.equal(repoUrl({ HOMELEDGER_GITHUB_REPO: 'javascript:alert(1)' }), '');
   assert.equal(repoUrl({ HOMELEDGER_GITHUB_REPO: 'data:text/html,hi' }), '');
+  assert.equal(repoLabel('https://github.com/HeroLi-9527/homeledger'), 'HeroLi-9527/homeledger');
+  assert.equal(fmtBytes(512), '512 B');
+  assert.equal(fmtBytes(2048), '2.0 KB');
   assert.equal(safeInternalPath('/\tevil.com', '/'), '/');
   assert.equal(safeInternalPath('/\\evil.com', '/'), '/');
   assert.equal(safeInternalPath('/transactions?a=1#h', '/'), '/transactions?a=1#h');
+});
+
+test('csvEscape 中和公式注入并保留合法负金额', () => {
+  assert.equal(csvEscape('-50.00'), '-50.00');
+  assert.equal(csvEscape('0'), '0');
+  assert.equal(csvEscape('正常商家'), '正常商家');
+  assert.equal(csvEscape('=1+1'), "'=1+1");
+  assert.equal(csvEscape('+CMD()'), "'+CMD()");
+  assert.equal(csvEscape('-2+3'), "'-2+3");
+  assert.equal(csvEscape('-cmd'), "'-cmd");
+  assert.equal(csvEscape('@SUM(A1:A2)'), "'@SUM(A1:A2)");
+  assert.equal(csvEscape('\t=1+1'), "'\t=1+1");
+  assert.equal(csvEscape('\r=1+1'), '"\'\r=1+1"');
+  assert.equal(csvEscape('  =HYPERLINK("a","b")'), '"  \'=HYPERLINK(""a"",""b"")"'.replace('  \'', '\'  '));
 });

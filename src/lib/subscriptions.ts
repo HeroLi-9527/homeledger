@@ -187,7 +187,7 @@ export function decorate(sub: SubscriptionRow, extras: Record<string, unknown> =
 
 export async function overview(db: Db, ledgerId: number) {
   const month = todayStr().slice(0, 7);
-  const [rows, chargedRow] = await Promise.all([
+  const [rows, chargedRow, ledgerRow] = await Promise.all([
     db.all<SubscriptionRow>(
       `SELECT s.*, a.name AS account_name, c.name AS category_name, c.icon AS category_icon
        FROM subscriptions s
@@ -205,10 +205,18 @@ export async function overview(db: Db, ledgerId: number) {
       Number(ledgerId),
       month,
     ),
+    db.get<{ currency: string }>('SELECT currency FROM ledgers WHERE id = ?', Number(ledgerId)),
   ]);
 
+  const baseCurrency = String(ledgerRow?.currency || 'CNY').toUpperCase();
   const items = rows.map((r) => decorate(r, { charge_count: Number(r.charge_count) || 0 }));
   const live = items.filter((s) => s.status === 'active' || s.status === 'trial');
+  const dueThisMonthItems = live.filter((s) => String(s.next_charge_at).slice(0, 7) === month);
+  let thisMonthPending = 0;
+  for (const s of dueThisMonthItems) {
+    const rate = await resolveRate(db, s.currency || baseCurrency, baseCurrency);
+    thisMonthPending += toBase(Math.abs(Number(s.amount_cents) || 0), rate);
+  }
   const upcoming =
     live.filter((s) => s.daysLeft !== null && s.daysLeft <= 7).sort((a, b) => (a.daysLeft ?? 0) - (b.daysLeft ?? 0))[0] ||
     null;
@@ -223,7 +231,8 @@ export async function overview(db: Db, ledgerId: number) {
     monthlyTotal: live.reduce((sum, s) => sum + Number(s.monthly_cents), 0),
     annualTotal: live.reduce((sum, s) => sum + Number(s.annual_cents), 0),
     annualPaidCount: live.filter((s) => s.cycle === 'yearly' || s.cycle === 'half_yearly').length,
-    dueThisMonth: live.filter((s) => String(s.next_charge_at).slice(0, 7) === month).length,
+    dueThisMonth: dueThisMonthItems.length,
+    thisMonthPending,
     thisMonthCharged: Number(chargedRow?.s || 0),
     upcoming,
   };

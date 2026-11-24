@@ -595,8 +595,14 @@ export async function importRecords(
 }
 
 export function csvEscape(v: unknown): string {
-  const s = v === null || v === undefined ? '' : String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  const raw = v === null || v === undefined ? '' : String(v);
+  const isPlainNegativeNumber = /^-\d+(\.\d+)?$/.test(raw);
+  const needsNeutralize =
+    /^[\t\r]/.test(raw) ||
+    /^[\t\r ]*[=+@]/.test(raw) ||
+    (/^[\t\r ]*-/.test(raw) && !isPlainNegativeNumber);
+  const safe = needsNeutralize ? `'${raw}` : raw;
+  return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
 export function csvLine(cells: unknown[]): string {

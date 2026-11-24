@@ -34,7 +34,7 @@
 系统面向个人与家庭在 Cloudflare 免费套餐下的长期稳定运行而设计，尽量压缩不必要的边缘读写开销：
 
 1. **无状态 HMAC-SHA256 会话鉴权**：浏览器会话通过 `SESSION_SECRET` 签名的 `hl.sid` Cookie 携带 `{ uid, lid, tv, csrf, exp }` 载荷，正常页面浏览无需读写会话表；配合 `users.token_version`，在修改密码、管理员重置密码/停用账号或全库恢复时即可即时令全端旧会话与 API 令牌同时失效。
-2. **迁移一次性初始化**：数据库结构、209 个系统分类、10 条默认汇率与站点默认配置由 `migrations/0001_init.sql`–`0003_session_cards.sql` 一次性落库，运行期免除初始化探测查询；首次访问 `/setup` 创建首个站点管理员。
+2. **迁移一次性初始化**：数据库结构、209 个系统分类、10 条默认汇率与站点默认配置由 `migrations/0001_init.sql`–`0004_txn_subscription_idx.sql` 一次性落库，运行期免除初始化探测查询；首次访问 `/setup` 创建首个站点管理员。
 3. **单表通知幂等去重**：`notifications(user_id, dedupe_key)` 使用部分唯一索引配合 `INSERT OR IGNORE`，单条 SQL 完成周期、订阅、预算、借贷、目标、信用账期与次卡提醒去重。
 4. **只读 OpenAPI 鉴权**：`/api/open/*` 使用 SHA-256 摘要存储的 Bearer Token 鉴权，鉴权阶段仅执行只读联合查询。
 5. **每 4 小时 Cron 与精准 R2 回收**：`wrangler.toml` 定时触发器配置为 `0 */4 * * *`（每天 6 次）；删除流水或单个附件时按已知 key 精准同步删除 R2 对象，不在定时任务中扫描整桶，仅保留管理员在 `/admin` 按需手动触发的孤儿文件清理入口。
@@ -49,7 +49,7 @@
 npm install
 cp .dev.vars.example .dev.vars
 
-# 2. 初始化本地 D1（应用 migrations/0001–0003）
+# 2. 初始化本地 D1（应用 migrations/0001–0004）
 npm run db:migrate:local
 
 # 3. 静态类型检查与全量单元测试 / 端到端测试
@@ -95,17 +95,37 @@ npx wrangler login
 npx wrangler d1 create homeledger-db
 npx wrangler r2 bucket create homeledger-attachments
 
-# 4. 将上一步返回的 database_id 填入 wrangler.toml 的 [[d1_databases]] 区块
+# 4. 复制配置模板并将 database_id 填入本地配置（避免把个人库名与 ID 误提交到 Git）
+cp wrangler.toml.example wrangler.local.toml   # 已加入 .gitignore；使用独立配置文件时以下各步需传 -c wrangler.local.toml
+# （若直接修改受跟踪的 wrangler.toml，建议执行：git update-index --skip-worktree wrangler.toml）
 
 # 5. 生成并写入生产环境 SESSION_SECRET（至少 16 位，建议 ≥ 32 位）
 openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET
+# （如使用 wrangler.local.toml：openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET -c wrangler.local.toml）
 
-# 6. 应用全部远程迁移（0001_init、0002_seed、0003_session_cards）并发布 Worker
-# （npm run deploy 已内置执行 `wrangler d1 migrations apply DB --remote && wrangler deploy`）
+# 6. 应用全部远程迁移（0001_init、0002_seed、0003_session_cards、0004_txn_subscription_idx）并发布 Worker
+# （npm run deploy 作用于默认的 wrangler.toml；若使用 wrangler.local.toml，请分两条命令执行：）
+#   npx wrangler d1 migrations apply DB --remote -c wrangler.local.toml
+#   npx wrangler deploy -c wrangler.local.toml
 npm run deploy
 ```
 
 > 若发布前遗漏配置 `SESSION_SECRET` 或长度不足 16 位，访问应用时会返回 503 配置引导页并阻止 `/setup` 半初始化；通过 `npx wrangler secret put SESSION_SECRET` 或在 Cloudflare 控制台 **Workers & Pages → Settings → Variables and Secrets** 中补齐后刷新页面即可恢复。
+
+### 运维工具脚本（D1 CLI）
+
+- **管理员/用户密码重置**（同时递增 `token_version` 并吊销 `api_tokens`）：
+  ```bash
+  npm run ops:reset-password -- --local                  # 重置本地最早管理员并生成随机密码
+  npm run ops:reset-password -- --remote --username admin --password 'NewStrongPassword123'
+  npm run ops:reset-password -- --dry-run                # 仅预览生成的 SQL
+  ```
+- **演示数据初始化**（含示例家庭账本、4 类账户、流水、预算、订阅、目标、借贷与次卡；远程执行须显式传 `--confirm-remote` 与独立的 `--password`，禁止使用默认演示弱密码）：
+  ```bash
+  npm run ops:seed-demo -- --local
+  npm run ops:seed-demo -- --remote --confirm-remote --password '<请替换为至少8位强密码>' --config wrangler.local.toml
+  npm run ops:seed-demo -- --dry-run
+  ```
 
 ### 上线后检查
 

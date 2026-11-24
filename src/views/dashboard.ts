@@ -23,6 +23,7 @@ export interface DashboardViewData {
   subs: { monthlyTotal: number; live: unknown[] };
   sessionCards: { activeCount: number; totalRemaining: number };
   aiReady: boolean;
+  writable?: boolean;
   month: string;
   monthLabel: string;
 }
@@ -118,7 +119,7 @@ export function dashboardPage(d: DashboardViewData): string {
         <a class="btn btn-sm" href="/transactions">全部明细 →</a>
       </div>
     </div>
-    ${groupList(d.recentGroups)}
+    ${groupList(d.recentGroups, { writable: d.writable })}
   </div>
   <div class="grid" style="align-content:start">
     <div class="card">

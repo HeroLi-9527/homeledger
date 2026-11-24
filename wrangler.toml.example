@@ -1,0 +1,46 @@
+# HomeLedger on Cloudflare Workers — 配置模板
+# 为避免将个人 D1 database_name / database_id 误提交到公开仓库，推荐两种方式之一：
+#   方式 A（推荐）：复制本文件为 wrangler.local.toml（已加入 .gitignore），后续命令行均传 -c wrangler.local.toml
+#   方式 B：直接编辑 wrangler.toml 并执行 git update-index --skip-worktree wrangler.toml
+#
+# 手动部署步骤（如使用 wrangler.local.toml）：
+#   npx wrangler login
+#   npx wrangler d1 create homeledger-db
+#   npx wrangler r2 bucket create homeledger-attachments
+#   把返回的 database_id 填入下方后执行：
+#   openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET -c wrangler.local.toml
+#   npx wrangler d1 migrations apply DB --remote -c wrangler.local.toml
+#   npx wrangler deploy -c wrangler.local.toml
+#   （若使用默认 wrangler.toml，可直接运行 npm run deploy）
+name = "homeledger"
+main = "src/index.ts"
+compatibility_date = "2025-11-17"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "homeledger-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "homeledger-attachments"
+
+# 定时任务：每 4 小时执行一次（周期账单 / 订阅扣费 / 预算预警 / 借贷与目标提醒 / 轻量 DB 清理）
+[triggers]
+crons = ["0 */4 * * *"]
+
+[vars]
+TZ = "Asia/Shanghai"
+SITE_NAME = "家账簿"
+# 若为 fork 仓库，可取消注释并填写完整 GitHub 仓库 URL（同时影响关于页展示文本与链接地址）：
+# HOMELEDGER_GITHUB_REPO = "https://github.com/HeroLi-9527/homeledger"
+
+# 敏感配置请通过 wrangler secret put 设置，勿明文提交：
+#   npx wrangler secret put SESSION_SECRET
+# 本地开发请复制 .dev.vars.example 为 .dev.vars

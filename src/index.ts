@@ -74,7 +74,7 @@ app.use('*', async (c, next) => {
   await next();
 
   if (!c.res.headers.has('Content-Security-Policy')) {
-    const noStore = path === '/settings/api-tokens' || path === '/export/json';
+    const noStore = path === '/settings/api-tokens' || path === '/export/json' || path === '/export/ledger.json';
     applySecurityHeaders(c.res, nonce, noStore);
   }
 });

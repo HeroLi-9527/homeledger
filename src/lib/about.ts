@@ -1,4 +1,5 @@
-export const GITHUB_REPO = 'https://github.com/sucraft-hub/homeledger';
+export const UPSTREAM_GITHUB_REPO = 'https://github.com/sucraft-hub/homeledger';
+export const GITHUB_REPO = UPSTREAM_GITHUB_REPO;
 
 export const APP = {
   name: '家账簿 HomeLedger',
@@ -67,4 +68,17 @@ export function issuesUrl(env: { HOMELEDGER_GITHUB_REPO?: string } = {}): string
   const repo = repoUrl(env);
   if (!repo || !/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(repo)) return null;
   return `${repo}/issues`;
+}
+
+export function repoLabel(url: string): string {
+  const m = /^https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)$/i.exec(String(url || '').trim());
+  return m ? m[1] : String(url || '');
+}
+
+export function fmtBytes(bytes: number): string {
+  const n = Math.max(0, Number(bytes) || 0);
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }

@@ -8,3 +8,4 @@ demo.html
 *.db-shm
 .DS_Store
 backups/
+wrangler.local.toml

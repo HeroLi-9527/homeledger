@@ -290,7 +290,11 @@ export async function resolveObject(env: Pick<Env, 'ATTACHMENTS'>, ledgerId: num
   return { obj, row };
 }
 
-export async function deleteKeysFromR2(env: Pick<Env, 'ATTACHMENTS'> | undefined, keys: string[]): Promise<void> {
+export async function deleteKeysFromR2(
+  env: Pick<Env, 'ATTACHMENTS'> | undefined,
+  keys: string[],
+  opts: { throwOnError?: boolean } = {},
+): Promise<void> {
   if (!env?.ATTACHMENTS) return;
   const valid = keys.filter(
     (k) => k && (k.startsWith('uploads/') || k.startsWith('imports/')) && !k.includes('..') && !k.includes('\\'),
@@ -298,8 +302,9 @@ export async function deleteKeysFromR2(env: Pick<Env, 'ATTACHMENTS'> | undefined
   for (let i = 0; i < valid.length; i += 1000) {
     try {
       await env.ATTACHMENTS.delete(valid.slice(i, i + 1000));
-    } catch {
-      /* ignore missing R2 keys */
+    } catch (e) {
+      console.error('[r2] delete failed:', e);
+      if (opts.throwOnError) throw e;
     }
   }
 }
@@ -332,9 +337,13 @@ export async function saveAvatar(
   return name;
 }
 
-export async function removeAvatar(env: Pick<Env, 'ATTACHMENTS'>, avatarPath: string | null | undefined): Promise<void> {
+export async function removeAvatar(
+  env: Pick<Env, 'ATTACHMENTS'>,
+  avatarPath: string | null | undefined,
+  opts: { throwOnError?: boolean } = {},
+): Promise<void> {
   if (!avatarPath) return;
   const clean = String(avatarPath).replace(/^uploads\/avatars\//, '');
   if (!clean || clean.includes('..')) return;
-  await deleteKeysFromR2(env, [`uploads/avatars/${clean}`]);
+  await deleteKeysFromR2(env, [`uploads/avatars/${clean}`], opts);
 }
