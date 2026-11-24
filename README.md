@@ -2,7 +2,7 @@
 
 基于 **Cloudflare Workers + TypeScript + Hono 4 + D1 + R2 + Cron Triggers** 构建的自托管家庭记账系统，零构建前端、全离线服务端 SVG 图表、AI 截图/文本双引擎记账与开放 API 一体化部署。
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/lizhengbo9527/homeledger)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/HeroLi-9527/homeledger)
 
 ---
 
@@ -82,7 +82,7 @@ npm run dev
 
 ### 一键部署（推荐）
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/lizhengbo9527/homeledger)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/HeroLi-9527/homeledger)
 
 1. **前置条件**：确保 Cloudflare 账号已开通 **R2**（提供每月 10GB 免费额度，首次启用需在控制台开通）。
 2. 点击上方 **Deploy to Cloudflare** 按钮并授权 GitHub，Cloudflare 会自动克隆仓库、创建 D1 数据库与 R2 存储桶，并在部署阶段通过 `npm run deploy` 自动执行 `migrations/0001–0003` 完成建表与初始化数据写入。
