@@ -2,8 +2,6 @@
 
 基于 **Cloudflare Workers + TypeScript + Hono 4 + D1 + R2 + Cron Triggers** 构建的自托管家庭记账系统，零构建前端、全离线服务端 SVG 图表、AI 截图/文本双引擎记账与开放 API 一体化部署。
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/HeroLi-9527/homeledger)
-
 ---
 
 ## 核心特性
@@ -80,34 +78,34 @@ npm run dev
 | `SITE_NAME` | Var | 否 | 默认站点标题（可在网页系统设置中动态覆盖），默认 `家账簿` |
 | `COOKIE_SECURE` | Var / Secret | 否 | 默认开启 `Secure` Cookie；仅纯 HTTP 本地调试时在 `.dev.vars` 设为 `false` |
 
-### 一键部署（推荐）
+### 手动部署步骤
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/HeroLi-9527/homeledger)
-
-1. **前置条件**：确保 Cloudflare 账号已开通 **R2**（提供每月 10GB 免费额度，首次启用需在控制台开通）。
-2. 点击上方 **Deploy to Cloudflare** 按钮并授权 GitHub，Cloudflare 会自动克隆仓库、创建 D1 数据库与 R2 存储桶，并在部署阶段通过 `npm run deploy` 自动执行 `migrations/0001–0003` 完成建表与初始化数据写入。
-3. 在部署向导或部署后的 Worker 面板 **Settings → Variables and Secrets** 中新增 **Secret** 类型变量 `SESSION_SECRET`（**至少 16 位**，建议 32 位以上随机字符串）。若未配置，访问应用时会展示 503 配置引导页并阻止不安全的半初始化。
-4. 访问部署域名，按引导在 `/setup` 创建首个站点管理员账户与默认账本。
-
-### 手动 CLI 部署步骤
+**前置条件**：本地已安装 Node.js（≥ 20），且 Cloudflare 账号已在控制台提前开通 **R2**（提供每月 10GB 免费额度）。
 
 ```bash
-# 1. 登录 Cloudflare（如尚未登录）
+# 1. 克隆仓库并安装依赖
+git clone https://github.com/HeroLi-9527/homeledger.git
+cd homeledger
+npm install
+
+# 2. 登录 Cloudflare（如尚未登录）
 npx wrangler login
 
-# 2. 创建远程 D1 数据库与 R2 存储桶
+# 3. 创建远程 D1 数据库与 R2 存储桶
 npx wrangler d1 create homeledger-db
 npx wrangler r2 bucket create homeledger-attachments
 
-# 3. 将上一步返回的 database_id 填入 wrangler.toml 的 [[d1_databases]] 区块
+# 4. 将上一步返回的 database_id 填入 wrangler.toml 的 [[d1_databases]] 区块
 
-# 4. 生成并写入生产环境 SESSION_SECRET（建议 ≥ 32 位）
+# 5. 生成并写入生产环境 SESSION_SECRET（至少 16 位，建议 ≥ 32 位）
 openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET
 
-# 5. 应用全部远程迁移（0001_init、0002_seed、0003_session_cards）并发布 Worker
+# 6. 应用全部远程迁移（0001_init、0002_seed、0003_session_cards）并发布 Worker
 # （npm run deploy 已内置执行 `wrangler d1 migrations apply DB --remote && wrangler deploy`）
 npm run deploy
 ```
+
+> 若发布前遗漏配置 `SESSION_SECRET` 或长度不足 16 位，访问应用时会返回 503 配置引导页并阻止 `/setup` 半初始化；通过 `npx wrangler secret put SESSION_SECRET` 或在 Cloudflare 控制台 **Workers & Pages → Settings → Variables and Secrets** 中补齐后刷新页面即可恢复。
 
 ### 上线后检查
 

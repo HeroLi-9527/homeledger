@@ -1,9 +1,11 @@
 # HomeLedger on Cloudflare Workers
-# 部署前：
+# 手动部署前：
+#   npx wrangler login
 #   npx wrangler d1 create homeledger-db
 #   npx wrangler r2 bucket create homeledger-attachments
 #   把返回的 database_id 填入下方后执行：
-#   npm run db:migrate && npm run deploy
+#   openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET
+#   npm run deploy   # 自动应用远程 D1 迁移并发布 Worker
 name = "homeledger"
 main = "src/index.ts"
 compatibility_date = "2025-11-17"
