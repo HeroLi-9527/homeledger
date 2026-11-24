@@ -3,6 +3,7 @@ import { nowStr, todayStr } from '../db.js';
 import { ledgerWriterIds, notify } from '../lib/auth.js';
 import {
   advanceDate,
+  budgetAmountInBaseCents,
   budgetPeriodRange,
   budgetUsedInRange,
   effectiveBudget,
@@ -14,7 +15,7 @@ import {
 } from '../lib/scheduler.js';
 import * as subs from '../lib/subscriptions.js';
 import * as txn from '../lib/txn.js';
-import type { Db, HonoEnv } from '../types.js';
+import type { Db, HonoEnv, OpenAuth } from '../types.js';
 import {
   assertAccountInLedger,
   assertCategoryInLedger,
@@ -99,7 +100,7 @@ async function enrichBudget(db: Db, b: BudgetRow, ref = tzRefDate()) {
       ...b,
       range: { start: b.start_date || '', end: b.end_date || '', label: '周期未设置', key: '' },
       used_cents: null as number | null,
-      effective_cents: Number(b.amount_cents),
+      effective_cents: await budgetAmountInBaseCents(db, b),
       rollover_cents: 0,
     };
   }
@@ -180,6 +181,7 @@ async function normalizeBudgetWrite(
     body.currency !== undefined
       ? String(body.currency || '').trim().toUpperCase().slice(0, 8) || 'CNY'
       : existing?.currency || 'CNY';
+  await txn.resolveRate(db, currency);
   const rollover = parseBoolFlag(body.rollover, existing?.rollover ?? 0);
   const alertPct =
     parseOptionalIntRange(body.alert_pct, existing?.alert_pct ?? 80, 1, 100, '预警阈值 alert_pct') ?? 80;
@@ -281,8 +283,8 @@ async function normalizeRecurringItems(
 
 const SUB_SELECT = `SELECT s.*, a.name AS account_name, c.name AS category_name, c.icon AS category_icon
   FROM subscriptions s
-  LEFT JOIN accounts a ON a.id = s.account_id
-  LEFT JOIN categories c ON c.id = s.category_id`;
+  LEFT JOIN accounts a ON a.id = s.account_id AND a.ledger_id = s.ledger_id
+  LEFT JOIN categories c ON c.id = s.category_id AND (c.ledger_id IS NULL OR c.ledger_id = s.ledger_id)`;
 
 async function getDecoratedSub(db: Db, id: number, ledgerId: number) {
   const row = await db.get<subs.SubscriptionRow>(`${SUB_SELECT} WHERE s.id = ? AND s.ledger_id = ?`, id, ledgerId);
@@ -1034,6 +1036,126 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
     return c.json({ ok: true });
   });
 
+  async function executeRecurringRule(
+    db: Db,
+    oa: OpenAuth,
+    rule: RecurringRuleRow,
+    body: Record<string, unknown>,
+  ): Promise<{ status: 200 | 400 | 409; data: Record<string, unknown> }> {
+    const bad = await ruleBadAccount(db, rule);
+    if (bad) return { status: 400, data: { ok: false, error: bad } };
+
+    const period = parseOptionalDate(body.next_run_at, rule.next_run_at, '执行期次') || rule.next_run_at;
+    const runDate = parseOptionalDate(body.txn_date ?? body.date, todayStr(), '入账日期') || todayStr();
+    const { stmts, created } = await recurringPostStmts(db, rule, runDate);
+    const next = advanceDate(period, rule);
+
+    const claim = await db.run(
+      'UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND ledger_id = ? AND next_run_at = ?',
+      next,
+      rule.id,
+      oa.ledgerId,
+      period,
+    );
+    if (claim.changes !== 1) {
+      return { status: 409, data: { ok: false, error: '该期已执行，请勿重复提交' } };
+    }
+
+    try {
+      stmts.push(['UPDATE recurring_rules SET last_run_at = ? WHERE id = ?', [nowStr(), rule.id]]);
+      await db.batch(stmts);
+    } catch (e) {
+      await db
+        .run('UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND next_run_at = ?', period, rule.id, next)
+        .catch(() => {});
+      throw e;
+    }
+
+    const updated = await db.get<RecurringRuleRow>(
+      'SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?',
+      rule.id,
+      oa.ledgerId,
+    );
+    return {
+      status: 200,
+      data: {
+        ok: true,
+        created,
+        next_run_at: next,
+        recurring: updated ? decorateRecurring(updated) : null,
+      },
+    };
+  }
+
+  async function executeSubscriptionCharge(
+    db: Db,
+    oa: OpenAuth,
+    s: subs.SubscriptionRow,
+    body: Record<string, unknown>,
+  ): Promise<{ status: 200 | 400 | 409; data: Record<string, unknown> }> {
+    if (!['active', 'trial'].includes(s.status)) {
+      return { status: 400, data: { ok: false, error: '已暂停或取消的订阅无法扣费' } };
+    }
+    if (s.status === 'trial' && s.trial_ends_on && s.trial_ends_on > todayStr()) {
+      return {
+        status: 400,
+        data: { ok: false, error: `订阅仍在试用期（到期日 ${s.trial_ends_on}），暂不可手动扣费` },
+      };
+    }
+    if (!(await subs.accountUsable(db, s.account_id, s.ledger_id))) {
+      return { status: 400, data: { ok: false, error: '扣费账户不存在或已归档，请先在订阅设置里更换账户' } };
+    }
+    const period = parseOptionalDate(body.next_charge_at, s.next_charge_at, '扣费日期') || s.next_charge_at;
+    const next = subs.advance(period, s);
+    const claim = await db.run(
+      'UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND ledger_id = ? AND next_charge_at = ?',
+      next,
+      s.id,
+      oa.ledgerId,
+      period,
+    );
+    if (claim.changes !== 1) {
+      return { status: 409, data: { ok: false, error: '该期已扣费，请勿重复提交' } };
+    }
+    let txnId: number | null;
+    try {
+      txnId = await subs.charge(db, { ...s, next_charge_at: period }, oa.userId, {
+        date: period,
+        expectedNextChargeAt: next,
+        prevLastChargeAt: s.last_charge_at ?? null,
+      });
+    } catch (e) {
+      const rb = await db
+        .run('UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ?', period, s.id, next)
+        .catch(() => null);
+      if (!rb || rb.changes !== 1) {
+        const key = `sub-rollback-fail:${s.id}:${period}`;
+        for (const uid of await ledgerWriterIds(db, s.ledger_id)) {
+          await notify(db, uid, {
+            kind: 'danger',
+            ledgerId: s.ledger_id,
+            title: `订阅扣费异常：${s.name}（${period}）`,
+            body: `${period} 一期扣费失败且抢占回滚失败，请检查订阅与流水`,
+            link: '/subscriptions',
+            dedupeKey: key,
+          });
+        }
+      }
+      throw e;
+    }
+    const subscription = await getDecoratedSub(db, s.id, oa.ledgerId);
+    return {
+      status: 200,
+      data: {
+        ok: true,
+        transaction_id: txnId,
+        charged_date: period,
+        next_charge_at: next,
+        subscription,
+      },
+    };
+  }
+
   openapiRoutes.post('/recurring/:id/run', async (c) => {
     const w = requireWriteApi(c);
     if (w) return w;
@@ -1051,42 +1173,70 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
 
     try {
       const body = await readJsonObject(c, { optional: true });
-      const bad = await ruleBadAccount(db, rule);
-      if (bad) return c.json({ ok: false, error: bad }, 400);
+      const res = await executeRecurringRule(db, oa, rule, body);
+      return c.json(res.data, res.status);
+    } catch (e) {
+      return c.json({ ok: false, error: toPublicError(e) }, 400);
+    }
+  });
 
-      const period = parseOptionalDate(body.next_run_at, rule.next_run_at, '执行期次') || rule.next_run_at;
-      const runDate = parseOptionalDate(body.txn_date, todayStr(), '入账日期') || todayStr();
-      const { stmts, created } = await recurringPostStmts(db, rule, runDate);
-      const next = advanceDate(period, rule);
+  openapiRoutes.post('/recurring/:id/pay', async (c) => {
+    const w = requireWriteApi(c);
+    if (w) return w;
+    const oa = c.get('openAuth')!;
+    const db = dbOf(c);
+    const id = parsePositiveIntId(c.req.param('id'));
+    if (!id) return c.json({ ok: false, error: '周期账单或订阅不存在' }, 404);
 
-      const claim = await db.run(
-        'UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND ledger_id = ? AND next_run_at = ?',
-        next,
-        id,
-        oa.ledgerId,
-        period,
-      );
-      if (claim.changes !== 1) {
-        return c.json({ ok: false, error: '该期已执行，请勿重复提交' }, 409);
+    try {
+      const body = await readJsonObject(c, { optional: true });
+      const rawKind = body.kind !== undefined && body.kind !== null ? String(body.kind).trim() : '';
+      if (rawKind && !['bill', 'recurring', 'subscription'].includes(rawKind)) {
+        return c.json({ ok: false, error: '无效的 kind 参数（仅支持 bill / recurring / subscription）' }, 400);
       }
 
-      try {
-        stmts.push(['UPDATE recurring_rules SET last_run_at = ? WHERE id = ?', [nowStr(), id]]);
-        await db.batch(stmts);
-      } catch (e) {
-        await db
-          .run('UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND next_run_at = ?', period, id, next)
-          .catch(() => {});
-        throw e;
+      if (rawKind === 'subscription') {
+        const s = await db.get<subs.SubscriptionRow>(
+          'SELECT * FROM subscriptions WHERE id = ? AND ledger_id = ?',
+          id,
+          oa.ledgerId,
+        );
+        if (!s) return c.json({ ok: false, error: '订阅不存在' }, 404);
+        const res = await executeSubscriptionCharge(db, oa, s, body);
+        return c.json({ ...res.data, ...(res.status === 200 ? { kind: 'subscription' } : {}) }, res.status);
       }
 
-      const updated = await db.get<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
-      return c.json({
-        ok: true,
-        created,
-        next_run_at: next,
-        recurring: updated ? decorateRecurring(updated) : null,
-      });
+      if (rawKind === 'bill' || rawKind === 'recurring') {
+        const rule = await db.get<RecurringRuleRow>(
+          'SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?',
+          id,
+          oa.ledgerId,
+        );
+        if (!rule) return c.json({ ok: false, error: '周期账单不存在' }, 404);
+        const res = await executeRecurringRule(db, oa, rule, body);
+        return c.json({ ...res.data, ...(res.status === 200 ? { kind: 'recurring' } : {}) }, res.status);
+      }
+
+      const [rule, sub] = await Promise.all([
+        db.get<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, oa.ledgerId),
+        db.get<subs.SubscriptionRow>('SELECT * FROM subscriptions WHERE id = ? AND ledger_id = ?', id, oa.ledgerId),
+      ]);
+      if (rule && sub) {
+        return c.json(
+          { ok: false, error: '该 ID 同时命中周期账单与订阅，请显式传入 kind（"recurring" 或 "subscription"）' },
+          409,
+        );
+      }
+      if (rule) {
+        const res = await executeRecurringRule(db, oa, rule, body);
+        return c.json({ ...res.data, ...(res.status === 200 ? { kind: 'recurring' } : {}) }, res.status);
+      }
+      if (sub) {
+        const res = await executeSubscriptionCharge(db, oa, sub, body);
+        return c.json({ ...res.data, ...(res.status === 200 ? { kind: 'subscription' } : {}) }, res.status);
+      }
+
+      return c.json({ ok: false, error: '周期账单或订阅不存在' }, 404);
     } catch (e) {
       return c.json({ ok: false, error: toPublicError(e) }, 400);
     }
@@ -1242,60 +1392,10 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
       oa.ledgerId,
     );
     if (!s) return c.json({ ok: false, error: '订阅不存在' }, 404);
-    if (!['active', 'trial'].includes(s.status)) {
-      return c.json({ ok: false, error: '已暂停或取消的订阅无法扣费' }, 400);
-    }
     try {
       const body = await readJsonObject(c, { optional: true });
-      if (!(await subs.accountUsable(db, s.account_id, s.ledger_id))) {
-        return c.json({ ok: false, error: '扣费账户不存在或已归档，请先在订阅设置里更换账户' }, 400);
-      }
-      const period = parseOptionalDate(body.next_charge_at, s.next_charge_at, '扣费日期') || s.next_charge_at;
-      const next = subs.advance(period, s);
-      const claim = await db.run(
-        'UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND ledger_id = ? AND next_charge_at = ?',
-        next,
-        s.id,
-        oa.ledgerId,
-        period,
-      );
-      if (claim.changes !== 1) {
-        return c.json({ ok: false, error: '该期已扣费，请勿重复提交' }, 409);
-      }
-      let txnId: number | null;
-      try {
-        txnId = await subs.charge(db, { ...s, next_charge_at: period }, oa.userId, {
-          date: period,
-          expectedNextChargeAt: next,
-          prevLastChargeAt: s.last_charge_at ?? null,
-        });
-      } catch (e) {
-        const rb = await db
-          .run('UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ?', period, s.id, next)
-          .catch(() => null);
-        if (!rb || rb.changes !== 1) {
-          const key = `sub-rollback-fail:${s.id}:${period}`;
-          for (const uid of await ledgerWriterIds(db, s.ledger_id)) {
-            await notify(db, uid, {
-              kind: 'danger',
-              ledgerId: s.ledger_id,
-              title: `订阅扣费异常：${s.name}（${period}）`,
-              body: `${period} 一期扣费失败且抢占回滚失败，请检查订阅与流水`,
-              link: '/subscriptions',
-              dedupeKey: key,
-            });
-          }
-        }
-        throw e;
-      }
-      const subscription = await getDecoratedSub(db, id, oa.ledgerId);
-      return c.json({
-        ok: true,
-        transaction_id: txnId,
-        charged_date: period,
-        next_charge_at: next,
-        subscription,
-      });
+      const res = await executeSubscriptionCharge(db, oa, s, body);
+      return c.json(res.data, res.status);
     } catch (e) {
       return c.json({ ok: false, error: toPublicError(e) }, 400);
     }
@@ -1530,16 +1630,21 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         await assertAccountInLedger(db, oa.ledgerId, accountId);
       }
 
-      const saved = Math.max(0, Number(g.saved_cents) + amt);
+      const prevSaved = Number(g.saved_cents);
+      const saved = Math.max(0, prevSaved + amt);
       const done = Number(g.target_cents) > 0 && saved >= Number(g.target_cents);
       const nextStatus = done ? 'completed' : 'active';
-      await db.run(
-        'UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ?',
+      const claim = await db.run(
+        'UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ? AND saved_cents = ?',
         saved,
         nextStatus,
         id,
         oa.ledgerId,
+        prevSaved,
       );
+      if (Number(claim.changes || 0) !== 1) {
+        return c.json({ ok: false, error: '储蓄目标刚被并发更新，请重试' }, 409);
+      }
 
       let txnId: number | null = null;
       if (createTxn && accountId) {
@@ -1559,7 +1664,16 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
           });
         } catch (e) {
           await db
-            .run('UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ?', g.saved_cents, g.status, id, oa.ledgerId)
+            .run(
+              `UPDATE goals
+               SET saved_cents = MAX(0, saved_cents - ?),
+                   status = CASE WHEN target_cents > 0 AND MAX(0, saved_cents - ?) >= target_cents THEN 'completed' ELSE 'active' END
+               WHERE id = ? AND ledger_id = ?`,
+              amt,
+              amt,
+              id,
+              oa.ledgerId,
+            )
             .catch(() => {});
           throw e;
         }

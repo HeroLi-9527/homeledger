@@ -1,4 +1,5 @@
 import { TXN_TYPE_MAP } from '../db.js';
+import { canWrite } from '../lib/auth.js';
 import type { AppContext, TxnRow } from '../types.js';
 import type { TxnDateGroup } from '../lib/txn.js';
 import { avatarUrl, esc, fmtAmount, initials, relDate } from '../lib/util.js';
@@ -55,6 +56,7 @@ export function blank({
 <meta name="csrf" content="${esc(csrf)}">
 <title>${esc(title)} · ${esc(siteName)}</title>
 <link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📒</text></svg>">
 <link rel="stylesheet" href="/css/app.css">
 <script nonce="${esc(cspNonce)}">try{var t=localStorage.getItem('hl_theme');if(t==='dark'||t==='light')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
@@ -126,9 +128,11 @@ export function layout({
         ['export', '/export', '📤', '导出备份'],
         ['members', '/members', '👥', '成员权限'],
         ['settings', '/settings', '⚙️', '系统设置'],
+        ['about', '/about', 'ℹ️', '关于'],
       ],
     },
   ];
+  const writable = Boolean(ctx.ledger && canWrite(ctx.ledger.role));
 
   const ledgerSwitcher = ctx.ledgers.length
     ? `<div class="ledger-switch">
@@ -162,6 +166,7 @@ ${g.items
 <meta name="csrf" content="${esc(csrf)}">
 <title>${esc(title)} · ${esc(siteName)}</title>
 <link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📒</text></svg>">
 <link rel="stylesheet" href="/css/app.css">
 <script nonce="${esc(cspNonce)}">try{var t=localStorage.getItem('hl_theme');if(t==='dark'||t==='light')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
@@ -209,6 +214,8 @@ ${g.items
           ? `<div class="user-menu">
         <button class="btn btn-sm" id="userMenuBtn" type="button">${avatarHtml(user, 22)} <span>${esc(user.display_name)}</span></button>
         <div class="user-drop hidden" id="userMenuDrop">
+          <button type="button" id="userMenuAvatar" style="display:flex;align-items:center;gap:8px">${avatarHtml(user, 24)} <span>更换头像</span></button>
+          <input type="file" id="userAvatarFile" accept="image/png,image/jpeg,image/gif,image/webp" class="hidden">
           <a href="/settings">⚙️ 系统设置</a>
           <a href="/ledgers">📒 账本管理</a>
           ${ctx.isAdmin ? '<a href="/admin">🛡️ 管理员面板</a>' : ''}
@@ -224,7 +231,28 @@ ${g.items
     </main>
   </div>
 </div>
-<button class="ai-fab" id="aiFab" type="button">✨ AI 记一笔</button>
+${
+  user
+    ? writable
+      ? `<nav class="mobile-nav" aria-label="移动端主导航">
+  <a class="mnav-item ${activeNav === 'home' ? 'active' : ''}" href="/"><span>📊</span><span>总览</span></a>
+  <a class="mnav-item ${activeNav === 'transactions' ? 'active' : ''}" href="/transactions"><span>📋</span><span>明细</span></a>
+  <a class="mnav-item mnav-add ${activeNav === 'new' ? 'active' : ''}" href="/transactions/new"><span>＋</span><span>记一笔</span></a>
+  <a class="mnav-item ${activeNav === 'reports' ? 'active' : ''}" href="/reports"><span>📈</span><span>报表</span></a>
+  <a class="mnav-item ${activeNav === 'ai' ? 'active' : ''}" href="/ai"><span>🤖</span><span>AI</span></a>
+</nav>`
+      : `<nav class="mobile-nav" aria-label="移动端主导航">
+  <a class="mnav-item ${activeNav === 'home' ? 'active' : ''}" href="/"><span>📊</span><span>总览</span></a>
+  <a class="mnav-item ${activeNav === 'transactions' ? 'active' : ''}" href="/transactions"><span>📋</span><span>明细</span></a>
+  <a class="mnav-item ${activeNav === 'calendar' ? 'active' : ''}" href="/calendar"><span>🗓️</span><span>日历</span></a>
+  <a class="mnav-item ${activeNav === 'reports' ? 'active' : ''}" href="/reports"><span>📈</span><span>报表</span></a>
+  <a class="mnav-item ${activeNav === 'search' ? 'active' : ''}" href="/search"><span>🔍</span><span>搜索</span></a>
+</nav>`
+    : ''
+}
+${
+  writable
+    ? `<button class="ai-fab" id="aiFab" type="button">✨ AI 记一笔</button>
 <div class="ai-panel hidden" id="aiPanel">
   <div class="ai-panel-head">
     <span>🤖 AI 记账助手</span>
@@ -242,9 +270,11 @@ ${g.items
       <button class="btn btn-sm btn-primary" id="aiSend" type="button">发送</button>
     </div>
   </div>
-</div>
+</div>`
+    : ''
+}
 <script src="/js/app.js"></script>
-<script src="/js/assistant.js"></script>
+${writable ? '<script src="/js/assistant.js"></script>' : ''}
 </body>
 </html>`;
 }

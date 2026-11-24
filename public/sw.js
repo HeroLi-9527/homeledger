@@ -1,5 +1,13 @@
-const CACHE = 'homeledger-static-v1';
-const PRECACHE = ['/css/app.css', '/js/app.js', '/js/assistant.js', '/manifest.webmanifest'];
+const CACHE = 'homeledger-static-v2';
+const PRECACHE = [
+  '/css/app.css',
+  '/js/app.js',
+  '/js/assistant.js',
+  '/manifest.webmanifest',
+  '/icons/icon-192.png',
+  '/icons/icon-512.png',
+  '/icons/icon-512-maskable.png',
+];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(PRECACHE)).catch(() => {}));

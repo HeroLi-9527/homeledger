@@ -489,12 +489,12 @@ export function categoriesPage({
       (root) => `<div class="mb12">
   <div class="between" style="padding:4px 0">
     <b>${esc(root.icon)} ${esc(root.name)}</b>
-    ${root.ledger_id ? `<form method="post" action="/categories/${root.id}/delete" style="display:inline" data-confirm="确认删除一级分类「${esc(root.name)}」？">${csrfInput}<button class="btn btn-sm btn-ghost" type="submit">删</button></form>` : '<span class="tiny muted">内置</span>'}
+    ${root.ledger_id ? `<div class="row" style="gap:4px"><details style="display:inline-block"><summary class="btn btn-sm btn-ghost">编辑</summary><form method="post" action="/categories/${root.id}" class="row mt8" style="gap:4px">${csrfInput}<input name="icon" value="${esc(root.icon)}" style="width:46px" maxlength="8"><input name="name" value="${esc(root.name)}" style="width:110px" maxlength="20" required><button class="btn btn-sm btn-primary" type="submit">保存</button></form></details><form method="post" action="/categories/${root.id}/delete" style="display:inline" data-confirm="确认删除一级分类「${esc(root.name)}」？">${csrfInput}<button class="btn btn-sm btn-ghost" type="submit">删</button></form></div>` : '<span class="tiny muted">内置</span>'}
   </div>
   <div class="row wrap">${(root.children || [])
     .map((ch) =>
       ch.ledger_id
-        ? `<span class="chip" style="gap:4px"><span>${esc(ch.icon)} ${esc(ch.name)}</span><form method="post" action="/categories/${ch.id}/delete" style="display:inline" data-confirm="确认删除二级分类「${esc(ch.name)}」？">${csrfInput}<button type="submit" title="删除二级分类" style="border:0;background:transparent;color:var(--expense);cursor:pointer;padding:0 2px;font-size:12px;line-height:1">✕</button></form></span>`
+        ? `<span class="chip" style="gap:4px;flex-wrap:wrap"><span>${esc(ch.icon)} ${esc(ch.name)}</span><details style="display:inline"><summary style="cursor:pointer;font-size:11px;color:var(--muted)" title="编辑二级分类">✎</summary><form method="post" action="/categories/${ch.id}" class="row" style="gap:4px;margin-top:4px">${csrfInput}<input name="icon" value="${esc(ch.icon)}" style="width:42px;padding:2px 4px;font-size:12px" maxlength="8"><input name="name" value="${esc(ch.name)}" style="width:88px;padding:2px 6px;font-size:12px" maxlength="20" required><button class="btn btn-sm btn-primary" type="submit">保存</button></form></details><form method="post" action="/categories/${ch.id}/delete" style="display:inline" data-confirm="确认删除二级分类「${esc(ch.name)}」？">${csrfInput}<button type="submit" title="删除二级分类" style="border:0;background:transparent;color:var(--expense);cursor:pointer;padding:0 2px;font-size:12px;line-height:1">✕</button></form></span>`
         : `<span class="chip">${esc(ch.icon)} ${esc(ch.name)}</span>`,
     )
     .join('')}</div>
@@ -537,7 +537,7 @@ export function tagsPage({
       tags
         .map(
           (t) => `<tr><td><span class="chip"># ${esc(t.name)}</span></td><td>${t.cnt}</td>
-<td><form method="post" action="/tags/${t.id}/delete" style="display:inline">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form></td></tr>`,
+<td><div class="row wrap"><form method="post" action="/tags/${t.id}" class="row" style="display:inline-flex;gap:4px">${csrfInput}<input name="name" value="${esc(t.name)}" maxlength="20" style="width:120px;padding:4px 8px;font-size:12px" required><button class="btn btn-sm" type="submit">保存</button></form><form method="post" action="/tags/${t.id}/delete" style="display:inline">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form></div></td></tr>`,
         )
         .join('') || '<tr><td colspan="3">暂无标签（记账时输入标签可自动创建）</td></tr>',
     ) +

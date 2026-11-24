@@ -217,12 +217,19 @@ export function avatarUrl(u: { avatar_path?: string | null; avatar_ver?: number 
   return `/uploads/avatars/${encodeURIComponent(p)}?v=${Number(u.avatar_ver) || 0}`;
 }
 
-/** 仅放行站内相对路径，拦截外链与伪协议（如 javascript:、//evil.com） */
+/** 仅放行站内相对路径，拦截外链与伪协议（如 javascript:、//evil.com、含制表符/控制字符绕过） */
 export function safeInternalPath(raw: unknown, fallback = '/'): string {
   if (typeof raw !== 'string') return fallback;
   const s = raw.trim();
-  if (!s || !s.startsWith('/') || s.startsWith('//') || s.startsWith('/\\') || /[\r\n\0]/.test(s)) {
+  if (!s || !s.startsWith('/') || s.startsWith('//') || s.startsWith('/\\') || /[\x00-\x1f\x7f]/.test(s)) {
     return fallback;
   }
-  return s;
+  try {
+    const base = 'https://homeledger.local';
+    const parsed = new URL(s, base);
+    if (parsed.origin !== base) return fallback;
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return fallback;
+  }
 }

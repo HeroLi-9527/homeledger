@@ -85,7 +85,7 @@ export function attachmentsPage({
         return `<tr>
   <td>
     <div class="row">
-      <a href="${esc(imgUrl)}" target="_blank" rel="noopener"><img src="${esc(imgUrl)}" alt="" style="width:38px;height:38px;object-fit:cover;border-radius:6px;border:1px solid var(--border)"></a>
+      <img src="${esc(imgUrl)}" data-zoom alt="" style="width:38px;height:38px;object-fit:cover;border-radius:6px;border:1px solid var(--border)">
       <a href="${esc(imgUrl)}" target="_blank" rel="noopener">${esc(a.file_name || a.rel_path)}</a>
     </div>
   </td>

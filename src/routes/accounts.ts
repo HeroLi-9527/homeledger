@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { nowStr, todayStr } from '../db.js';
-import { normalizeAccountWrite } from '../lib/accounts.js';
+import { deleteAccountIfUnreferenced, normalizeAccountWrite } from '../lib/accounts.js';
 import * as fd from '../lib/formdata.js';
 import * as sc from '../lib/session-cards.js';
 import * as txn from '../lib/txn.js';
@@ -93,21 +93,11 @@ accountsRoutes.post('/accounts/:id/delete', async (c) => {
   const db = dbOf(c);
   const ledgerId = Number(c.get('ctx').ledger!.id);
   const id = Number(c.req.param('id'));
-  const used = Number(
-    (
-      await db.get<{ c: number }>(
-        'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND (account_id = ? OR to_account_id = ?) AND deleted_at IS NULL',
-        ledgerId,
-        id,
-        id,
-      )
-    )?.c || 0,
-  );
-  if (used) {
-    setFlash(c, 'error', `该账户还有 ${used} 笔未删除记账，无法删除`);
+  const del = await deleteAccountIfUnreferenced(db, ledgerId, id);
+  if (!del.ok) {
+    setFlash(c, 'error', del.error);
     return c.redirect('/accounts');
   }
-  await db.run('DELETE FROM accounts WHERE id = ? AND ledger_id = ?', id, ledgerId);
   setFlash(c, 'success', '账户已删除');
   return c.redirect('/accounts');
 });
@@ -329,6 +319,40 @@ accountsRoutes.post('/categories', async (c) => {
   return c.redirect('/categories');
 });
 
+accountsRoutes.post('/categories/:id', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ledgerId = Number(c.get('ctx').ledger!.id);
+  const id = Number(c.req.param('id'));
+  const cat = await db.get<CategoryRow>(
+    'SELECT * FROM categories WHERE id = ? AND ledger_id = ? AND is_system = 0',
+    id,
+    ledgerId,
+  );
+  if (!cat) {
+    setFlash(c, 'error', '仅可编辑当前账本的自定义分类');
+    return c.redirect('/categories');
+  }
+  const body = await bodyOf(c);
+  const name = String(body.name || '').trim().slice(0, 20);
+  if (!name) {
+    setFlash(c, 'error', '分类名称不能为空');
+    return c.redirect('/categories');
+  }
+  const iconRaw = body.icon !== undefined ? String(body.icon || '').trim() : '';
+  const icon = (iconRaw || cat.icon || '🏷️').slice(0, 8);
+  await db.run(
+    'UPDATE categories SET name = ?, icon = ? WHERE id = ? AND ledger_id = ? AND is_system = 0',
+    name,
+    icon,
+    id,
+    ledgerId,
+  );
+  setFlash(c, 'success', '分类已更新');
+  return c.redirect('/categories');
+});
+
 accountsRoutes.post('/categories/:id/delete', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
@@ -412,6 +436,41 @@ accountsRoutes.post('/tags', async (c) => {
       '#0F766E',
     );
   }
+  return c.redirect('/tags');
+});
+
+accountsRoutes.post('/tags/:id', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ledgerId = Number(c.get('ctx').ledger!.id);
+  const id = Number(c.req.param('id'));
+  const tag = await db.get<{ id: number; name: string }>(
+    'SELECT id, name FROM tags WHERE id = ? AND ledger_id = ?',
+    id,
+    ledgerId,
+  );
+  if (!tag) {
+    setFlash(c, 'error', '标签不存在');
+    return c.redirect('/tags');
+  }
+  const name = String((await bodyOf(c)).name || '').trim().slice(0, 20);
+  if (!name) {
+    setFlash(c, 'error', '标签名称不能为空');
+    return c.redirect('/tags');
+  }
+  const dup = await db.get<{ id: number }>(
+    'SELECT id FROM tags WHERE ledger_id = ? AND name = ? AND id != ?',
+    ledgerId,
+    name,
+    id,
+  );
+  if (dup) {
+    setFlash(c, 'error', `标签「${name}」已存在`);
+    return c.redirect('/tags');
+  }
+  await db.run('UPDATE tags SET name = ? WHERE id = ? AND ledger_id = ?', name, id, ledgerId);
+  setFlash(c, 'success', '标签已更新');
   return c.redirect('/tags');
 });
 

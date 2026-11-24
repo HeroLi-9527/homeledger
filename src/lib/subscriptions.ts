@@ -191,8 +191,8 @@ export async function overview(db: Db, ledgerId: number) {
     db.all<SubscriptionRow>(
       `SELECT s.*, a.name AS account_name, c.name AS category_name, c.icon AS category_icon
        FROM subscriptions s
-       LEFT JOIN accounts a ON a.id = s.account_id
-       LEFT JOIN categories c ON c.id = s.category_id
+       LEFT JOIN accounts a ON a.id = s.account_id AND a.ledger_id = s.ledger_id
+       LEFT JOIN categories c ON c.id = s.category_id AND (c.ledger_id IS NULL OR c.ledger_id = s.ledger_id)
        WHERE s.ledger_id = ?
        ORDER BY CASE s.status WHEN 'active' THEN 0 WHEN 'trial' THEN 1 WHEN 'paused' THEN 2 ELSE 3 END,
                 s.next_charge_at, s.id`,

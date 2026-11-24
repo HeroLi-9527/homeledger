@@ -134,20 +134,26 @@ export async function saveBufferImage(
   const fileName = `${Date.now()}_${uid(8)}.${ext}`;
   const key = `uploads/${ym}/${fileName}`;
   await env.ATTACHMENTS.put(key, buf, { httpMetadata: { contentType: mime } });
-  const info = await db.run(
-    `INSERT INTO attachments (ledger_id, txn_id, user_id, kind, file_name, rel_path, mime, size, ai_status, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
-    Number(ledgerId),
-    txnId != null ? Number(txnId) : null,
-    Number(userId),
-    kind,
-    name || fileName,
-    key,
-    mime,
-    buf.length,
-    aiStatus,
-    nowStr(),
-  );
+  let info;
+  try {
+    info = await db.run(
+      `INSERT INTO attachments (ledger_id, txn_id, user_id, kind, file_name, rel_path, mime, size, ai_status, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      Number(ledgerId),
+      txnId != null ? Number(txnId) : null,
+      Number(userId),
+      kind,
+      name || fileName,
+      key,
+      mime,
+      buf.length,
+      aiStatus,
+      nowStr(),
+    );
+  } catch (e) {
+    await env.ATTACHMENTS.delete(key).catch(() => {});
+    throw e;
+  }
   return {
     id: Number(info.lastInsertRowid),
     rel: key,

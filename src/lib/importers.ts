@@ -599,10 +599,14 @@ export function csvEscape(v: unknown): string {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+export function csvLine(cells: unknown[]): string {
+  return `${cells.map(csvEscape).join(',')}\r\n`;
+}
+
 export function toCsv(header: string[], rows: unknown[][]): string {
-  const lines = [header.map(csvEscape).join(',')];
-  for (const r of rows) lines.push(r.map(csvEscape).join(','));
-  return `\uFEFF${lines.join('\r\n')}\r\n`;
+  let out = `\uFEFF${csvLine(header)}`;
+  for (const r of rows) out += csvLine(r);
+  return out;
 }
 
 export const EXPORT_HEADER = ['日期', '类型', '金额', '币种', '折算金额', '分类', '账户', '转入账户', '成员', '商家', '备注', '标签', '来源', '状态'];

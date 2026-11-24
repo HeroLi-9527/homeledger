@@ -6,7 +6,7 @@ import {
   todayStr,
   type AccountGroupKey,
 } from '../db.js';
-import type { AccountRow } from '../types.js';
+import type { AccountRow, Db } from '../types.js';
 import { addMonths, daysInMonth, esc, fmtAmount, pad, parseAmountToCents } from './util.js';
 
 export interface NextMonthlyDay {
@@ -305,4 +305,118 @@ export function normalizeAccountWrite(
   }
 
   return out;
+}
+
+export interface AccountReferenceCounts {
+  transactions: number;
+  subscriptions: number;
+  recurring_rules: number;
+  budgets: number;
+  goals: number;
+  debts: number;
+  total: number;
+}
+
+export async function findAccountReferences(
+  db: Db,
+  ledgerId: number,
+  accountId: number,
+): Promise<AccountReferenceCounts> {
+  const aid = Number(accountId);
+  const lid = Number(ledgerId);
+  const [txnRow, subRow, recRows, budRow, goalRow, debtRow] = await Promise.all([
+    db.get<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND (account_id = ? OR to_account_id = ?) AND deleted_at IS NULL',
+      lid,
+      aid,
+      aid,
+    ),
+    db.get<{ c: number }>('SELECT COUNT(*) AS c FROM subscriptions WHERE ledger_id = ? AND account_id = ?', lid, aid),
+    db.all<{ payload: string }>('SELECT payload FROM recurring_rules WHERE ledger_id = ?', lid),
+    db.get<{ c: number }>('SELECT COUNT(*) AS c FROM budgets WHERE ledger_id = ? AND account_id = ?', lid, aid),
+    db.get<{ c: number }>('SELECT COUNT(*) AS c FROM goals WHERE ledger_id = ? AND account_id = ?', lid, aid),
+    db.get<{ c: number }>('SELECT COUNT(*) AS c FROM debts WHERE ledger_id = ? AND account_id = ?', lid, aid),
+  ]);
+
+  let recurringCount = 0;
+  for (const r of recRows) {
+    let matched = false;
+    try {
+      const parsed = JSON.parse(r.payload || '{}') as unknown;
+      const items = Array.isArray(parsed)
+        ? parsed
+        : parsed && typeof parsed === 'object' && Array.isArray((parsed as { items?: unknown[] }).items)
+          ? (parsed as { items: unknown[] }).items
+          : parsed && typeof parsed === 'object'
+            ? [parsed]
+            : [];
+      for (const it of items) {
+        if (!it || typeof it !== 'object') continue;
+        const rec = it as Record<string, unknown>;
+        if (
+          aid > 0 &&
+          ((rec.account_id != null && Number(rec.account_id) === aid) ||
+            (rec.to_account_id != null && Number(rec.to_account_id) === aid))
+        ) {
+          matched = true;
+          break;
+        }
+      }
+    } catch {
+      // 忽略损坏 JSON（不采用正则猜测），统一按有效周期规则对象校验
+    }
+    if (matched) recurringCount++;
+  }
+
+  const transactions = Number(txnRow?.c || 0);
+  const subscriptions = Number(subRow?.c || 0);
+  const budgets = Number(budRow?.c || 0);
+  const goals = Number(goalRow?.c || 0);
+  const debts = Number(debtRow?.c || 0);
+  return {
+    transactions,
+    subscriptions,
+    recurring_rules: recurringCount,
+    budgets,
+    goals,
+    debts,
+    total: transactions + subscriptions + recurringCount + budgets + goals + debts,
+  };
+}
+
+export function formatAccountRefError(refs: AccountReferenceCounts): string {
+  const parts: string[] = [];
+  if (refs.transactions > 0) parts.push(`未删除记账 ${refs.transactions} 笔`);
+  if (refs.subscriptions > 0) parts.push(`订阅 ${refs.subscriptions} 个`);
+  if (refs.recurring_rules > 0) parts.push(`周期账单 ${refs.recurring_rules} 个`);
+  if (refs.budgets > 0) parts.push(`预算 ${refs.budgets} 个`);
+  if (refs.goals > 0) parts.push(`储蓄目标 ${refs.goals} 个`);
+  if (refs.debts > 0) parts.push(`借贷记录 ${refs.debts} 笔`);
+  return parts.length ? `该账户仍被引用（${parts.join('、')}），无法删除` : '该账户无法删除';
+}
+
+export async function deleteAccountIfUnreferenced(
+  db: Db,
+  ledgerId: number,
+  accountId: number,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const refs = await findAccountReferences(db, ledgerId, accountId);
+  if (refs.total > 0) {
+    return { ok: false, error: formatAccountRefError(refs) };
+  }
+  const res = await db.run(
+    `DELETE FROM accounts
+     WHERE id = ? AND ledger_id = ?
+       AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.ledger_id = accounts.ledger_id AND (t.account_id = accounts.id OR t.to_account_id = accounts.id) AND t.deleted_at IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.ledger_id = accounts.ledger_id AND s.account_id = accounts.id)
+       AND NOT EXISTS (SELECT 1 FROM budgets b WHERE b.ledger_id = accounts.ledger_id AND b.account_id = accounts.id)
+       AND NOT EXISTS (SELECT 1 FROM goals g WHERE g.ledger_id = accounts.ledger_id AND g.account_id = accounts.id)
+       AND NOT EXISTS (SELECT 1 FROM debts d WHERE d.ledger_id = accounts.ledger_id AND d.account_id = accounts.id)`,
+    accountId,
+    ledgerId,
+  );
+  if (Number(res.changes || 0) === 1) return { ok: true };
+  const after = await findAccountReferences(db, ledgerId, accountId);
+  if (after.total > 0) return { ok: false, error: formatAccountRefError(after) };
+  return { ok: false, error: '账户不存在或已被删除' };
 }

@@ -119,7 +119,7 @@
       const catWrap = $('#f-cat-wrap');
       if (catWrap) catWrap.classList.toggle('hidden', type === 'transfer' || type === 'adjust');
       const isIncome = ['income', 'interest', 'refund', 'reimburse'].includes(type);
-      $$('.cat-kind').forEach((el) => el.classList.toggle('hidden', el.dataset.catKind !== (isIncome ? 'income' : 'expense')));
+      $$('.cat-kind, .cat-parents').forEach((el) => el.classList.toggle('hidden', el.dataset.catKind !== (isIncome ? 'income' : 'expense')));
       const accLabel = $('#acc-label');
       if (accLabel) {
         accLabel.textContent =
@@ -184,7 +184,7 @@
       });
     });
 
-    // 分类芯片选择
+    // 分类芯片选择与一级分类快速跳转
     $$('.cat-item').forEach((item) => {
       item.addEventListener('click', (e) => {
         e.preventDefault();
@@ -192,6 +192,14 @@
         $$('.cat-item').forEach((i) => i.classList.toggle('selected', i === item));
         const hint = $('#cat-hint');
         if (hint) hint.textContent = item.dataset.path || item.dataset.name || '';
+      });
+    });
+    $$('.cat-parent').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const bar = btn.closest('.cat-parents');
+        if (bar) $$('.cat-parent', bar).forEach((b) => b.classList.toggle('active', b === btn));
+        const target = document.getElementById(btn.dataset.target);
+        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       });
     });
 
@@ -424,6 +432,9 @@
           '<div class="field"><label>金额</label><input type="text" inputmode="decimal" class="d-amount" value="' +
           (it.amount_cents / 100).toFixed(2) +
           '"></div>' +
+          '<div class="field"><label>币种</label><input type="text" maxlength="6" class="d-currency" value="' +
+          esc((it.currency || 'CNY').toUpperCase()) +
+          '"></div>' +
           '<div class="field"><label>日期</label><input type="date" class="d-date" value="' +
           esc(it.txn_date) +
           '"></div>' +
@@ -528,17 +539,26 @@
       confirmForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const items = $$('.draft', resultBox)
-          .map((card) => ({
-            type: $('.d-type', card).value,
-            amount_cents: Math.round(parseFloat($('.d-amount', card).value || '0') * 100),
-            txn_date: $('.d-date', card).value,
-            category_id: $('.d-category', card).value || null,
-            account_id: $('.d-account', card).value || null,
-            to_account_id: ($('.d-type', card).value === 'transfer' ? ($('.d-to-account', card) || {}).value : null) || null,
-            note: $('.d-note', card).value,
-            merchant: $('.d-note', card).value,
-            draft_id: (data.items[Number(card.dataset.i)] || {}).draft_id || null,
-          }))
+          .map((card) => {
+            const draft = data.items[Number(card.dataset.i)] || {};
+            const curEl = $('.d-currency', card);
+            const currency = String((curEl && curEl.value) || draft.currency || 'CNY')
+              .trim()
+              .toUpperCase()
+              .slice(0, 8) || 'CNY';
+            return {
+              type: $('.d-type', card).value,
+              amount_cents: parseYuanToCents($('.d-amount', card).value),
+              currency,
+              txn_date: $('.d-date', card).value,
+              category_id: $('.d-category', card).value || null,
+              account_id: ($('.d-type', card).value === 'transfer' ? ($('.d-account', card) || {}).value : $('.d-account', card).value) || null,
+              to_account_id: ($('.d-type', card).value === 'transfer' ? ($('.d-to-account', card) || {}).value : null) || null,
+              note: $('.d-note', card).value,
+              merchant: $('.d-note', card).value,
+              draft_id: draft.draft_id || null,
+            };
+          })
           .filter((it) => it.amount_cents > 0);
         if (!items.length) return toast('请至少保留一笔有效金额', 'warn');
         const saveBtn = $('#ai-save');
@@ -568,6 +588,24 @@
           saveBtn.textContent = '确认入库';
         }
       });
+
+      const canAutoSave =
+        data.autoSave &&
+        data.items.length > 0 &&
+        $$('.draft', resultBox).every((card) => {
+          const amtVal = parseYuanToCents($('.d-amount', card).value);
+          const t = $('.d-type', card).value;
+          const aId = $('.d-account', card).value;
+          const toId = ($('.d-to-account', card) || {}).value;
+          if (!(amtVal > 0) || !aId) return false;
+          if (t === 'transfer' && !toId) return false;
+          return true;
+        });
+      if (canAutoSave) {
+        toast('已开启自动入库，正在保存…', 'info');
+        if (confirmForm.requestSubmit) confirmForm.requestSubmit();
+        else $('#ai-save').click();
+      }
     }
 
     const quickBtn = $('#ai-text-quick');
@@ -581,7 +619,7 @@
         if (!res.ok) return toast('识别失败：' + res.error, 'error');
         if (!res.items.length) return toast('未识别出金额，请换个说法', 'warn');
         lastScanIds = [];
-        renderDrafts({ items: res.items, engine: res.engine, warnings: res.warnings || [] }, 'ai_text');
+        renderDrafts({ items: res.items, engine: res.engine, model: res.model, autoSave: res.autoSave, warnings: res.warnings || [] }, 'ai_text');
       });
     }
 
@@ -621,6 +659,14 @@
         '</span><span class="chip">共 ' +
         res.count +
         ' 条</span></div>';
+      if (res.skipped > 0) {
+        html +=
+          '<div class="flash warn mb12"><span>已自动跳过 ' +
+          res.skipped +
+          ' 条无效、已关闭或退款记录' +
+          (res.skippedDates ? '（含 ' + res.skippedDates + ' 条无有效日期）' : '') +
+          '。</span></div>';
+      }
       html +=
         '<div class="kpi-grid mb16">' +
         '<div class="stat"><div class="label">支出合计</div><div class="value amount expense">' +
@@ -638,7 +684,7 @@
         esc(res.stat.maxDate || '—') +
         '</div></div></div>';
       html +=
-        '<div class="row mb12"><label class="check"><input type="checkbox" id="imp-auto-acc" checked> 自动创建缺失的支付账户</label>' +
+        '<div class="row mb12 wrap"><label class="check"><input type="checkbox" id="imp-auto-acc" checked> 自动创建缺失的支付账户</label>' +
         (res.neutralCount
           ? '<label class="check"><input type="checkbox" id="imp-include-neutral"> 一并导入 ' +
             res.neutralCount +
@@ -650,6 +696,9 @@
       html +=
         '<div class="scroll-x"><table class="table"><thead><tr><th>日期</th><th>类型</th><th class="num">金额</th><th>商家/说明</th><th>建议分类</th><th>账户</th></tr></thead><tbody>';
       res.sample.slice(0, 60).forEach((r) => {
+        const accCell = r.guess_account_missing
+          ? '<td class="small imp-warn">缺失（将用默认账户）</td>'
+          : '<td class="small muted">' + esc(r.guess_account || r.account_hint || '—') + '</td>';
         html +=
           '<tr><td>' +
           esc(r.txn_date) +
@@ -661,33 +710,100 @@
           esc(r.merchant || r.note || '—') +
           '</td><td class="small muted">' +
           esc(r.guess_category || r.category_hint || '—') +
-          '</td><td class="small muted">' +
-          esc(r.guess_account || r.account_hint || '—') +
-          '</td></tr>';
+          '</td>' +
+          accCell +
+          '</tr>';
       });
-      html += '</tbody></table></div></div>';
+      html += '</tbody></table></div>';
+      if (res.neutralCount && Array.isArray(res.neutralSample) && res.neutralSample.length) {
+        html +=
+          '<div class="notice mt12"><b>发现 ' +
+          res.neutralCount +
+          ' 条「不计收支」记录（如余额宝转入、信用卡还款）</b>：默认跳过以免重复统计收支，勾选上方复选框可作为转账记录导入（前 ' +
+          res.neutralSample.length +
+          ' 条示例）：</div>' +
+          '<div class="scroll-x mt8"><table class="table"><thead><tr><th>日期</th><th class="num">金额</th><th>商家/说明</th><th>账户</th></tr></thead><tbody>';
+        res.neutralSample.forEach((nr) => {
+          html +=
+            '<tr><td>' +
+            esc(nr.txn_date) +
+            '</td><td class="num amount">' +
+            money(nr.amount_cents) +
+            '</td><td>' +
+            esc(nr.merchant || nr.note || '—') +
+            '</td><td class="small ' +
+            (nr.guess_account_missing ? 'imp-warn' : 'muted') +
+            '">' +
+            (nr.guess_account_missing ? '缺失（将用默认账户）' : esc(nr.guess_account || nr.account_hint || '—')) +
+            '</td></tr>';
+        });
+        html += '</tbody></table></div>';
+      }
+      html += '<div id="import-commit-result" class="mt12"></div></div>';
       preview.innerHTML = html;
 
-      $('#imp-commit').addEventListener('click', async () => {
-        const btn = $('#imp-commit');
-        btn.disabled = true;
-        btn.textContent = '导入中…';
+      const neutralChk = $('#imp-include-neutral');
+      const commitBtn = $('#imp-commit');
+      if (neutralChk && commitBtn) {
+        neutralChk.addEventListener('change', () => {
+          const total = Number(res.count || 0) + (neutralChk.checked ? Number(res.neutralCount || 0) : 0);
+          commitBtn.textContent = '确认导入 ' + total + ' 条';
+        });
+      }
+
+      commitBtn.addEventListener('click', async () => {
+        commitBtn.disabled = true;
+        commitBtn.textContent = '导入中…';
         const r = await postJson('/api/import/commit', {
           token: state.token,
           auto_create_account: $('#imp-auto-acc').checked,
-          include_neutral: !!($('#imp-include-neutral') && $('#imp-include-neutral').checked),
+          include_neutral: !!(neutralChk && neutralChk.checked),
         });
+        const resBox = $('#import-commit-result');
         if (r.ok) {
           toast('成功导入 ' + r.imported + ' 条，跳过重复 ' + r.skipped + ' 条', r.failed ? 'warn' : 'success');
-          if (!r.failed) setTimeout(() => (window.location.href = '/transactions'), 800);
-          else {
-            btn.disabled = false;
-            btn.textContent = '完成（部分失败）';
+          if (!r.failed) {
+            setTimeout(() => (window.location.href = '/transactions'), 800);
+          } else {
+            commitBtn.disabled = false;
+            commitBtn.textContent = '已完成（部分失败 ' + r.failed + ' 条）';
+            const list = (r.failuresAll || r.failures || []);
+            if (resBox) {
+              let fh =
+                '<div class="flash warn"><span>已导入 ' +
+                r.imported +
+                ' 条，跳过 ' +
+                r.skipped +
+                ' 条，失败 ' +
+                r.failed +
+                ' 条。' +
+                (r.jobId ? ' <a href="/import/failures/' + r.jobId + '" class="bold">下载失败清单 →</a>' : '') +
+                '</span></div>';
+              if (list.length) {
+                fh +=
+                  '<div class="scroll-x"><table class="table"><thead><tr><th>行号/序号</th><th>商家</th><th>失败原因</th></tr></thead><tbody>' +
+                  list
+                    .slice(0, 50)
+                    .map(
+                      (f) =>
+                        '<tr><td>' +
+                        esc(f.line ? '第 ' + f.line + ' 行' : '第 ' + (Number(f.index || 0) + 1) + ' 条') +
+                        '</td><td>' +
+                        esc(f.merchant || '—') +
+                        '</td><td class="imp-warn">' +
+                        esc(f.error) +
+                        '</td></tr>',
+                    )
+                    .join('') +
+                  '</tbody></table></div>';
+              }
+              resBox.innerHTML = fh;
+            }
           }
         } else {
           toast('导入失败：' + r.error, 'error');
-          btn.disabled = false;
-          btn.textContent = '重试导入';
+          commitBtn.disabled = false;
+          commitBtn.textContent = '重试导入';
         }
       });
     }
@@ -754,6 +870,7 @@
         res.models.forEach((m) => {
           const o = document.createElement('option');
           o.value = m.id;
+          o.dataset.vision = m.vision === true ? '1' : m.vision === false ? '0' : '';
           o.textContent = m.id + (m.vision === true ? ' ✅ 可读图' : '');
           sel.appendChild(o);
         });
@@ -761,7 +878,16 @@
         out.textContent = '✅ 已读取 ' + res.models.length + ' 个模型';
       });
       sel.addEventListener('change', () => {
+        const opt = sel.options[sel.selectedIndex];
         if (sel.value && modelInput) modelInput.value = sel.value;
+        const visChk = $('input[name="ai.vision"]');
+        if (visChk && opt && (opt.dataset.vision === '1' || opt.dataset.vision === '0')) {
+          visChk.checked = opt.dataset.vision === '1';
+          if (out) {
+            out.textContent =
+              '已选用 ' + sel.value + (visChk.checked ? '（已自动勾选「支持视觉识图」）' : '（已自动取消「支持视觉识图」）');
+          }
+        }
       });
     }
 
@@ -860,24 +986,29 @@
   }
 
   function initAvatarUpload() {
-    const pick = $('#avatarPick');
-    const file = $('#avatarFile');
-    if (pick && file) {
-      pick.addEventListener('click', () => file.click());
-      file.addEventListener('change', async () => {
-        const f = file.files[0];
-        file.value = '';
-        if (!f) return;
-        if (f.size > 2 * 1024 * 1024) return toast('头像请小于 2MB', 'warn');
-        const res = await postJson('/settings/avatar', { dataUrl: await fileToDataUrl(f) });
-        if (res.ok) {
-          toast('头像已更新', 'success');
-          setTimeout(() => window.location.reload(), 600);
-        } else {
-          toast(res.error || '上传失败', 'error');
-        }
-      });
+    async function uploadAvatarFile(fileInput) {
+      const f = fileInput.files[0];
+      fileInput.value = '';
+      if (!f) return;
+      if (f.size > 2 * 1024 * 1024) return toast('头像请小于 2MB', 'warn');
+      const res = await postJson('/settings/avatar', { dataUrl: await fileToDataUrl(f) });
+      if (res.ok) {
+        toast('头像已更新', 'success');
+        setTimeout(() => window.location.reload(), 600);
+      } else {
+        toast(res.error || '上传失败', 'error');
+      }
     }
+    const bindPair = (btnId, inputId) => {
+      const btn = $(btnId);
+      const inp = $(inputId);
+      if (!btn || !inp) return;
+      btn.addEventListener('click', () => inp.click());
+      inp.addEventListener('change', () => uploadAvatarFile(inp));
+    };
+    bindPair('#avatarPick', '#avatarFile');
+    bindPair('#userMenuAvatar', '#userAvatarFile');
+
     const clearBtn = $('#avatarClear');
     if (clearBtn) {
       clearBtn.addEventListener('click', async () => {
@@ -888,6 +1019,81 @@
         }
       });
     }
+  }
+
+  function initLightbox() {
+    let overlay = null;
+    const close = () => {
+      if (overlay) {
+        overlay.remove();
+        overlay = null;
+      }
+    };
+    document.addEventListener('click', (e) => {
+      const img = e.target && e.target.closest ? e.target.closest('img[data-zoom]') : null;
+      if (!img) return;
+      e.preventDefault();
+      close();
+      overlay = document.createElement('div');
+      overlay.className = 'hl-lightbox';
+      const big = document.createElement('img');
+      big.src = img.currentSrc || img.src;
+      big.alt = img.alt || '';
+      overlay.appendChild(big);
+      overlay.addEventListener('click', close);
+      document.body.appendChild(overlay);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') close();
+    });
+  }
+
+  function initSidebar() {
+    const sb = $('.sidebar');
+    if (!sb) return;
+    try {
+      const saved = sessionStorage.getItem('hl_sidebar_scroll');
+      if (saved !== null) {
+        sb.scrollTop = Number(saved) || 0;
+      } else {
+        const active = $('.nav-item.active', sb);
+        if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+      }
+      sb.addEventListener('scroll', () => {
+        try {
+          sessionStorage.setItem('hl_sidebar_scroll', String(sb.scrollTop));
+        } catch {}
+      });
+    } catch {}
+  }
+
+  function parseYuanToCents(input) {
+    if (input === null || input === undefined) return 0;
+    const s = String(input).trim().replace(/[¥$€£,\s元块圆]/g, '');
+    if (!/^-?\d{1,12}(\.\d{0,4})?$/.test(s)) return 0;
+    const neg = s.startsWith('-');
+    const parts = (neg ? s.slice(1) : s).split('.');
+    const ip = parts[0] || '0';
+    const fp = parts[1] || '';
+    let cents = Number(ip) * 100 + Number((fp + '00').slice(0, 2));
+    if (fp.length > 2 && Number(fp[2]) >= 5) cents += 1;
+    return neg ? -cents : cents;
+  }
+
+  function initNumberInputs() {
+    document.addEventListener('focusout', (e) => {
+      const el = e.target;
+      if (!el || el.tagName !== 'INPUT' || el.getAttribute('inputmode') !== 'decimal') return;
+      const name = String(el.name || '');
+      if (el.hasAttribute('data-no-money-format') || name === 'rate' || /^rate_/.test(name)) return;
+      const raw = String(el.value || '').trim();
+      if (!raw) return;
+      if (!/^-?\d{1,12}(\.\d{0,4})?$/.test(raw)) return;
+      const cents = parseYuanToCents(raw);
+      if (Math.abs(cents) / 100 < 1e12) {
+        el.value = (cents < 0 ? '-' : '') + (Math.abs(cents) / 100).toFixed(2);
+      }
+    });
   }
 
   /* ============================ 账户与次卡表单 ============================ */
@@ -1057,8 +1263,11 @@
   document.addEventListener('DOMContentLoaded', () => {
     initThemeToggle();
     initMobileNav();
+    initSidebar();
     initUserMenu();
     initAvatarUpload();
+    initLightbox();
+    initNumberInputs();
     initTxnForm();
     initTxnAttachments();
     initRecurringForm();

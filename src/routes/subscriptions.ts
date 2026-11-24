@@ -9,6 +9,7 @@ import type { HonoEnv } from '../types.js';
 import { layout, simpleTable } from '../views/layout.js';
 import { subscriptionsPage } from '../views/planning.js';
 import { bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
+import { assertAccountInLedger, assertCategoryInLedger } from './openapi-helpers.js';
 
 export const subscriptionsRoutes = new Hono<HonoEnv>();
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -141,17 +142,21 @@ subscriptionsRoutes.get('/subscriptions/:id/edit', async (c) => {
 <form method="post" action="/subscriptions/${s.id}" data-require-trial-end>${csrfInput}
 <div class="grid grid-2">
   <div class="field"><label>名称</label><input name="name" value="${esc(s.name)}" required></div>
+  <div class="field"><label>图标</label><input name="icon" value="${esc(s.icon || '🧾')}" maxlength="8"></div>
   <div class="field"><label>金额（元）</label><input name="amount" inputmode="decimal" value="${(s.amount_cents / 100).toFixed(2)}" required></div>
+  <div class="field"><label>币种</label><input name="currency" value="${esc(s.currency || 'CNY')}" maxlength="8"></div>
   <div class="field"><label>周期</label><select name="cycle">${Object.entries(subs.CYCLE_LABEL).map(([k, v]) => `<option value="${k}" ${s.cycle === k ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></div>
   <div class="field"><label>每 N 个周期</label><input name="cycle_n" type="number" min="1" max="12" value="${s.cycle_n || 1}"></div>
   <div class="field"><label>下次扣费</label><input type="date" name="next_charge_at" value="${esc(s.next_charge_at)}"></div>
-  <div class="field"><label>扣费日（锚点）</label><input name="anchor_day" type="number" min="1" max="31" value="${s.anchor_day || ''}"></div>
+  <div class="field"><label>扣费日（锚点 1-31）</label><input name="anchor_day" type="number" min="1" max="31" value="${s.anchor_day || ''}"></div>
+  <div class="field"><label>年付扣费月（1-12）</label><input name="anchor_month" type="number" min="1" max="12" value="${s.anchor_month ?? ''}"></div>
   <div class="field"><label>试用到期日</label><input type="date" name="trial_ends_on" value="${esc(s.trial_ends_on || '')}"></div>
   <div class="field"><label>状态</label><select name="status"><option value="active" ${s.status === 'active' ? 'selected' : ''}>生效中</option><option value="trial" ${s.status === 'trial' ? 'selected' : ''}>试用中</option><option value="paused" ${s.status === 'paused' ? 'selected' : ''}>已暂停</option></select></div>
   <div class="field"><label>扣费账户</label><select name="account_id"><option value="">—</option>${accounts.map((a) => `<option value="${a.id}" ${Number(s.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></div>
   <div class="field"><label>分类</label><select name="category_id"><option value="">—</option>${cats.map((cc) => `<option value="${cc.id}" ${Number(s.category_id) === Number(cc.id) ? 'selected' : ''}>${esc(cc.path)}</option>`).join('')}</select></div>
   <div class="field"><label>套餐</label><input name="plan" value="${esc(s.plan || '')}"></div>
   <div class="field"><label>提前提醒天数</label><input name="reminder_days" type="number" min="0" max="60" value="${Number(s.reminder_days ?? 3)}"></div>
+  <div class="field"><label>官网 / 退订链接${s.vendor_url && /^https?:\/\//i.test(s.vendor_url) ? ` <a href="${esc(s.vendor_url)}" target="_blank" rel="noopener noreferrer">打开 ↗</a>` : ''}</label><input name="vendor_url" type="url" value="${esc(s.vendor_url || '')}" maxlength="200"></div>
   <div class="field"><label>备注</label><input name="note" value="${esc(s.note || '')}"></div>
   <div class="field" style="justify-content:flex-end"><label class="check"><input type="checkbox" name="auto_renew" ${s.auto_renew ? 'checked' : ''}> 到期自动扣费记账</label></div>
 </div>
@@ -170,6 +175,8 @@ subscriptionsRoutes.post('/subscriptions', async (c) => {
   try {
     const d = readSubForm(body, ctx.user!.id);
     if (!d.name || !d.amount_cents) throw new Error('请填写订阅名称与金额');
+    if (d.account_id !== null) await assertAccountInLedger(db, ledgerId(c), d.account_id);
+    if (d.category_id !== null) await assertCategoryInLedger(db, ledgerId(c), d.category_id, 'expense');
     await db.run(
       `INSERT INTO subscriptions (ledger_id, name, icon, plan, vendor_url, amount_cents, currency, cycle, cycle_n,
         anchor_month, anchor_day, account_id, category_id, auto_renew, trial_ends_on, next_charge_at,
@@ -216,6 +223,16 @@ subscriptionsRoutes.post('/subscriptions/:id', async (c) => {
   try {
     const d = readSubForm(body, ctx.user!.id, { keepNext: true, oldNext: old.next_charge_at });
     if (!d.name || !d.amount_cents) throw new Error('名称与金额不能为空');
+    if (d.account_id !== null) {
+      await assertAccountInLedger(db, ledgerId(c), d.account_id, {
+        allowArchived: d.account_id === old.account_id,
+      });
+    }
+    if (d.category_id !== null) {
+      await assertCategoryInLedger(db, ledgerId(c), d.category_id, 'expense', {
+        allowArchived: d.category_id === old.category_id,
+      });
+    }
     await db.run(
       `UPDATE subscriptions SET name=?, icon=?, plan=?, vendor_url=?, amount_cents=?, currency=?, cycle=?, cycle_n=?,
         anchor_month=?, anchor_day=?, account_id=?, category_id=?, auto_renew=?, trial_ends_on=?, next_charge_at=?,
@@ -258,6 +275,10 @@ subscriptionsRoutes.post('/subscriptions/:id/charge', async (c) => {
   if (!s) return c.redirect('/subscriptions');
   if (!['active', 'trial'].includes(s.status)) {
     setFlash(c, 'error', '已暂停或取消的订阅无法扣费');
+    return c.redirect('/subscriptions');
+  }
+  if (s.status === 'trial' && s.trial_ends_on && s.trial_ends_on > todayStr()) {
+    setFlash(c, 'error', `订阅仍在试用期（到期日 ${s.trial_ends_on}），暂不可手动扣费`);
     return c.redirect('/subscriptions');
   }
   const period = DAY_RE.test(String(body.next_charge_at || '')) ? String(body.next_charge_at) : s.next_charge_at;

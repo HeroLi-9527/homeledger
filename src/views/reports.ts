@@ -2,7 +2,7 @@ import { barChart, donutChart, heatmapChart, lineChart, progressBar } from '../l
 import { compactMoney, esc, fmtAmount } from '../lib/util.js';
 
 export interface ReportsViewProps {
-  range: { start: string; end: string; label: string; preset: string; month?: string };
+  range: { start: string; end: string; label: string; preset: string; month?: string; from?: string; to?: string; year?: string };
   kind: 'expense' | 'income';
   selectedCat: string | null;
   sum: { income: number; expense: number; net: number; count: number };
@@ -14,6 +14,7 @@ export interface ReportsViewProps {
   subcats: Array<{ category_id: number | null; name: string; icon: string; color: string; parent: string; total: number; cnt: number }>;
   trend: Array<{ month: string; income: number; expense: number }>;
   days: Array<{ date: string; income: number; expense: number; count: number }>;
+  weekdayExpense: Array<{ wd: number; label: string; expense: number; cnt: number }>;
   members: Array<{ id: number; name: string; color: string; expense: number; income: number; cnt: number }>;
   netWorth: Array<{ month: string; value: number }>;
   overview: { net: number; assets: number; liabilities: number };
@@ -92,6 +93,13 @@ export function reportsPage(p: ReportsViewProps): string {
   });
 
   const heatmapSvg = heatmapChart({ month: p.heatmapMonth, days: p.days, valueUnit: '元' });
+  const weekdayChart = barChart({
+    labels: p.weekdayExpense.map((w) => w.label),
+    series: [{ name: '支出', color: '#BE123C', data: p.weekdayExpense.map((w) => w.expense / 100) }],
+    height: 185,
+    showLegend: false,
+    valueUnit: '元',
+  });
   const totalMemberExp = Math.max(1, p.members.reduce((s, m) => s + m.expense, 0));
   const presetBtn = (k: string, label: string) =>
     `<a class="btn btn-sm ${p.range.preset === k ? 'btn-primary' : ''}" href="${esc(p.linkWith({ preset: k }, { keepPeriod: false }))}">${label}</a>`;
@@ -107,6 +115,16 @@ export function reportsPage(p: ReportsViewProps): string {
       <a class="btn btn-sm" href="/export/csv">导出 CSV</a>
     </div>
   </div>
+  <form method="get" action="/reports" class="row wrap mb12">
+    <input type="hidden" name="preset" value="custom">
+    ${p.kind !== 'expense' ? `<input type="hidden" name="kind" value="${esc(p.kind)}">` : ''}
+    ${p.selectedCat ? `<input type="hidden" name="cat" value="${esc(p.selectedCat)}">` : ''}
+    <span class="tiny muted">自定义区间：</span>
+    <input type="date" name="from" value="${esc(p.range.start)}" style="width:auto">
+    <span class="tiny muted">~</span>
+    <input type="date" name="to" value="${esc(p.range.end)}" style="width:auto">
+    <button class="btn btn-sm ${p.range.preset === 'custom' ? 'btn-primary' : ''}" type="submit">查询</button>
+  </form>
   <div class="kpi-grid">
     <div class="stat"><div class="label">当前家庭净资产</div><div class="value amount">${fmtAmount(p.overview.net)}</div><div class="delta">资产 ${fmtAmount(p.overview.assets)} · 负债 ${fmtAmount(p.overview.liabilities)}</div></div>
     <div class="stat"><div class="label">本期总支出</div><div class="value amount expense">-${fmtAmount(p.sum.expense)}</div><div class="delta">支出 ${p.expenseCount.c} 笔 · 笔均 ${fmtAmount(Math.round(p.expenseCount.avg))}</div></div>
@@ -169,6 +187,17 @@ export function reportsPage(p: ReportsViewProps): string {
   <div class="card">
     <div class="card-head"><b>消费日历热力图（${esc(p.heatmapMonth)}）</b></div>
     <div class="chart-box">${heatmapSvg}</div>
+  </div>
+</div>
+<div class="card mb16">
+  <div class="card-head"><b>星期分布（支出）</b><span class="muted small">按周一至周日汇总</span></div>
+  <div class="chart-box">${weekdayChart}</div>
+  <div class="row wrap mt8" style="justify-content:space-around">
+    ${p.weekdayExpense
+      .map(
+        (w) => `<div class="tiny" style="text-align:center"><div class="muted">${esc(w.label)}（${w.cnt}笔）</div><div class="amount bold">${fmtAmount(w.expense)}</div></div>`,
+      )
+      .join('')}
   </div>
 </div>`;
 }

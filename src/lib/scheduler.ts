@@ -403,8 +403,23 @@ export function budgetPrevRange(b: Pick<BudgetRow, 'period' | 'start_date' | 'en
   }
 }
 
+export async function budgetAmountInBaseCents(
+  db: Db,
+  b: Pick<BudgetRow, 'amount_cents' | 'currency'>,
+): Promise<number> {
+  const raw = Number(b.amount_cents) || 0;
+  if (!raw) return 0;
+  try {
+    const rate = await resolveRate(db, b.currency || 'CNY');
+    return toBase(raw, rate);
+  } catch (e) {
+    console.warn('[budget] missing rate for budget currency:', b.currency, e);
+    return raw;
+  }
+}
+
 export async function effectiveBudget(db: Db, b: BudgetRow, ref: Date) {
-  const amount = Number(b.amount_cents) || 0;
+  const amount = await budgetAmountInBaseCents(db, b);
   if (!b.rollover || b.trigger_type === 'income') return { amount, rollover: 0 };
   const prev = budgetPrevRange(b, ref);
   if (!prev) return { amount, rollover: 0 };
@@ -622,6 +637,25 @@ export async function runSubscriptions(db: Db, today = todayStr()) {
   return { charged: r.charged, renewed: r.renewed, notified: r.notified + reminded };
 }
 
+/** 修复因关联报销入账流水缺失导致的孤儿已报销标记（纯 DB，不扫 R2；仅重置有明确 dangling related_id 的记录） */
+export async function repairReimbursedLinks(db: Db): Promise<number> {
+  const res = await db.run(
+    `UPDATE transactions
+     SET reimbursed_at = NULL, related_id = NULL
+     WHERE reimbursed_at IS NOT NULL
+       AND deleted_at IS NULL
+       AND related_id IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM transactions r
+         WHERE r.id = transactions.related_id
+           AND r.ledger_id = transactions.ledger_id
+           AND r.type = 'reimburse'
+           AND r.deleted_at IS NULL
+       )`,
+  );
+  return Number(res.changes || 0);
+}
+
 /** 轻量 DB 清理（不在定时任务中执行任何 R2.list() 全量扫描） */
 async function cleanup(db: Db, env?: Pick<Env, 'ATTACHMENTS'>) {
   try {
@@ -630,6 +664,7 @@ async function cleanup(db: Db, env?: Pick<Env, 'ATTACHMENTS'>) {
       ['DELETE FROM ledger_invites WHERE expires_at IS NOT NULL AND expires_at < ?', [today]],
       ["DELETE FROM notifications WHERE is_read = 1 AND created_at < date(?, '-90 day')", [today]],
     ]);
+    await repairReimbursedLinks(db);
     const pending = await db.all<{ id: number; rel_path: string }>(
       "SELECT id, rel_path FROM attachments WHERE ai_status = 'pending' AND created_at < date(?, '-7 day')",
       today,

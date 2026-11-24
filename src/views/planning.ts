@@ -22,10 +22,13 @@ export function budgetsPage({
         const used = b.used as number | null;
         const ratio = b.ratio as number | null;
         const amt = Number(b.amount_cents);
+        const origAmt = Number(b.orig_amount_cents ?? amt);
+        const diffCurrency =
+          b.currency && b.baseCurrency && String(b.currency).toUpperCase() !== String(b.baseCurrency).toUpperCase();
         return `<tr>
   <td><b>${esc(b.name)}</b> <span class="chip">${esc(b.catLabel)}</span>${Number(b.rollover) > 0 ? ` <span class="tiny muted">含结转 ${fmtAmount(Number(b.rollover))}</span>` : ''}</td>
   <td>${esc(b.rangeLabel || b.period)}</td>
-  <td class="num amount">${fmtAmount(amt)}</td>
+  <td class="num amount">${fmtAmount(amt)}${diffCurrency ? `<div class="tiny muted">${(origAmt / 100).toFixed(2)} ${esc(b.currency)}</div>` : ''}</td>
   <td class="num amount">${used == null ? '—' : fmtAmount(used)}</td>
   <td style="min-width:150px">${ratio == null || used == null ? '—' : `${progressBar(used, amt)} <span class="tiny muted">${Math.round(ratio)}%</span>`}</td>
   <td>
@@ -74,12 +77,19 @@ export function subscriptionsPage({
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
   const rows =
     ov.items
-      .map(
-        (s) => `<tr>
+      .map((s) => {
+        const anchorHint =
+          s.cycle === 'monthly' &&
+          s.anchor_day &&
+          s.next_charge_at &&
+          Number(String(s.next_charge_at).slice(8, 10)) !== Number(s.anchor_day)
+            ? ` <span class="tiny muted">（锚点 ${s.anchor_day} 日）</span>`
+            : '';
+        return `<tr>
   <td>${esc(s.icon || '🧾')} <b>${esc(s.name)}</b> <span class="tiny muted">${esc(s.plan || '')}</span><div class="tiny muted">已扣 ${Number(s.charge_count || 0)} 期</div></td>
   <td class="num amount">${fmtAmount(Number(s.amount_cents))}</td>
   <td>${esc(cycleLabel(String(s.cycle), Number(s.cycle_n)))}</td>
-  <td>${esc(s.next_charge_at || '')}${s.daysLeft != null ? ` <span class="tiny muted">(${s.daysLeft}天)</span>` : ''}</td>
+  <td>${esc(s.next_charge_at || '')}${anchorHint}${s.daysLeft != null ? ` <span class="tiny muted">(${s.daysLeft}天)</span>` : ''}</td>
   <td><span class="chip">${esc(statusLabel(String(s.status)))}</span></td>
   <td>
     <div class="row wrap">
@@ -91,8 +101,8 @@ export function subscriptionsPage({
       <form method="post" action="/subscriptions/${s.id}/delete" style="display:inline" data-confirm="确认永久删除该订阅？（不会删除已生成的历史扣费流水）">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
     </div>
   </td>
-</tr>`,
-      )
+</tr>`;
+      })
       .join('') || '<tr><td colspan="6">暂无订阅</td></tr>';
 
   return `<div class="kpi-grid mb16">
@@ -106,9 +116,12 @@ ${simpleTable('订阅扣费管理', ['名称', '金额', '周期', '下次扣费
 <form method="post" action="/subscriptions" data-require-trial-end>${csrfInput}
   <div class="grid grid-3">
     <input name="name" placeholder="订阅名称，如：iCloud+" required>
+    <input name="icon" placeholder="图标，默认 🧾" value="🧾" maxlength="8">
     <input name="amount" placeholder="每期金额（元）" inputmode="decimal" required>
+    <input name="currency" placeholder="币种，默认 CNY" value="CNY" maxlength="8">
     <select name="cycle">${Object.entries(CYCLE_LABEL).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('')}</select>
     <input name="cycle_n" type="number" min="1" max="12" value="1" title="每 N 个周期">
+    <input name="anchor_month" type="number" min="1" max="12" placeholder="扣费月（1-12，年付可选）">
     <select name="account_id"><option value="">扣费账户</option>${accounts.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
     <select name="category_id"><option value="">分类</option>${cats.map((cc) => `<option value="${cc.id}">${esc(cc.path)}</option>`).join('')}</select>
     <input type="date" name="next_charge_at" value="${today}">
@@ -116,6 +129,7 @@ ${simpleTable('订阅扣费管理', ['名称', '金额', '周期', '下次扣费
     <input type="date" name="trial_ends_on" title="试用结束日">
     <select name="status"><option value="active">生效中</option><option value="trial">试用中</option><option value="paused">已暂停</option></select>
     <input name="reminder_days" type="number" min="0" max="60" value="3" title="提前提醒天数">
+    <input name="vendor_url" type="url" placeholder="官网 / 退订链接（可选）">
     <input name="note" placeholder="备注">
   </div>
   <div class="row mt12"><label class="check"><input type="checkbox" name="auto_renew" checked> 到期自动扣费记账</label><button class="btn btn-primary" type="submit">创建订阅</button></div>

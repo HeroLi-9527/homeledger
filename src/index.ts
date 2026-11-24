@@ -4,6 +4,7 @@ import * as auth from './lib/auth.js';
 import { runScheduled } from './lib/scheduler.js';
 import { esc, uid } from './lib/util.js';
 import { accountsRoutes } from './routes/accounts.js';
+import { aboutRoutes } from './routes/about.js';
 import { adminRoutes } from './routes/admin.js';
 import { aiRoutes } from './routes/ai.js';
 import { authRoutes } from './routes/auth.js';
@@ -30,7 +31,7 @@ import { blank, layout } from './views/layout.js';
 
 export const app = new Hono<HonoEnv>();
 
-const STATIC_ASSETS_PREFIX = /^\/(css|js)\//;
+const STATIC_ASSETS_PREFIX = /^\/(css|js|icons)\//;
 const STATIC_ASSET_EXACT = new Set(['/manifest.webmanifest', '/sw.js', '/favicon.ico']);
 const UPLOAD_CONTENT_TYPE: Record<string, string> = {
   png: 'image/png',
@@ -189,6 +190,7 @@ app.route('/', subscriptionsRoutes);
 app.route('/', aiRoutes);
 app.route('/', reportsRoutes);
 app.route('/', adminRoutes);
+app.route('/', aboutRoutes);
 
 app.notFound((c) => {
   if (wantsJson(c) || c.req.path.startsWith('/api/')) {

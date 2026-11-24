@@ -39,21 +39,32 @@ export function txnFormPage({
   const mainTabKeys = [...PRIMARY_TXN_TYPES, 'reimburse', 'refund', 'borrow'];
   const extraTypes = TXN_TYPES.filter((x) => !mainTabKeys.includes(x.key));
 
-  const renderCatTree = (tree: CategoryRow[], kind: 'expense' | 'income') =>
-    tree
-      .map(
-        (root) => `<div class="cat-kind mb8" data-cat-kind="${kind}">
+  const renderCatTree = (tree: CategoryRow[], kind: 'expense' | 'income') => {
+    const parentsBar = tree.length
+      ? `<div class="cat-parents" data-cat-kind="${kind}">${tree
+          .map((root) => `<button type="button" class="chip cat-parent" data-target="cat-root-${root.id}">${esc(root.icon)} ${esc(root.name)}</button>`)
+          .join('')}</div>`
+      : '';
+    const groups = tree
+      .map((root) => {
+        const hasKids = Boolean(root.children && root.children.length);
+        const btns = hasKids
+          ? `<button type="button" class="cat-item ${Number(t.category_id) === Number(root.id) ? 'selected' : ''}" data-id="${root.id}" data-name="${esc(root.name)}" data-path="${esc(root.name)}">${esc(root.icon)} 不细分</button>` +
+            root.children!
+              .map(
+                (ch) =>
+                  `<button type="button" class="cat-item ${Number(t.category_id) === Number(ch.id) ? 'selected' : ''}" data-id="${ch.id}" data-name="${esc(ch.name)}" data-path="${esc(`${root.name}/${ch.name}`)}">${esc(ch.icon)} ${esc(ch.name)}</button>`,
+              )
+              .join('')
+          : `<button type="button" class="cat-item ${Number(t.category_id) === Number(root.id) ? 'selected' : ''}" data-id="${root.id}" data-name="${esc(root.name)}" data-path="${esc(root.name)}">${esc(root.icon)} ${esc(root.name)}</button>`;
+        return `<div class="cat-kind mb8" id="cat-root-${root.id}" data-cat-kind="${kind}">
   <div class="tiny muted bold mb8">${esc(root.icon)} ${esc(root.name)}</div>
-  <div class="cat-grid">
-    ${(root.children && root.children.length ? root.children : [root])
-      .map(
-        (ch) => `<button type="button" class="cat-item ${Number(t.category_id) === Number(ch.id) ? 'selected' : ''}" data-id="${ch.id}" data-name="${esc(ch.name)}" data-path="${esc(root.id === ch.id ? root.name : `${root.name}/${ch.name}`)}">${esc(ch.icon)} ${esc(ch.name)}</button>`,
-      )
-      .join('')}
-  </div>
-</div>`,
-      )
+  <div class="cat-grid">${btns}</div>
+</div>`;
+      })
       .join('');
+    return parentsBar + groups;
+  };
 
   const aiForm = {
     categories: [...form.expenseCats, ...form.incomeCats].map((c) => ({
@@ -141,7 +152,7 @@ export function txnFormPage({
         <label>币种与汇率</label>
         <div class="row">
           <input name="currency" value="${esc(t.currency || 'CNY')}" maxlength="6" style="max-width:90px">
-          <input name="rate" value="${esc(t.rate ?? '')}" placeholder="汇率（留空自动查表）" inputmode="decimal">
+          <input name="rate" value="${esc(t.rate ?? '')}" placeholder="汇率（留空自动查表）" inputmode="decimal" data-no-money-format>
         </div>
       </div>
       <div class="field">
@@ -200,7 +211,7 @@ export function txnFormPage({
             const imgUrl = webUrl(a.rel_path);
             return `<div class="between" style="border-bottom:1px solid var(--border);padding:8px 0">
   <div class="row" style="min-width:0;flex:1">
-    <a href="${esc(imgUrl)}" target="_blank" rel="noopener"><img src="${esc(imgUrl)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:8px;border:1px solid var(--border)"></a>
+    <img src="${esc(imgUrl)}" data-zoom alt="" style="width:48px;height:48px;object-fit:cover;border-radius:8px;border:1px solid var(--border)">
     <div style="min-width:0;flex:1">
       <div class="small bold" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${esc(imgUrl)}" target="_blank" rel="noopener">${esc(a.file_name || a.rel_path)}</a></div>
       <div class="tiny muted">${esc(a.created_at)}${a.size ? ` · ${(Number(a.size) / 1024).toFixed(1)} KB` : ''}</div>
@@ -243,7 +254,21 @@ export function txnFormPage({
   </div>
 </div>`;
 
-    return `<div class="split-workspace">${formCard}${attachmentsCard}</div>`;
+    const canReimburse = Boolean(t.is_reimbursable) && !t.reimbursed_at && (curType === 'expense' || curType === 'fee');
+    const reimburseCard = canReimburse
+      ? `<div class="card mb16">
+  <div class="card-head"><b>待报销 · 一键报销入账</b><span class="chip warn">未报销</span></div>
+  <p class="muted small mb12">标记该笔支出为已报销，并按原币折算金额生成一笔报销入账流水。</p>
+  <form method="post" action="/transactions/${txnId}/reimburse" class="row wrap">
+    <input type="hidden" name="_csrf" value="${esc(csrf)}">
+    <input type="hidden" name="back" value="/transactions/${txnId}/edit">
+    <select name="account_id" style="flex:1;min-width:160px">${accountOptionsHtml(form.accounts, { selectedId: t.account_id as string | number | undefined, emptyLabel: '选择报销入账账户…' })}</select>
+    <button class="btn btn-primary btn-sm" type="submit">标记已报销并入账</button>
+  </form>
+</div>`
+      : '';
+
+    return `<div class="split-workspace">${formCard}<div>${reimburseCard}${attachmentsCard}</div></div>`;
   }
 
   const aiSideCard = `<div class="card">

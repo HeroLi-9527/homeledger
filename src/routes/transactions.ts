@@ -276,12 +276,38 @@ txnRoutes.post('/transactions/bulk-reimburse', async (c) => {
   try {
     const res = await txn.markReimbursed(db, ids, Number(ctx.ledger!.id), ctx.user!.id, accountId);
     if (isJson) return c.json({ ok: true, ...res });
-    setFlash(c, 'success', `已标记 ${res.count} 笔为已报销，生成入账 ${(res.total / 100).toFixed(2)}`);
-    return c.redirect(String(body.back || '/transactions'));
+    const reasons = [...new Set(res.skipped.map((s) => s.reason))];
+    setFlash(
+      c,
+      'success',
+      `已标记 ${res.count} 笔为已报销，生成入账 ${(res.total / 100).toFixed(2)}${res.skipped.length ? `，${res.skipped.length} 笔跳过（${reasons.join('；')}）` : ''}`,
+    );
+    return c.redirect(u.safeInternalPath(body.back, '/transactions'));
   } catch (e) {
     if (isJson) return c.json({ ok: false, error: toPublicError(e) }, 400);
     setFlash(c, 'error', toPublicError(e));
-    return c.redirect(String(body.back || '/transactions'));
+    return c.redirect(u.safeInternalPath(body.back, '/transactions'));
+  }
+});
+
+txnRoutes.post('/transactions/:id/reimburse', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const body = await bodyOf(c);
+  const id = Number(c.req.param('id'));
+  const accountId = body.account_id ? Number(body.account_id) : 0;
+  const isJson = body._json === '1' || wantsJson(c);
+  try {
+    const res = await txn.markReimbursed(db, [id], Number(ctx.ledger!.id), ctx.user!.id, accountId);
+    if (isJson) return c.json({ ok: true, ...res });
+    setFlash(c, 'success', `已标记为已报销，生成入账 ${(res.total / 100).toFixed(2)}`);
+    return c.redirect(u.safeInternalPath(body.back, '/transactions'));
+  } catch (e) {
+    if (isJson) return c.json({ ok: false, error: toPublicError(e) }, 400);
+    setFlash(c, 'error', toPublicError(e));
+    return c.redirect(u.safeInternalPath(body.back, '/transactions'));
   }
 });
 

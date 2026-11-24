@@ -12,6 +12,9 @@ export interface DashboardViewData {
   overview: { accounts: AccountRow[]; assets: number; liabilities: number; net: number };
   trendChart: string;
   cats: Array<{ name: string; icon: string; color: string; total: number; cnt: number }>;
+  incomeCats: Array<{ name: string; icon: string; color: string; total: number; cnt: number }>;
+  todayCount: number;
+  upcoming: Array<{ id: number; name: string; frequency: string; next_run_at: string; amount_cents: number }>;
   budgets: Array<{ id: number; name: string; used: number; amount_cents: number; ratio: number; rangeLabel: string }>;
   recentGroups: TxnDateGroup[];
   debts: Array<{ direction: string; cnt: number; total: number }>;
@@ -62,7 +65,7 @@ export function dashboardPage(d: DashboardViewData): string {
   <div class="stat">
     <div class="label"><span>本月总支出</span>${expDiff !== null ? `<span class="chip ${expDiff > 0 ? 'expense' : 'income'}">${expDiff > 0 ? '↑' : '↓'} ${Math.abs(expDiff)}% 环比</span>` : ''}</div>
     <div class="value amount expense">-${fmtAmount(d.cur.expense)}</div>
-    <div class="delta">上月支出 ${fmtAmount(d.prev.expense)} · 共 ${d.cur.count} 笔</div>
+    <div class="delta">上月支出 ${fmtAmount(d.prev.expense)} · 共 ${d.cur.count} 笔 · 今日已记 ${d.todayCount} 笔</div>
   </div>
   <div class="stat">
     <div class="label"><span>本月总收入</span>${incDiff !== null ? `<span class="chip ${incDiff >= 0 ? 'income' : 'warn'}">${incDiff >= 0 ? '↑' : '↓'} ${Math.abs(incDiff)}% 环比</span>` : ''}</div>
@@ -90,6 +93,18 @@ export function dashboardPage(d: DashboardViewData): string {
     <div class="card-head"><b>支出构成占比</b><a class="btn btn-sm btn-ghost" href="/reports?month=${d.month}">分类报表 →</a></div>
     <div style="display:flex;justify-content:center;margin-bottom:10px">${donut}</div>
     ${d.cats.length ? donutLegend(donutItems, d.cur.expense / 100, '元') : ''}
+    ${
+      d.incomeCats.length
+        ? `<div class="mt12" style="border-top:1px solid var(--border);padding-top:10px">
+      <div class="tiny muted bold mb8">本月收入分类 TOP</div>
+      ${d.incomeCats
+        .map(
+          (c) => `<div class="between" style="padding:3px 0"><span class="small">${esc(c.icon)} ${esc(c.name)} <span class="tiny muted">${c.cnt}笔</span></span><span class="amount small income">+${fmtAmount(c.total)}</span></div>`,
+        )
+        .join('')}
+    </div>`
+        : ''
+    }
   </div>
 </div>
 
@@ -153,6 +168,11 @@ export function dashboardPage(d: DashboardViewData): string {
       ${d.goals
         .map(
           (g) => `<div class="between"><span>${esc(g.icon)} ${esc(g.name)}</span><span class="tiny amount">${fmtAmount(g.saved_cents)} / ${fmtAmount(g.target_cents)}</span></div>`,
+        )
+        .join('')}
+      ${d.upcoming
+        .map(
+          (r) => `<div class="between"><span>🔁 ${esc(r.name)} <span class="tiny muted">(${esc(r.next_run_at)})</span></span><a href="/recurring" class="amount small">${fmtAmount(r.amount_cents)}</a></div>`,
         )
         .join('')}
     </div>

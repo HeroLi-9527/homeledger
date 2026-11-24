@@ -1,16 +1,41 @@
 import type { Context } from 'hono';
 import { Hono } from 'hono';
-import { accountGroupOf, isCreditGroupType, nowStr, todayStr } from '../db.js';
-import { creditMetrics, groupAccountsSummary, normalizeAccountWrite } from '../lib/accounts.js';
+import { accountGroupOf, isCreditGroupType, nowStr, todayStr, TXN_TYPE_MAP } from '../db.js';
+import {
+  creditMetrics,
+  deleteAccountIfUnreferenced,
+  groupAccountsSummary,
+  normalizeAccountWrite,
+} from '../lib/accounts.js';
 import { analyzeBill } from '../lib/ai.js';
 import * as attach from '../lib/attachments.js';
 import * as auth from '../lib/auth.js';
+import { BACKUP_TABLES } from '../lib/backup.js';
 import * as fd from '../lib/formdata.js';
+import {
+  budgetAmountInBaseCents,
+  budgetPeriodRange,
+  budgetUsedInRange,
+  effectiveBudget,
+  tzRefDate,
+  type BudgetRow,
+  type RecurringRuleRow,
+} from '../lib/scheduler.js';
 import * as sc from '../lib/session-cards.js';
 import { overview as subsOverview } from '../lib/subscriptions.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
-import type { AccountRow, CategoryRow, HonoEnv, Role } from '../types.js';
+import type { AccountRow, CategoryRow, Db, HonoEnv, Role } from '../types.js';
+import {
+  buildAiJson,
+  cleanupSavedAiImages,
+  extractRawImages,
+  findDuplicateAiTxn,
+  MAX_AI_TEXT_LEN,
+  saveAiImagesBestEffort,
+  validateRawImages,
+  type SavedAiImage,
+} from './ai.js';
 import { dbOf, envOf, toPublicError } from './helpers.js';
 import {
   parseAmountField,
@@ -22,8 +47,106 @@ import {
   requireWriteApi,
 } from './openapi-helpers.js';
 import { registerPlanningOpenApi } from './openapi-planning.js';
+import { parseReportRange } from './reports.js';
 
 export const openapiRoutes = new Hono<HonoEnv>();
+
+const TXN_TYPE_ALIASES: Record<string, string> = {
+  支出: 'expense',
+  收入: 'income',
+  转账: 'transfer',
+  借出: 'lend',
+  借入: 'borrow',
+  收款: 'repay_receive',
+  收回借款: 'repay_receive',
+  还款: 'repay_pay',
+  偿还借款: 'repay_pay',
+  报销: 'reimburse',
+  报销入账: 'reimburse',
+  退款: 'refund',
+  手续费: 'fee',
+  利息: 'interest',
+  利息收入: 'interest',
+  买入: 'invest_buy',
+  投资买入: 'invest_buy',
+  卖出: 'invest_sell',
+  投资卖出: 'invest_sell',
+  校准: 'adjust',
+  余额调整: 'adjust',
+};
+
+function normName(s: string): string {
+  return String(s || '').replace(/\s+/g, '').toLowerCase();
+}
+
+async function resolveCategoryIdByName(
+  db: Db,
+  ledgerId: number,
+  nameHint: string,
+  txnType: string,
+): Promise<number | null> {
+  const hint = normName(nameHint);
+  if (!hint) return null;
+  const kind = (txn.INCOME_TYPES as readonly string[]).includes(txnType)
+    ? 'income'
+    : (txn.EXPENSE_TYPES as readonly string[]).includes(txnType)
+      ? 'expense'
+      : null;
+  const rows = await fd.flatCategories(db, ledgerId, kind);
+  for (const c of rows) {
+    if (normName(c.path) === hint || normName(c.name) === hint) return Number(c.id);
+  }
+  const tail = hint.includes('/') ? hint.split('/').pop() || hint : hint;
+  for (const c of rows) {
+    if (normName(c.name) === tail) return Number(c.id);
+  }
+  return null;
+}
+
+async function lookupAccountIdByName(db: Db, ledgerId: number, nameHint: string): Promise<number | null> {
+  const cleanName = nameHint.trim().slice(0, 30);
+  if (!cleanName) return null;
+  const target = normName(cleanName);
+  const accounts = await db.all<AccountRow>(
+    'SELECT * FROM accounts WHERE ledger_id = ? AND is_archived = 0 ORDER BY sort_order, id',
+    ledgerId,
+  );
+  for (const a of accounts) {
+    if (normName(a.name) === target) return Number(a.id);
+  }
+  return null;
+}
+
+async function createAutoAccount(
+  db: Db,
+  ledgerId: number,
+  cleanName: string,
+  createdAccounts: string[],
+): Promise<number> {
+  const type = /信用|花呗|白条|分期/.test(cleanName)
+    ? 'credit'
+    : /储值|充值|预付|会员卡|礼品卡/.test(cleanName)
+      ? 'prepaid'
+      : /支付宝|微信|京东|云闪付/.test(cleanName)
+        ? 'virtual'
+        : /银行|卡/.test(cleanName)
+          ? 'debit'
+          : 'other';
+  const icon = type === 'credit' ? '💳' : type === 'prepaid' ? '🎟️' : type === 'virtual' ? '📱' : type === 'debit' ? '🏦' : '📦';
+  const res = await db.run(
+    `INSERT INTO accounts (ledger_id, name, type, icon, currency, initial_cents, balance_cents, sort_order, note, created_at)
+     VALUES (?,?,?,?,?,0,0,999,?,?)`,
+    ledgerId,
+    cleanName,
+    type,
+    icon,
+    'CNY',
+    '由开放 API 自动创建',
+    nowStr(),
+  );
+  createdAccounts.push(cleanName);
+  return Number(res.lastInsertRowid);
+}
 
 function extractBearer(c: Context<HonoEnv>): string | null {
   const authz = c.req.header('authorization') || '';
@@ -143,26 +266,102 @@ openapiRoutes.post('/transactions', async (c) => {
   const db = dbOf(c);
   try {
     const body = (await c.req.json()) as Record<string, unknown>;
-    const amountCents =
-      body.amount_cents != null ? Math.round(Number(body.amount_cents)) : u.parseAmountToCents(body.amount);
-    const id = await txn.createTransaction(db, oa.ledgerId, oa.userId, {
-      type: String(body.type || 'expense'),
-      amount_cents: amountCents,
-      currency: String(body.currency || 'CNY'),
-      rate: (body.rate as string | number | null) ?? null,
-      account_id: (body.account_id as string | number | null) ?? null,
-      to_account_id: (body.to_account_id as string | number | null) ?? null,
-      category_id: (body.category_id as string | number | null) ?? null,
-      txn_date: String(body.txn_date || todayStr()),
-      note: body.note != null ? String(body.note) : null,
-      merchant: body.merchant != null ? String(body.merchant) : null,
-      status: String(body.status || 'cleared'),
-      is_reimbursable: body.is_reimbursable ? 1 : 0,
-      tags: String(body.tags || ''),
-      source: String(body.source || 'openapi').slice(0, 30),
-    });
+    const rawType = String(body.type || 'expense').trim();
+    const type = TXN_TYPE_ALIASES[rawType] || rawType;
+    if (!TXN_TYPE_MAP[type]) {
+      return c.json({ ok: false, error: `无效的交易类型（${rawType}）` }, 400);
+    }
+    const rawCents = body.amount_cents != null ? Math.round(Number(body.amount_cents)) : u.parseAmountToCents(body.amount);
+    const amountCents = type === 'adjust' ? rawCents : Math.abs(rawCents);
+    if (!Number.isFinite(amountCents) || !amountCents) {
+      return c.json({ ok: false, error: '金额必须大于 0' }, 400);
+    }
+
+    const currency = String(body.currency || 'CNY').trim().toUpperCase().slice(0, 8) || 'CNY';
+    await txn.resolveRate(db, currency, (body.rate as string | number | null) ?? null);
+
+    let toAccountId: string | number | null = (body.to_account_id as string | number | null) ?? null;
+    if (!toAccountId) {
+      const toAccName = String(body.to_account ?? body.to_account_name ?? '').trim();
+      if (toAccName) {
+        const cleanTo = toAccName.slice(0, 30);
+        const foundTo = await lookupAccountIdByName(db, oa.ledgerId, cleanTo);
+        if (!foundTo) throw new Error(`账户「${cleanTo}」不存在`);
+        toAccountId = foundTo;
+      }
+    }
+
+    let accountId: string | number | null = (body.account_id as string | number | null) ?? null;
+    let pendingAutoAccName: string | null = null;
+    if (!accountId) {
+      const accName = String(body.account ?? body.account_name ?? '').trim().slice(0, 30);
+      if (accName) {
+        const foundAcc = await lookupAccountIdByName(db, oa.ledgerId, accName);
+        if (foundAcc) {
+          accountId = foundAcc;
+        } else {
+          if (body.auto_create_account === false) throw new Error(`账户「${accName}」不存在`);
+          pendingAutoAccName = accName;
+        }
+      }
+    }
+
+    if ((type === 'transfer' || type === 'invest_buy' || type === 'invest_sell') && !toAccountId) {
+      throw new Error(type === 'transfer' ? '转账需要选择转出与转入账户' : '投资交易需要选择资金账户与投资账户');
+    }
+
+    let categoryId: string | number | null = (body.category_id as string | number | null) ?? null;
+    if (!categoryId) {
+      const catName = String(body.category ?? body.category_name ?? '').trim();
+      if (catName) {
+        categoryId = await resolveCategoryIdByName(db, oa.ledgerId, catName, type);
+      }
+    }
+
+    const txnDate = String(body.txn_date ?? body.date ?? todayStr()).trim() || todayStr();
+
+    const createdAccounts: string[] = [];
+    let autoCreatedAccountId: number | null = null;
+    if (!accountId && pendingAutoAccName) {
+      autoCreatedAccountId = await createAutoAccount(db, oa.ledgerId, pendingAutoAccName, createdAccounts);
+      accountId = autoCreatedAccountId;
+    }
+
+    let id: number;
+    try {
+      id = await txn.createTransaction(db, oa.ledgerId, oa.userId, {
+        type,
+        amount_cents: amountCents,
+        currency,
+        rate: (body.rate as string | number | null) ?? null,
+        account_id: accountId,
+        to_account_id: toAccountId,
+        category_id: categoryId,
+        txn_date: txnDate,
+        note: body.note != null ? String(body.note) : null,
+        merchant: body.merchant != null ? String(body.merchant) : null,
+        status: String(body.status || 'cleared'),
+        is_reimbursable: body.is_reimbursable ? 1 : 0,
+        tags: String(body.tags || ''),
+        source: String(body.source || 'openapi').slice(0, 30),
+      });
+    } catch (err) {
+      if (autoCreatedAccountId) {
+        await db.run('DELETE FROM accounts WHERE id = ? AND ledger_id = ?', autoCreatedAccountId, oa.ledgerId).catch(() => {});
+        createdAccounts.length = 0;
+      }
+      throw err;
+    }
     const created = await txn.getTransaction(db, id, oa.ledgerId);
-    return c.json({ ok: true, id, transaction: created }, 201);
+    return c.json(
+      {
+        ok: true,
+        id,
+        transaction: created,
+        ...(createdAccounts.length ? { created_accounts: createdAccounts } : {}),
+      },
+      201,
+    );
   } catch (e) {
     return c.json({ ok: false, error: toPublicError(e) }, 400);
   }
@@ -231,55 +430,87 @@ openapiRoutes.post('/ai/bill', async (c) => {
   const oa = c.get('openAuth')!;
   const db = dbOf(c);
   const env = envOf(c);
+  let savedImages: SavedAiImage[] = [];
+  const createdIds: number[] = [];
   try {
     const body = (await c.req.json()) as Record<string, unknown>;
-    const rawImages = Array.isArray(body.images) ? body.images.slice(0, attach.MAX_IMAGES) : [];
+    const rawImages = extractRawImages(body);
     const text = String(body.text || '').trim();
     if (!rawImages.length && !text) {
       return c.json({ ok: false, error: '请提供 text 或 images' }, 400);
     }
-
-    const savedImages: Array<Awaited<ReturnType<typeof attach.saveDataUrlImage>>> = [];
-    const analyzeImages: Array<{ dataUrl: string }> = [];
-    for (const img of rawImages) {
-      const dataUrl = typeof img === 'string' ? img : String((img as { dataUrl?: string })?.dataUrl || '');
-      if (!dataUrl) continue;
-      analyzeImages.push({ dataUrl });
-      savedImages.push(
-        await attach.saveDataUrlImage(db, env, {
-          dataUrl,
-          ledgerId: oa.ledgerId,
-          userId: oa.userId,
-          kind: 'screenshot',
-          aiStatus: 'analyzed',
-        }),
-      );
+    if (text.length > MAX_AI_TEXT_LEN) {
+      return c.json({ ok: false, error: `输入文字不能超过 ${MAX_AI_TEXT_LEN} 字` }, 400);
     }
 
+    const validImages = validateRawImages(rawImages);
     const res = await analyzeBill(db, {
-      images: analyzeImages,
+      images: validImages,
       text,
       ledgerId: oa.ledgerId,
       defaultAccountId: body.account_id ? Number(body.account_id) : null,
     });
+
+    const warnings = [...res.warnings];
+    let imageSaveFailed = false;
+    if (res.items.length > 0 && validImages.length > 0) {
+      const saved = await saveAiImagesBestEffort(db, env, {
+        ledgerId: oa.ledgerId,
+        userId: oa.userId,
+        rawImages: validImages,
+        aiStatus: 'pending',
+      });
+      savedImages = saved.saved;
+      imageSaveFailed = saved.failed;
+      if (imageSaveFailed) warnings.push('部分凭证图片保存失败');
+    }
+
     const autoSave = body.auto_save !== false;
-    const createdIds: number[] = [];
+    const source = String(body.source || (validImages.length ? 'ai_screenshot' : 'openapi')).slice(0, 30);
+    let duplicates = 0;
+    const errors: string[] = [];
 
     if (autoSave && res.items.length) {
-      for (const it of res.items) {
+      for (let i = 0; i < res.items.length; i++) {
+        const it = res.items[i];
         if (!(it.amount_cents > 0)) continue;
-        const id = await txn.createTransaction(db, oa.ledgerId, oa.userId, {
-          type: it.type,
-          amount_cents: it.amount_cents,
-          currency: it.currency || 'CNY',
-          account_id: it.account_id,
-          category_id: it.category_id,
-          txn_date: it.txn_date,
-          note: it.note,
-          merchant: it.merchant,
-          source: String(body.source || (rawImages.length ? 'ai_screenshot' : 'openapi')).slice(0, 30),
-        });
-        createdIds.push(id);
+        const currency = String(it.currency || 'CNY').trim().toUpperCase().slice(0, 8) || 'CNY';
+        const dupId = await findDuplicateAiTxn(
+          db,
+          oa.ledgerId,
+          {
+            draft_id: it.draft_id,
+            type: it.type,
+            txn_date: it.txn_date,
+            amount_cents: it.amount_cents,
+            currency,
+            account_id: it.account_id,
+            merchant: it.merchant,
+          },
+          source,
+          { allowNaturalKey: true, excludeIds: createdIds, windowSeconds: 120 },
+        );
+        if (dupId) {
+          duplicates++;
+          continue;
+        }
+        try {
+          const id = await txn.createTransaction(db, oa.ledgerId, oa.userId, {
+            type: it.type,
+            amount_cents: it.amount_cents,
+            currency,
+            account_id: it.account_id,
+            category_id: it.category_id,
+            txn_date: it.txn_date,
+            note: it.note,
+            merchant: it.merchant,
+            source,
+            ai_json: buildAiJson(it.draft_id, { engine: res.engine, ...(res.model ? { model: res.model } : {}) }),
+          });
+          createdIds.push(id);
+        } catch (e) {
+          errors.push(`第 ${i + 1} 笔（${toPublicError(e)}）`);
+        }
       }
       if (createdIds.length && savedImages.length) {
         await attach.linkImagesToTxns(db, {
@@ -288,6 +519,12 @@ openapiRoutes.post('/ai/bill', async (c) => {
           txnIds: createdIds,
           aiStatus: 'linked',
         });
+      } else if (!createdIds.length && savedImages.length) {
+        await cleanupSavedAiImages(db, env, oa.ledgerId, savedImages);
+        savedImages = [];
+      }
+      if (!createdIds.length && errors.length && duplicates === 0) {
+        return c.json({ ok: false, error: errors[0], errors }, 400);
       }
     }
 
@@ -297,11 +534,17 @@ openapiRoutes.post('/ai/bill', async (c) => {
       model: res.model,
       items: res.items,
       created: createdIds.length,
+      duplicates,
       ids: createdIds,
-      warnings: res.warnings,
+      warnings,
       images: savedImages,
+      ...(errors.length ? { errors } : {}),
+      ...(imageSaveFailed ? { imageSaveFailed: true } : {}),
     });
   } catch (e) {
+    if (!createdIds.length && savedImages.length) {
+      await cleanupSavedAiImages(db, env, oa.ledgerId, savedImages);
+    }
     return c.json({ ok: false, error: toPublicError(e) }, 400);
   }
 });
@@ -564,22 +807,12 @@ openapiRoutes.delete('/accounts/:id', async (c) => {
   const db = dbOf(c);
   const id = parsePositiveIntId(c.req.param('id'));
   if (!id) return c.json({ ok: false, error: '账户不存在' }, 404);
-  const existing = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+  const existing = await db.get<AccountRow>('SELECT id FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
   if (!existing) return c.json({ ok: false, error: '账户不存在' }, 404);
-  const used = Number(
-    (
-      await db.get<{ c: number }>(
-        'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND (account_id = ? OR to_account_id = ?) AND deleted_at IS NULL',
-        oa.ledgerId,
-        id,
-        id,
-      )
-    )?.c || 0,
-  );
-  if (used > 0) {
-    return c.json({ ok: false, error: `该账户还有 ${used} 笔未删除记账，无法删除` }, 400);
+  const del = await deleteAccountIfUnreferenced(db, oa.ledgerId, id);
+  if (!del.ok) {
+    return c.json({ ok: false, error: del.error }, 400);
   }
-  await db.run('DELETE FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
   return c.json({ ok: true });
 });
 
@@ -1093,47 +1326,230 @@ openapiRoutes.get('/summary', async (c) => {
 
 openapiRoutes.get('/overview', async (c) => {
   const oa = c.get('openAuth')!;
-  const month = todayStr().slice(0, 7);
+  const qMonth = c.req.query('month');
+  const month = /^\d{4}-\d{2}$/.test(String(qMonth || '')) ? String(qMonth) : todayStr().slice(0, 7);
+  const prevMonth = u.addMonths(month, -1);
   const db = dbOf(c);
-  const [summary, overview, recent, subs] = await Promise.all([
+  const [
+    summary,
+    previous,
+    overview,
+    recent,
+    subs,
+    trend,
+    expenseCategories,
+    incomeCategories,
+    budgetsRaw,
+    debts,
+    goals,
+    recurringRaw,
+    pendingReimburse,
+  ] = await Promise.all([
     txn.summary(db, oa.ledgerId, `${month}-01`, u.monthEnd(month)),
+    txn.summary(db, oa.ledgerId, `${prevMonth}-01`, u.monthEnd(prevMonth)),
     txn.accountOverview(db, oa.ledgerId),
     txn.listTransactions(db, oa.ledgerId, { page: 1, pageSize: 10 }),
     subsOverview(db, oa.ledgerId),
+    txn.monthlyTrend(db, oa.ledgerId, 6),
+    txn.categoryBreakdown(db, oa.ledgerId, `${month}-01`, u.monthEnd(month), 'expense'),
+    txn.categoryBreakdown(db, oa.ledgerId, `${month}-01`, u.monthEnd(month), 'income'),
+    db.all<BudgetRow>('SELECT * FROM budgets WHERE ledger_id = ? AND is_active = 1 ORDER BY id', oa.ledgerId),
+    db.all<{ direction: string; cnt: number; total: number }>(
+      "SELECT direction, COUNT(*) AS cnt, COALESCE(SUM(balance_cents),0) AS total FROM debts WHERE ledger_id = ? AND status = 'open' GROUP BY direction",
+      oa.ledgerId,
+    ),
+    db.all<{ id: number; name: string; icon: string; saved_cents: number; target_cents: number; target_date: string | null; status: string }>(
+      "SELECT id, name, icon, saved_cents, target_cents, target_date, status FROM goals WHERE ledger_id = ? AND status = 'active' ORDER BY id LIMIT 10",
+      oa.ledgerId,
+    ),
+    db.all<RecurringRuleRow>(
+      'SELECT * FROM recurring_rules WHERE ledger_id = ? AND is_active = 1 ORDER BY next_run_at LIMIT 5',
+      oa.ledgerId,
+    ),
+    db.get<{ count: number; sum: number }>(
+      'SELECT COUNT(*) AS count, COALESCE(SUM(amount_base_cents),0) AS sum FROM transactions WHERE ledger_id = ? AND deleted_at IS NULL AND is_reimbursable = 1 AND reimbursed_at IS NULL',
+      oa.ledgerId,
+    ),
   ]);
+
+  const refDate = tzRefDate();
+  const budgets = await Promise.all(
+    budgetsRaw.map(async (b) => {
+      const r2 = budgetPeriodRange(b, refDate);
+      const isUnset = b.period === 'custom' && (!b.start_date || !b.end_date);
+      const [used, eff] = await Promise.all([
+        isUnset ? Promise.resolve(null) : budgetUsedInRange(db, b, r2.start, r2.end),
+        isUnset ? budgetAmountInBaseCents(db, b).then((amount) => ({ amount, rollover: 0 })) : effectiveBudget(db, b, refDate),
+      ]);
+      return {
+        ...b,
+        range: r2,
+        used_cents: used,
+        effective_cents: eff.amount,
+        rollover_cents: eff.rollover,
+      };
+    }),
+  );
+
   return c.json({
     ok: true,
     month,
     summary,
+    previous,
     overview: { net: overview.net, assets: overview.assets, liabilities: overview.liabilities },
     recent: recent.rows,
-    subscriptions: { active_count: subs.active.length, monthly_cents: subs.monthlyTotal },
+    trend,
+    expense_categories: expenseCategories,
+    income_categories: incomeCategories,
+    accounts: overview.accounts.map(enrichAccount),
+    budgets,
+    debts,
+    goals,
+    upcoming_recurring: recurringRaw.map((r) => {
+      let amountCents = 0;
+      try {
+        const p = JSON.parse(r.payload || '{}') as unknown;
+        const items = Array.isArray(p)
+          ? p
+          : p && typeof p === 'object' && Array.isArray((p as { items?: unknown[] }).items)
+            ? (p as { items: unknown[] }).items
+            : [p];
+        for (const it of items) {
+          if (it && typeof it === 'object') amountCents += Math.abs(Number((it as { amount_cents?: number }).amount_cents) || 0);
+        }
+      } catch {
+        amountCents = 0;
+      }
+      return { id: r.id, name: r.name, frequency: r.frequency, next_run_at: r.next_run_at, auto_post: r.auto_post, amount_cents: amountCents };
+    }),
+    pending_reimburse: {
+      count: Number(pendingReimburse?.count || 0),
+      sum: Number(pendingReimburse?.sum || 0),
+    },
+    subscriptions: {
+      active_count: subs.active.length,
+      monthly_cents: subs.monthlyTotal,
+      annual_cents: subs.annualTotal,
+    },
   });
 });
 
 openapiRoutes.get('/reports', async (c) => {
   const oa = c.get('openAuth')!;
-  const month = /^\d{4}-\d{2}$/.test(String(c.req.query('month') || ''))
-    ? String(c.req.query('month'))
-    : todayStr().slice(0, 7);
-  const start = `${month}-01`;
-  const end = u.monthEnd(month);
+  const q = c.req.query();
+  const range = parseReportRange(q);
+  const kind: 'expense' | 'income' = q.kind === 'income' ? 'income' : 'expense';
+  const selectedCat = q.cat ? String(q.cat).trim() : null;
+  const heatmapMonth = range.month || todayStr().slice(0, 7);
+  const prevM = u.addMonths(heatmapMonth, -1);
+  const lastYearM = u.addMonths(heatmapMonth, -12);
   const db = dbOf(c);
-  const [summary, expense_categories, income_categories, trend, members, net_worth] = await Promise.all([
-    txn.summary(db, oa.ledgerId, start, end),
-    txn.categoryBreakdown(db, oa.ledgerId, start, end, 'expense'),
-    txn.categoryBreakdown(db, oa.ledgerId, start, end, 'income'),
+
+  const [
+    summary,
+    expense_categories,
+    income_categories,
+    subcategories,
+    trend,
+    daily,
+    weekday_expense,
+    members,
+    net_worth,
+    expRow,
+    prevSum,
+    lastYearSum,
+  ] = await Promise.all([
+    txn.summary(db, oa.ledgerId, range.start, range.end),
+    txn.categoryBreakdown(db, oa.ledgerId, range.start, range.end, 'expense'),
+    txn.categoryBreakdown(db, oa.ledgerId, range.start, range.end, 'income'),
+    txn.subcategoryBreakdown(db, oa.ledgerId, range.start, range.end, kind, selectedCat),
     txn.monthlyTrend(db, oa.ledgerId, 6),
-    txn.memberBreakdown(db, oa.ledgerId, start, end),
+    txn.dailyBreakdown(db, oa.ledgerId, `${heatmapMonth}-01`, u.monthEnd(heatmapMonth)),
+    txn.weekdayExpenseBreakdown(db, oa.ledgerId, range.start, range.end),
+    txn.memberBreakdown(db, oa.ledgerId, range.start, range.end),
     txn.netWorthTrend(db, oa.ledgerId, 6),
+    db.get<{ c: number; avg: number }>(
+      `SELECT COUNT(*) AS c, COALESCE(AVG(amount_base_cents),0) AS avg
+       FROM transactions
+       WHERE ledger_id = ? AND deleted_at IS NULL AND txn_date BETWEEN ? AND ? AND type IN ('expense','fee')`,
+      oa.ledgerId,
+      range.start,
+      range.end,
+    ),
+    range.preset === 'month' ? txn.summary(db, oa.ledgerId, `${prevM}-01`, u.monthEnd(prevM)) : Promise.resolve(null),
+    range.preset === 'month' ? txn.summary(db, oa.ledgerId, `${lastYearM}-01`, u.monthEnd(lastYearM)) : Promise.resolve(null),
   ]);
-  return c.json({ ok: true, month, summary, expense_categories, income_categories, trend, members, net_worth });
+
+  const compare =
+    range.preset === 'month' && prevSum && lastYearSum
+      ? {
+          prevMonth: { label: prevM, income: prevSum.income, expense: prevSum.expense },
+          lastYear: { label: lastYearM, income: lastYearSum.income, expense: lastYearSum.expense },
+        }
+      : null;
+
+  return c.json({
+    ok: true,
+    month: heatmapMonth,
+    range,
+    kind,
+    summary,
+    compare,
+    expense_categories,
+    income_categories,
+    subcategories,
+    trend,
+    daily,
+    weekday_expense,
+    expense_stats: {
+      count: Number(expRow?.c || 0),
+      avg_cents: Math.round(Number(expRow?.avg || 0)),
+    },
+    members,
+    net_worth,
+  });
 });
 
 registerPlanningOpenApi(openapiRoutes);
 
 openapiRoutes.get('/export', async (c) => {
   const oa = c.get('openAuth')!;
-  const res = await txn.listTransactions(dbOf(c), oa.ledgerId, { page: 1, pageSize: 50000 });
-  return c.json({ ok: true, ledger_id: oa.ledgerId, total: res.total, transactions: res.rows });
+  const db = dbOf(c);
+  if (c.req.query('scope') === 'full') {
+    if (!oa.isAdmin) {
+      return c.json({ ok: false, error: '仅站点管理员可导出全库备份' }, 403);
+    }
+    const tables: Record<string, unknown[]> = {};
+    for (const tbl of BACKUP_TABLES) {
+      tables[tbl] = await db.all(`SELECT * FROM ${tbl}`);
+    }
+    c.header('Cache-Control', 'no-store');
+    return c.json({ ok: true, app: 'homeledger', version: 2, exported_at: nowStr(), tables });
+  }
+  const enc = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        controller.enqueue(enc.encode(`{"ok":true,"ledger_id":${oa.ledgerId},"transactions":[`));
+        let total = 0;
+        let first = true;
+        for await (const batch of txn.iterateAllForExport(db, oa.ledgerId)) {
+          let chunk = '';
+          for (const row of batch) {
+            chunk += `${first ? '' : ','}${JSON.stringify(row)}`;
+            first = false;
+            total++;
+          }
+          if (chunk) controller.enqueue(enc.encode(chunk));
+        }
+        controller.enqueue(enc.encode(`],"total":${total}}`));
+        controller.close();
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+  });
+  return new Response(stream, {
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  });
 });

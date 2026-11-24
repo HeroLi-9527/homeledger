@@ -6,7 +6,8 @@ import test from 'node:test';
 import { makeDb, todayStr } from '../src/db.js';
 import { app } from '../src/index.js';
 import { getAiConfig } from '../src/lib/ai.js';
-import { checkCreditAccounts, checkSessionCards, runScheduled } from '../src/lib/scheduler.js';
+import { checkCreditAccounts, checkSessionCards, repairReimbursedLinks, runScheduled } from '../src/lib/scheduler.js';
+import { iterateAllForExport } from '../src/lib/txn.js';
 import type { Env } from '../src/types.js';
 
 type SQLInputValue = null | number | bigint | string | Uint8Array;
@@ -2293,4 +2294,819 @@ test('OpenAPI 全资源 CRUD、业务动作与权限/跨账本隔离回归', asy
     (await api('/goals', aliceToken, 'POST', { name: '越权目标', target: '100', account_id: l2AccId })).status,
     400,
   );
+});
+
+test('关于页、PWA 图标、防呆/报销/AI 加固、规划边界、CSV TTL/全量导出与 OpenAPI 兼容回归', async () => {
+  const { sqlite, env, r2Store } = setupEnv();
+  const req = (p: string, init: RequestInit = {}) =>
+    app.fetch(new Request(`http://localhost${p}`, init), env);
+  const api = (p: string, token: string, method = 'GET', body?: unknown) =>
+    req(`/api/open${p}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+  // 初始化管理员 alice 与只读成员/跨账本用户 bob
+  const setupRes = await req('/setup', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({
+      username: 'alice',
+      display_name: 'Alice',
+      password: 'password123',
+      password2: 'password123',
+      site_name: '全特性回归',
+    }),
+  });
+  assert.equal(setupRes.status, 302);
+  const aliceCookie = extractSidCookie(setupRes);
+  const homeHtml = await (await req('/', { headers: { Cookie: aliceCookie } })).text();
+  const aliceCsrf = extractCsrf(homeHtml);
+
+  const aliceToken = (
+    (await (
+      await req('/settings/api-tokens', {
+        method: 'POST',
+        headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'AliceTok' }),
+      })
+    ).json()) as { token: string }
+  ).token;
+
+  await req('/members/invite', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, role: 'viewer', days: '7' }),
+  });
+  const invCode = (sqlite.prepare('SELECT code FROM ledger_invites ORDER BY id DESC LIMIT 1').get() as { code: string }).code;
+  const bobJoinRes = await req(`/join/${invCode}/register`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({ username: 'bob', display_name: 'Bob', password: 'bobpassword', password2: 'bobpassword' }),
+  });
+  const bobL1Cookie = extractSidCookie(bobJoinRes);
+  const bobL1Home = await (await req('/', { headers: { Cookie: bobL1Cookie } })).text();
+  const bobL1Csrf = extractCsrf(bobL1Home);
+
+  const bobNewLedger = await req('/ledgers', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: bobL1Cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: bobL1Csrf, name: 'Bob独立账本', kind: 'personal', currency: 'CNY' }),
+  });
+  const bobL2Cookie = extractSidCookie(bobNewLedger);
+  const bobL2Csrf = extractCsrf(await (await req('/', { headers: { Cookie: bobL2Cookie } })).text());
+  const bobL2Token = (
+    (await (
+      await req('/settings/api-tokens', {
+        method: 'POST',
+        headers: { Cookie: bobL2Cookie, 'x-csrf-token': bobL2Csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'BobL2Tok' }),
+      })
+    ).json()) as { token: string }
+  ).token;
+
+  // 1. /about 页面、移动端导航、viewer 隐藏 AI 助手与真实 PNG 图标
+  assert.ok(homeHtml.includes('href="/about"'));
+  assert.ok(homeHtml.includes('class="mobile-nav"'));
+  assert.ok(homeHtml.includes('id="aiFab"') && homeHtml.includes('/js/assistant.js'));
+  assert.ok(homeHtml.includes('今日已记 0 笔'));
+  assert.ok(bobL1Home.includes('class="mobile-nav"'));
+  assert.equal(bobL1Home.includes('id="aiFab"'), false, '只读成员不得加载 AI 助手浮窗');
+  assert.equal(bobL1Home.includes('/js/assistant.js'), false);
+
+  const aboutRes = await req('/about', { headers: { Cookie: aliceCookie } });
+  assert.equal(aboutRes.status, 200);
+  const aboutHtml = await aboutRes.text();
+  assert.ok(aboutHtml.includes('HomeLedger') && aboutHtml.includes('更新记录'));
+
+  for (const iconPath of ['/icons/icon-192.png', '/icons/icon-512.png', '/icons/icon-512-maskable.png']) {
+    const iconRes = await req(iconPath);
+    assert.equal(iconRes.status, 200, `${iconPath} 应返回 200`);
+    const bytes = new Uint8Array(await iconRes.arrayBuffer());
+    assert.deepEqual([...bytes.slice(0, 4)], [0x89, 0x50, 0x4e, 0x47], `${iconPath} 必须为有效 PNG`);
+  }
+  const manifestRes = await req('/manifest.webmanifest');
+  assert.equal(manifestRes.status, 200);
+  const manifestText = await manifestRes.text();
+  assert.ok(manifestText.includes('/icons/icon-192.png') && manifestText.includes('/icons/icon-512-maskable.png'));
+
+  // 2. 账户删前多表引用检查（Web + OpenAPI）
+  const refAccRes = await api('/accounts', aliceToken, 'POST', { name: '引用待删账户', type: 'debit' });
+  assert.equal(refAccRes.status, 201);
+  const refAcc = ((await refAccRes.json()) as { id: number }).id;
+
+  const refBudRes = await api('/budgets', aliceToken, 'POST', { name: '账户预算', scope: 'account', account_id: refAcc, amount: '500' });
+  assert.equal(refBudRes.status, 201);
+  const refBudId = ((await refBudRes.json()) as { id: number }).id;
+  assert.equal((await api(`/accounts/${refAcc}`, aliceToken, 'DELETE')).status, 400);
+  const webDelRes = await req(`/accounts/${refAcc}/delete`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf }),
+  });
+  assert.equal(webDelRes.status, 302);
+  assert.ok(sqlite.prepare('SELECT id FROM accounts WHERE id = ?').get(refAcc), '被预算引用时 Web 端也禁止删户');
+  await api(`/budgets/${refBudId}`, aliceToken, 'DELETE');
+
+  const refGoalRes = await api('/goals', aliceToken, 'POST', { name: '账户目标', target: '1000', account_id: refAcc });
+  assert.equal(refGoalRes.status, 201);
+  const refGoalId = ((await refGoalRes.json()) as { id: number }).id;
+  assert.equal((await api(`/accounts/${refAcc}`, aliceToken, 'DELETE')).status, 400);
+  await api(`/goals/${refGoalId}`, aliceToken, 'DELETE');
+
+  const refDebtRes = await api('/debts', aliceToken, 'POST', { direction: 'receivable', counterparty: '张三', principal: '100', account_id: refAcc });
+  assert.equal(refDebtRes.status, 201);
+  const refDebtId = ((await refDebtRes.json()) as { id: number }).id;
+  assert.equal((await api(`/accounts/${refAcc}`, aliceToken, 'DELETE')).status, 400);
+  await api(`/debts/${refDebtId}`, aliceToken, 'DELETE');
+
+  const refSubRes = await api('/subscriptions', aliceToken, 'POST', { name: '账户订阅', amount: '15', account_id: refAcc });
+  assert.equal(refSubRes.status, 201);
+  const refSubId = ((await refSubRes.json()) as { id: number }).id;
+  assert.equal((await api(`/accounts/${refAcc}`, aliceToken, 'DELETE')).status, 400);
+  await api(`/subscriptions/${refSubId}`, aliceToken, 'DELETE');
+
+  const refRecRes = await api('/recurring', aliceToken, 'POST', {
+    name: '账户周期',
+    frequency: 'monthly',
+    next_run_at: '2099-01-01',
+    items: [{ type: 'expense', amount: '20', account_id: refAcc }],
+  });
+  assert.equal(refRecRes.status, 201);
+  const refRecId = ((await refRecRes.json()) as { id: number }).id;
+  assert.equal((await api(`/accounts/${refAcc}`, aliceToken, 'DELETE')).status, 400);
+  await api(`/recurring/${refRecId}`, aliceToken, 'DELETE');
+  assert.equal((await api(`/accounts/${refAcc}`, aliceToken, 'DELETE')).status, 200);
+
+  // 3. Web 端自定义分类编辑与标签重命名防重
+  const customCat = (
+    (await (await api('/categories', aliceToken, 'POST', { name: '爱好', kind: 'expense', icon: '🎨' })).json()) as { id: number }
+  ).id;
+  await req(`/categories/${customCat}`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, name: '摄影器材', icon: '📷' }),
+  });
+  const editedCat = sqlite.prepare('SELECT name, icon FROM categories WHERE id = ?').get(customCat) as { name: string; icon: string };
+  assert.deepEqual({ ...editedCat }, { name: '摄影器材', icon: '📷' });
+
+  const sysCatBefore = (sqlite.prepare('SELECT name FROM categories WHERE id = 1').get() as { name: string }).name;
+  await req('/categories/1', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, name: '篡改系统' }),
+  });
+  assert.equal((sqlite.prepare('SELECT name FROM categories WHERE id = 1').get() as { name: string }).name, sysCatBefore);
+
+  const tagA = ((await (await api('/tags', aliceToken, 'POST', { name: '出差' })).json()) as { id: number }).id;
+  await api('/tags', aliceToken, 'POST', { name: '日常' });
+  await req(`/tags/${tagA}`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, name: '日常' }),
+  });
+  assert.equal((sqlite.prepare('SELECT name FROM tags WHERE id = ?').get(tagA) as { name: string }).name, '出差', '重名标签不得覆盖');
+  await req(`/tags/${tagA}`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, name: '商旅' }),
+  });
+  assert.equal((sqlite.prepare('SELECT name FROM tags WHERE id = ?').get(tagA) as { name: string }).name, '商旅');
+
+  // 4. 单笔报销与孤儿已报销标记修复
+  const reimbOrigId = (
+    (await (
+      await api('/transactions', aliceToken, 'POST', {
+        type: 'expense',
+        amount: '88',
+        account_id: 1,
+        is_reimbursable: true,
+        tags: '商旅',
+        note: '单笔报销测试',
+      })
+    ).json()) as { id: number }
+  ).id;
+  const reimbRes = await req(`/transactions/${reimbOrigId}/reimburse`, {
+    method: 'POST',
+    headers: {
+      Cookie: aliceCookie,
+      'x-csrf-token': aliceCsrf,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ account_id: 1 }),
+  });
+  assert.equal(reimbRes.status, 200);
+  const reimbJson = (await reimbRes.json()) as { count: number; total: number };
+  assert.equal(reimbJson.count, 1);
+  assert.equal(reimbJson.total, 8800);
+  const afterReimb = sqlite.prepare('SELECT reimbursed_at, related_id FROM transactions WHERE id = ?').get(reimbOrigId) as {
+    reimbursed_at: string | null;
+    related_id: number | null;
+  };
+  assert.ok(afterReimb.reimbursed_at && afterReimb.related_id);
+
+  // 软删关联的报销入账流水以制造孤儿状态，验证 repairReimbursedLinks 可修复
+  sqlite.prepare('UPDATE transactions SET deleted_at = ? WHERE id = ?').run('2026-11-24 00:00:00', afterReimb.related_id);
+  const repaired = await repairReimbursedLinks(makeDb(env));
+  assert.equal(repaired, 1);
+  const afterRepair = sqlite.prepare('SELECT reimbursed_at, related_id FROM transactions WHERE id = ?').get(reimbOrigId) as {
+    reimbursed_at: string | null;
+    related_id: number | null;
+  };
+  assert.deepEqual({ ...afterRepair }, { reimbursed_at: null, related_id: null });
+
+  // 5. AI 解析/聊天 4000 字拦截、零条目不留孤儿图、待确认存图与自然键去重
+  const longText = '买'.repeat(4001);
+  assert.equal(
+    (
+      await req('/ai/analyze', {
+        method: 'POST',
+        headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: longText }),
+      })
+    ).status,
+    400,
+  );
+  assert.equal(
+    (
+      await req('/api/ai/chat', {
+        method: 'POST',
+        headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: longText }),
+      })
+    ).status,
+    400,
+  );
+  assert.equal((await api('/ai/bill', aliceToken, 'POST', { text: longText })).status, 400);
+
+  const zeroAnalyze = await req('/ai/analyze', {
+    method: 'POST',
+    headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: '无金额纯闲聊', images: [PNG_1X1_DATA_URL] }),
+  });
+  assert.equal(zeroAnalyze.status, 200);
+  const zeroJson = (await zeroAnalyze.json()) as { items: unknown[]; images: unknown[] };
+  assert.equal(zeroJson.items.length, 0);
+  assert.equal(zeroJson.images.length, 0);
+  assert.equal((sqlite.prepare('SELECT COUNT(*) AS c FROM attachments').get() as { c: number }).c, 0, '零条目不得落盘图片');
+
+  const okAnalyze = await req('/ai/analyze', {
+    method: 'POST',
+    headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: '午饭 35 元', images: [{ dataUrl: PNG_1X1_DATA_URL, name: 'meal.png' }] }),
+  });
+  assert.equal(okAnalyze.status, 200);
+  const analyzeData = (await okAnalyze.json()) as {
+    autoSave: boolean;
+    items: Array<{ draft_id: string } & Record<string, unknown>>;
+    images: Array<{ id: number }>;
+  };
+  assert.equal(typeof analyzeData.autoSave, 'boolean');
+  assert.equal(analyzeData.items.length, 1);
+  assert.equal(analyzeData.images.length, 1);
+  const attBeforeConfirm = sqlite.prepare('SELECT ai_status, txn_id FROM attachments WHERE id = ?').get(analyzeData.images[0].id) as {
+    ai_status: string;
+    txn_id: number | null;
+  };
+  assert.equal(attBeforeConfirm.ai_status, 'pending');
+  assert.equal(attBeforeConfirm.txn_id, null);
+
+  const confirmRes = await req('/ai/confirm', {
+    method: 'POST',
+    headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      items: analyzeData.items,
+      image_ids: analyzeData.images.map((x) => x.id),
+      source: 'ai_screenshot',
+    }),
+  });
+  assert.equal(confirmRes.status, 200);
+  const attAfterConfirm = sqlite.prepare('SELECT ai_status, txn_id FROM attachments WHERE id = ?').get(analyzeData.images[0].id) as {
+    ai_status: string;
+    txn_id: number | null;
+  };
+  assert.equal(attAfterConfirm.ai_status, 'linked');
+  assert.ok(attAfterConfirm.txn_id);
+
+  const chat1 = await req('/api/ai/chat', {
+    method: 'POST',
+    headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: '打车 48 元' }),
+  });
+  assert.equal(chat1.status, 200);
+  assert.equal(((await chat1.json()) as { created: number }).created, 1);
+  const chat2 = await req('/api/ai/chat', {
+    method: 'POST',
+    headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: '打车 48 元' }),
+  });
+  assert.equal(chat2.status, 200);
+  const chat2Json = (await chat2.json()) as { created: number; duplicates: number };
+  assert.equal(chat2Json.created, 0);
+  assert.equal(chat2Json.duplicates, 1, '重复自然键聊天记账应命中去重');
+
+  // 6. 搜索筛选与报表星期分布 / 自定义区间
+  const searchRes = await req(`/search?member_id=1&tag_id=${tagA}&source=openapi&min=10&max=500`, {
+    headers: { Cookie: aliceCookie },
+  });
+  assert.equal(searchRes.status, 200);
+  const searchHtml = await searchRes.text();
+  assert.ok(searchHtml.includes('单笔报销测试'));
+
+  const repHtml = await (
+    await req('/reports?preset=custom&from=2026-01-01&to=2026-12-31', { headers: { Cookie: aliceCookie } })
+  ).text();
+  assert.ok(repHtml.includes('2026-01-01 ~ 2026-12-31'));
+  assert.ok(repHtml.includes('星期分布（支出）'));
+
+  // 7. 规划细节：预算自定义日校验与编辑字段、试用期订阅阻断扣费、目标存入校验归档账户
+  await req('/budgets', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: aliceCsrf,
+      name: '倒挂预算',
+      period: 'custom',
+      start_date: '2026-06-10',
+      end_date: '2026-06-01',
+      amount: '100',
+    }),
+  });
+  assert.equal(sqlite.prepare("SELECT id FROM budgets WHERE name = '倒挂预算'").get(), undefined);
+
+  const budId = ((await (await api('/budgets', aliceToken, 'POST', { name: '编辑字段预算', amount: '300' })).json()) as { id: number }).id;
+  await req(`/budgets/${budId}`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: aliceCsrf,
+      name: '编辑字段预算',
+      period: 'custom',
+      start_date: '2026-01-01',
+      end_date: '2026-12-31',
+      amount: '500',
+      trigger_type: 'income',
+      currency: 'USD',
+      is_active: '1',
+    }),
+  });
+  const budRow = sqlite.prepare('SELECT trigger_type, currency FROM budgets WHERE id = ?').get(budId) as {
+    trigger_type: string;
+    currency: string;
+  };
+  assert.deepEqual({ ...budRow }, { trigger_type: 'income', currency: 'USD' });
+
+  const trialSubId = (
+    (await (
+      await api('/subscriptions', aliceToken, 'POST', {
+        name: '试用流媒体',
+        amount: '28',
+        account_id: 1,
+        status: 'trial',
+        trial_ends_on: '2099-12-31',
+      })
+    ).json()) as { id: number }
+  ).id;
+  assert.equal((await api(`/subscriptions/${trialSubId}/charge`, aliceToken, 'POST')).status, 400, '试用期未结束前 API 禁止提前扣费');
+  await req(`/subscriptions/${trialSubId}/charge`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf }),
+  });
+  assert.equal(
+    (sqlite.prepare('SELECT COUNT(*) AS c FROM transactions WHERE subscription_id = ?').get(trialSubId) as { c: number }).c,
+    0,
+    '试用期未结束前 Web 端也禁止提前扣费',
+  );
+
+  const archAccRes = await api('/accounts', aliceToken, 'POST', { name: '已归档卡', type: 'debit' });
+  assert.equal(archAccRes.status, 201);
+  const archAccId = ((await archAccRes.json()) as { id: number }).id;
+  await api(`/accounts/${archAccId}/archive`, aliceToken, 'POST');
+  const goalId = (
+    (await (await api('/goals', aliceToken, 'POST', { name: '旅游基金', target: '2000', account_id: 1 })).json()) as { id: number }
+  ).id;
+  await req(`/goals/${goalId}/deposit`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, amount: '100', create_txn: 'on', account_id: String(archAccId) }),
+  });
+  assert.equal(
+    (sqlite.prepare('SELECT saved_cents FROM goals WHERE id = ?').get(goalId) as { saved_cents: number }).saved_cents,
+    0,
+    '选中归档账户存入不得修改 goal saved_cents',
+  );
+
+  // 8. CSV 导入预览字段与 2 小时 TTL 校验 + >200 行全量导出
+  const csvSample = [
+    '交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号',
+    '2026-11-24 12:00:00,餐饮美食,便利店,便当,支出,25.00,,支付成功,ORD-TTL-1',
+    '2026-11-24 13:00:00,投资理财,基金,转入,不计收支,100.00,现金,支付成功,ORD-TTL-2',
+    'bad-date,餐饮美食,食堂,早餐,支出,10.00,现金,支付成功,ORD-TTL-3',
+  ].join('\n');
+  const csvDataUrl = `data:text/csv;base64,${Buffer.from(csvSample, 'utf8').toString('base64')}`;
+  const prevRes = await req('/api/import/preview', {
+    method: 'POST',
+    headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileName: 'ttl.csv', dataUrl: csvDataUrl }),
+  });
+  assert.equal(prevRes.status, 200);
+  const prevJson = (await prevRes.json()) as {
+    token: string;
+    skipped: number;
+    skippedDates: number;
+    neutralCount: number;
+    neutralSample: unknown[];
+    sample: Array<{ guess_account_missing?: boolean }>;
+  };
+  assert.equal(prevJson.skipped, 1);
+  assert.equal(prevJson.skippedDates, 1);
+  assert.equal(prevJson.neutralCount, 1);
+  assert.equal(prevJson.neutralSample.length, 1);
+  assert.equal(prevJson.sample[0].guess_account_missing, true);
+
+  const previewKey = `imports/preview-${prevJson.token}.json`;
+  const storedPreview = r2Store.get(previewKey);
+  assert.ok(storedPreview);
+  const expiredPayload = JSON.parse(new TextDecoder().decode(storedPreview.data)) as Record<string, unknown>;
+  expiredPayload.created_at = Date.now() - 3 * 3600 * 1000;
+  storedPreview.data = new TextEncoder().encode(JSON.stringify(expiredPayload));
+
+  const expiredCommit = await req('/api/import/commit', {
+    method: 'POST',
+    headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: prevJson.token }),
+  });
+  assert.equal(expiredCommit.status, 400);
+  assert.equal(r2Store.has(previewKey), false, '过期的预览对象应在拒接后同步从 R2 删除');
+
+  // 插入超过 200 笔流水验证全量导出无截断
+  const insBulk = sqlite.prepare(
+    `INSERT INTO transactions (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, txn_date, note, status, source, user_id, created_at, updated_at)
+     VALUES (1, 'expense', 100, 'CNY', 1, 100, 1, '2026-11-01', ?, 'cleared', 'manual', 1, '2026-11-01 00:00:00', '2026-11-01 00:00:00')`,
+  );
+  for (let i = 0; i < 215; i++) insBulk.run(`批量导出测试-${i}`);
+
+  const exportCsvText = await (await req('/export/csv', { headers: { Cookie: aliceCookie } })).text();
+  const csvLines = exportCsvText.trim().split('\n');
+  assert.ok(csvLines.length >= 216, `Web CSV 导出应包含全部流水（当前 ${csvLines.length - 1} 行）`);
+
+  const openExportJson = (await (await api('/export', aliceToken)).json()) as {
+    total: number;
+    transactions: unknown[];
+  };
+  assert.ok(openExportJson.total >= 215 && openExportJson.transactions.length >= 215);
+
+  // 9. OpenAPI 兼容别名、中文字段、扩展总览/报表与全库导出权限控制
+  const payRuleId = (
+    (await (
+      await api('/recurring', aliceToken, 'POST', {
+        name: '房租月付',
+        frequency: 'monthly',
+        next_run_at: '2026-11-24',
+        items: [{ type: 'expense', amount: '2500', account_id: 1 }],
+      })
+    ).json()) as { id: number }
+  ).id;
+  const payRecRes = await api(`/recurring/${payRuleId}/pay`, aliceToken, 'POST', { kind: 'bill' });
+  assert.equal(payRecRes.status, 200);
+  assert.equal(((await payRecRes.json()) as { kind: string }).kind, 'recurring');
+
+  const activeSubId = (
+    (await (
+      await api('/subscriptions', aliceToken, 'POST', { name: '云盘', amount: '12', account_id: 1, status: 'active' })
+    ).json()) as { id: number }
+  ).id;
+  const paySubRes = await api(`/recurring/${activeSubId}/pay`, aliceToken, 'POST', { kind: 'subscription' });
+  assert.equal(paySubRes.status, 200);
+  assert.equal(((await paySubRes.json()) as { kind: string }).kind, 'subscription');
+
+  const cnTxnRes = await api('/transactions', aliceToken, 'POST', {
+    type: '支出',
+    date: '2026-11-24',
+    amount: '33.50',
+    category: '餐饮美食',
+    account: '招行自动建卡',
+    note: '中文别名记账',
+  });
+  assert.equal(cnTxnRes.status, 201);
+  const cnTxnJson = (await cnTxnRes.json()) as {
+    transaction: { type: string; txn_date: string; amount_cents: number };
+    created_accounts?: string[];
+  };
+  assert.equal(cnTxnJson.transaction.type, 'expense');
+  assert.equal(cnTxnJson.transaction.txn_date, '2026-11-24');
+  assert.equal(cnTxnJson.transaction.amount_cents, 3350);
+  assert.deepEqual(cnTxnJson.created_accounts, ['招行自动建卡']);
+
+  const ovJson = (await (await api('/overview', aliceToken)).json()) as Record<string, unknown> & {
+    subscriptions: Record<string, unknown>;
+  };
+  for (const key of [
+    'previous',
+    'trend',
+    'expense_categories',
+    'income_categories',
+    'accounts',
+    'budgets',
+    'debts',
+    'goals',
+    'upcoming_recurring',
+    'pending_reimburse',
+  ]) {
+    assert.ok(key in ovJson, `/overview 缺少 ${key}`);
+  }
+  assert.ok('annual_cents' in ovJson.subscriptions);
+
+  const openRepJson = (
+    await (await api('/reports?preset=custom&from=2026-01-01&to=2026-12-31', aliceToken)).json()
+  ) as Record<string, unknown>;
+  for (const key of ['range', 'kind', 'subcategories', 'daily', 'weekday_expense', 'expense_stats']) {
+    assert.ok(key in openRepJson, `/reports 缺少 ${key}`);
+  }
+
+  assert.equal((await api('/export?scope=full', bobL2Token)).status, 403, '非站点管理员禁止导出全库备份');
+  const fullExpRes = await api('/export?scope=full', aliceToken);
+  assert.equal(fullExpRes.status, 200);
+  assert.equal(fullExpRes.headers.get('cache-control'), 'no-store');
+  const fullExpJson = (await fullExpRes.json()) as { app: string; tables: Record<string, unknown[]> };
+  assert.equal(fullExpJson.app, 'homeledger');
+  assert.ok(Array.isArray(fullExpJson.tables.users) && Array.isArray(fullExpJson.tables.transactions));
+
+  // 当月收入分类 TOP 与未来周期账单首页展示
+  const incCatRow = sqlite.prepare("SELECT id FROM categories WHERE kind = 'income' LIMIT 1").get() as { id: number };
+  assert.equal(
+    (
+      await api('/transactions', aliceToken, 'POST', {
+        type: '收入',
+        date: todayStr(),
+        amount: '800',
+        account_id: 1,
+        category_id: incCatRow.id,
+        note: '首页收入分类验证',
+      })
+    ).status,
+    201,
+  );
+  const popHomeHtml = await (await req('/', { headers: { Cookie: aliceCookie } })).text();
+  assert.ok(popHomeHtml.includes('本月收入分类 TOP') && popHomeHtml.includes('今日已记'));
+
+  // 10. Codex 审查 P1/P2 修复专项回归
+  // 10.1 repairReimbursedLinks 不重置 related_id IS NULL 的历史合法标记
+  const nullLinkTxnId = (
+    (await (
+      await api('/transactions', aliceToken, 'POST', {
+        type: 'expense',
+        amount: '42',
+        account_id: 1,
+        is_reimbursable: true,
+        note: '无关联ID历史已报销',
+      })
+    ).json()) as { id: number }
+  ).id;
+  sqlite.prepare("UPDATE transactions SET reimbursed_at = '2026-11-24 00:00:00', related_id = NULL WHERE id = ?").run(nullLinkTxnId);
+  assert.equal(await repairReimbursedLinks(makeDb(env)), 0);
+  const stillReimbursed = sqlite.prepare('SELECT reimbursed_at FROM transactions WHERE id = ?').get(nullLinkTxnId) as {
+    reimbursed_at: string | null;
+  };
+  assert.ok(stillReimbursed.reimbursed_at, 'related_id IS NULL 不得被误清报销标记');
+
+  // 10.2 储蓄目标并发存入乐观锁与失败增量回滚
+  const raceGoalId = (
+    (await (await api('/goals', aliceToken, 'POST', { name: '并发测试目标', target: '1000', account_id: 1 })).json()) as { id: number }
+  ).id;
+  const [depA, depB] = await Promise.all([
+    api(`/goals/${raceGoalId}/deposit`, aliceToken, 'POST', { amount: '10' }),
+    api(`/goals/${raceGoalId}/deposit`, aliceToken, 'POST', { amount: '20' }),
+  ]);
+  const depStatuses = [depA.status, depB.status].sort();
+  assert.ok(
+    (depStatuses[0] === 200 && depStatuses[1] === 409) || (depStatuses[0] === 200 && depStatuses[1] === 200),
+  );
+  const savedAfterRace = (sqlite.prepare('SELECT saved_cents FROM goals WHERE id = ?').get(raceGoalId) as { saved_cents: number })
+    .saved_cents;
+  const expectedAfterRace =
+    (depA.status === 200 ? 1000 : 0) + (depB.status === 200 ? 2000 : 0);
+  assert.equal(savedAfterRace, expectedAfterRace, '并发存入不可丢失更新');
+  const failDep = await api(`/goals/${raceGoalId}/deposit`, aliceToken, 'POST', {
+    amount: '50',
+    create_txn: true,
+    account_id: 999999,
+  });
+  assert.equal(failDep.status, 400);
+  assert.equal(
+    (sqlite.prepare('SELECT saved_cents FROM goals WHERE id = ?').get(raceGoalId) as { saved_cents: number }).saved_cents,
+    expectedAfterRace,
+  );
+
+  // 10.3 AI 调用模型前图片校验、同日同额多杯保留、外币保留与部分失败关联
+  assert.equal(
+    (
+      await req('/ai/analyze', {
+        method: 'POST',
+        headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ images: ['https://evil.test/x.png'] }),
+      })
+    ).status,
+    400,
+    '非 dataUrl 图片应在调用模型前被拦截',
+  );
+  assert.equal((await api('/ai/bill', aliceToken, 'POST', { images: ['https://evil.test/x.png'] })).status, 400);
+
+  const dupCoffees = await req('/ai/confirm', {
+    method: 'POST',
+    headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      source: 'ai_text',
+      items: [
+        { draft_id: 'coffee-a', type: 'expense', amount_cents: 3200, currency: 'CNY', account_id: 1, txn_date: todayStr(), merchant: '瑞幸', note: '美式1' },
+        { draft_id: 'coffee-b', type: 'expense', amount_cents: 3200, currency: 'CNY', account_id: 1, txn_date: todayStr(), merchant: '瑞幸', note: '美式2' },
+        { draft_id: 'usd-bill', type: 'expense', amount_cents: 1000, currency: 'USD', account_id: 1, txn_date: todayStr(), merchant: 'AppStore', note: '外币保留' },
+      ],
+    }),
+  });
+  assert.equal(dupCoffees.status, 200);
+  const dupCoffeesJson = (await dupCoffees.json()) as { created: number; duplicates: number; ids: number[] };
+  assert.equal(dupCoffeesJson.created, 3, '同日等额多笔与外币草稿均应入库');
+  assert.equal(dupCoffeesJson.duplicates, 0);
+  const usdTxn = sqlite.prepare('SELECT currency, amount_cents, amount_base_cents FROM transactions WHERE id = ?').get(
+    dupCoffeesJson.ids[2],
+  ) as { currency: string; amount_cents: number; amount_base_cents: number };
+  assert.equal(usdTxn.currency, 'USD');
+  assert.equal(usdTxn.amount_cents, 1000);
+  assert.ok(usdTxn.amount_base_cents > 1000);
+
+  // 模拟多笔 AI 返回部分成功（1 笔 USD 成功，1 笔 ZZZ 无汇率失败）仍关联凭证图且不丢凭证
+  const origFetch = globalThis.fetch;
+  sqlite.prepare("UPDATE settings SET value = 'true' WHERE key = 'ai.enabled'").run();
+  sqlite.prepare("UPDATE settings SET value = 'http://127.0.0.1:18999/v1' WHERE key = 'ai.base_url'").run();
+  sqlite.prepare("UPDATE settings SET value = 'mock-model' WHERE key = 'ai.model'").run();
+  sqlite.prepare("UPDATE settings SET value = 'true' WHERE key = 'ai.vision'").run();
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify([
+                { type: 'expense', amount: 12, currency: 'CNY', merchant: '部分成功项', acct: '现金' },
+                { type: 'expense', amount: 15, currency: 'ZZZ', merchant: '无汇率失败项', acct: '现金' },
+              ]),
+            },
+          },
+        ],
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )) as typeof fetch;
+  try {
+    const partRes = await api('/ai/bill', aliceToken, 'POST', {
+      text: '两笔混币测试',
+      images: [{ dataUrl: PNG_1X1_DATA_URL, name: 'part.png' }],
+    });
+    assert.equal(partRes.status, 200);
+    const partJson = (await partRes.json()) as {
+      created: number;
+      errors?: string[];
+      images: Array<{ id: number }>;
+    };
+    assert.equal(partJson.created, 1);
+    assert.equal(partJson.errors?.length, 1);
+    assert.equal(partJson.images.length, 1);
+    const linkedAtt = sqlite.prepare('SELECT ai_status, txn_id FROM attachments WHERE id = ?').get(partJson.images[0].id) as {
+      ai_status: string;
+      txn_id: number | null;
+    };
+    assert.equal(linkedAtt.ai_status, 'linked');
+    assert.ok(linkedAtt.txn_id);
+  } finally {
+    globalThis.fetch = origFetch;
+    sqlite.prepare("UPDATE settings SET value = 'false' WHERE key = 'ai.enabled'").run();
+  }
+
+  // 10.4 /recurring/:id/pay 同 ID 歧义返回 409
+  sqlite
+    .prepare(
+      `INSERT INTO recurring_rules (id, ledger_id, name, payload, frequency, interval_n, day_of_month, next_run_at, auto_post, is_active, created_by_user_id, created_at)
+       VALUES (?, 1, '同ID冲突规则', ?, 'monthly', 1, 24, '2026-11-24', 0, 1, 1, '2026-11-24 00:00:00')`,
+    )
+    .run(activeSubId, JSON.stringify({ items: [{ type: 'expense', amount_cents: 1000, account_id: 1 }] }));
+  assert.equal((await api(`/recurring/${activeSubId}/pay`, aliceToken, 'POST')).status, 409);
+
+  // 10.5 Web 规划写入跨账本 IDOR 校验
+  const bobL2AccId = (
+    (await (await api('/accounts', bobL2Token, 'POST', { name: 'Bob秘密卡', type: 'debit' })).json()) as { id: number }
+  ).id;
+  const bobL2CatId = (
+    (await (await api('/categories', bobL2Token, 'POST', { name: 'Bob私密分类', kind: 'expense' })).json()) as { id: number }
+  ).id;
+  await req('/budgets', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, name: '越权Web账户预算', scope: 'account', account_id: String(bobL2AccId), amount: '100' }),
+  });
+  await req('/budgets', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, name: '越权Web分类预算', scope: 'category', category_id: String(bobL2CatId), amount: '100' }),
+  });
+  assert.equal(sqlite.prepare("SELECT id FROM budgets WHERE name LIKE '越权Web%'").get(), undefined);
+
+  await req('/recurring', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: aliceCsrf,
+      name: '越权Web周期',
+      item_type: 'expense',
+      item_amount: '50',
+      item_account_id: String(bobL2AccId),
+      item_category_id: String(bobL2CatId),
+    }),
+  });
+  assert.equal(sqlite.prepare("SELECT id FROM recurring_rules WHERE name = '越权Web周期'").get(), undefined);
+
+  await req('/subscriptions', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, name: '越权Web订阅', amount: '20', account_id: String(bobL2AccId) }),
+  });
+  assert.equal(sqlite.prepare("SELECT id FROM subscriptions WHERE name = '越权Web订阅'").get(), undefined);
+
+  await req('/goals', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, name: '越权Web目标', target: '200', account_id: String(bobL2AccId) }),
+  });
+  assert.equal(sqlite.prepare("SELECT id FROM goals WHERE name = '越权Web目标'").get(), undefined);
+
+  // 10.6 汇率字段标记 data-no-money-format & 单笔编辑页一键报销按钮
+  const newTxnHtml = await (await req('/transactions/new', { headers: { Cookie: aliceCookie } })).text();
+  assert.ok(newTxnHtml.includes('name="rate"') && newTxnHtml.includes('data-no-money-format'));
+
+  const editReimbHtml = await (await req(`/transactions/${reimbOrigId}/edit`, { headers: { Cookie: aliceCookie } })).text();
+  assert.ok(editReimbHtml.includes(`action="/transactions/${reimbOrigId}/reimburse"`));
+
+  // 10.7 预算外币折算本位币 & 无效币种拒绝
+  const usdOverview = (await (await api('/overview', aliceToken)).json()) as {
+    budgets: Array<{ id: number; effective_cents: number }>;
+  };
+  const usdBudgetItem = usdOverview.budgets.find((x) => x.id === budId);
+  assert.ok(usdBudgetItem && usdBudgetItem.effective_cents > 50000, 'USD 预算必须折算为本位币后再计算额度');
+  assert.equal((await api('/budgets', aliceToken, 'POST', { name: '坏币种预算', amount: '100', currency: 'ZZZ' })).status, 400);
+
+  // 10.8 OpenAPI 自动建户：失败零残留与超长名截断复用
+  assert.equal(
+    (await api('/transactions', aliceToken, 'POST', { type: '支出', amount: '0', account: '零金额禁止建户' })).status,
+    400,
+  );
+  assert.equal(sqlite.prepare("SELECT id FROM accounts WHERE name = '零金额禁止建户'").get(), undefined);
+  assert.equal(
+    (await api('/transactions', aliceToken, 'POST', { type: 'transfer', amount: '50', account: '缺转入禁止建户' })).status,
+    400,
+  );
+  assert.equal(sqlite.prepare("SELECT id FROM accounts WHERE name = '缺转入禁止建户'").get(), undefined);
+
+  const longAccName = '超长账户名称用于验证截断后不会在第二次记账时重复建户超过三十字符';
+  const long1 = await api('/transactions', aliceToken, 'POST', { type: '支出', amount: '10', account: longAccName });
+  assert.equal(long1.status, 201);
+  const long1Json = (await long1.json()) as { created_accounts?: string[] };
+  assert.equal(long1Json.created_accounts?.length, 1);
+  const long2 = await api('/transactions', aliceToken, 'POST', { type: '支出', amount: '11', account: longAccName });
+  assert.equal(long2.status, 201);
+  const long2Json = (await long2.json()) as { created_accounts?: string[] };
+  assert.equal(long2Json.created_accounts, undefined, '截断同名账户应复用而非重复创建');
+
+  // 10.9 键集游标 iterateAllForExport 精确无重复无漏行
+  const dbRowsCount = (
+    sqlite.prepare('SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = 1 AND deleted_at IS NULL').get() as { c: number }
+  ).c;
+  const cursorIds: number[] = [];
+  for await (const chunk of iterateAllForExport(makeDb(env), 1, 50)) {
+    for (const row of chunk) cursorIds.push(Number(row.id));
+  }
+  assert.equal(cursorIds.length, dbRowsCount);
+  assert.equal(new Set(cursorIds).size, dbRowsCount);
 });

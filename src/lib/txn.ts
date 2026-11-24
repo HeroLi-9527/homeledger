@@ -8,7 +8,7 @@ import {
 } from '../db.js';
 import type { AccountRow, BatchStatement, Db, Env, TxnRow } from '../types.js';
 import * as attach from './attachments.js';
-import { lastMonths, monthEnd, toBase } from './util.js';
+import { lastMonths, monthEnd, toBase, WEEKDAYS } from './util.js';
 
 let stampSeq = 0;
 const stampMs = (): string => {
@@ -29,10 +29,10 @@ SELECT t.*,
   u.display_name AS member_name, u.avatar_color AS member_color,
   (SELECT GROUP_CONCAT(tg.name, ' ') FROM transaction_tags tt JOIN tags tg ON tg.id = tt.tag_id WHERE tt.transaction_id = t.id) AS tag_names
 FROM transactions t
-LEFT JOIN categories c ON c.id = t.category_id
-LEFT JOIN categories pc ON pc.id = c.parent_id
-LEFT JOIN accounts a ON a.id = t.account_id
-LEFT JOIN accounts ta ON ta.id = t.to_account_id
+LEFT JOIN categories c ON c.id = t.category_id AND (c.ledger_id IS NULL OR c.ledger_id = t.ledger_id)
+LEFT JOIN categories pc ON pc.id = c.parent_id AND (pc.ledger_id IS NULL OR pc.ledger_id = t.ledger_id)
+LEFT JOIN accounts a ON a.id = t.account_id AND a.ledger_id = t.ledger_id
+LEFT JOIN accounts ta ON ta.id = t.to_account_id AND ta.ledger_id = t.ledger_id
 LEFT JOIN users u ON u.id = t.user_id
 `;
 
@@ -685,10 +685,6 @@ export async function markReimbursed(
   const rowIds = rows.map((r) => r.id);
   const results = await db.batch([
     [
-      `UPDATE transactions SET reimbursed_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND reimbursed_at IS NULL AND is_reimbursable = 1 AND type IN ('expense','fee') AND id IN (${inList})`,
-      [stamp, ledgerId, ...rowIds],
-    ],
-    [
       `INSERT INTO transactions
        (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
         user_id, txn_date, note, merchant, status, is_reimbursable, group_id, source, ai_json, created_at, updated_at)
@@ -716,31 +712,32 @@ export async function markReimbursed(
         nowStr(),
       ],
     ],
+    [
+      `UPDATE transactions
+       SET reimbursed_at = ?, related_id = last_insert_rowid()
+       WHERE ledger_id = ? AND deleted_at IS NULL AND reimbursed_at IS NULL
+         AND is_reimbursable = 1 AND type IN ('expense','fee') AND id IN (${inList})`,
+      [stamp, ledgerId, ...rowIds],
+    ],
     ...balanceDeltaStmts([[reimburseTxn, 1]]),
   ]);
-  const txnId = Number(results[1]?.meta?.last_row_id || 0);
-  if (Number(results[0]?.meta?.changes || 0) !== rows.length || !txnId) {
+  const txnId = Number(results[0]?.meta?.last_row_id || 0);
+  if (Number(results[1]?.meta?.changes || 0) !== rows.length || !txnId) {
     try {
       await db.batch([
-        [`UPDATE transactions SET reimbursed_at = NULL WHERE ledger_id = ? AND reimbursed_at = ? AND id IN (${inList})`, [ledgerId, stamp, ...rowIds]],
-        ['UPDATE transactions SET deleted_at = ?, updated_at = ? WHERE id = ?', [nowStr(), nowStr(), txnId]],
+        [
+          `UPDATE transactions SET reimbursed_at = NULL, related_id = NULL WHERE ledger_id = ? AND (reimbursed_at = ? OR related_id = ?) AND id IN (${inList})`,
+          [ledgerId, stamp, txnId, ...rowIds],
+        ],
+        ...(txnId
+          ? ([['UPDATE transactions SET deleted_at = ?, updated_at = ? WHERE id = ?', [nowStr(), nowStr(), txnId]]] as BatchStatement[])
+          : []),
         ...balanceDeltaStmts([[reimburseTxn, -1]]),
       ]);
     } catch (e) {
       console.error('markReimbursed compensation failed', txnId, e);
     }
     throw new Error('部分记录已被删除或报销，请刷新后重试');
-  }
-  try {
-    await db.run(
-      `UPDATE transactions SET related_id = ? WHERE ledger_id = ? AND reimbursed_at = ? AND id IN (${inList})`,
-      txnId,
-      ledgerId,
-      stamp,
-      ...rowIds,
-    );
-  } catch (e) {
-    console.error('markReimbursed related_id backfill failed', txnId, e);
   }
   return { txnId, total, count: rows.length, skipped };
 }
@@ -1092,4 +1089,69 @@ export async function netWorthTrend(db: Db, ledgerId: number, months = 6) {
     out[out.length - 1].value = [...included.values()].reduce((s, a) => s + Number(a.balance_cents), 0);
   }
   return out;
+}
+
+export async function weekdayExpenseBreakdown(db: Db, ledgerId: number, start: string, end: string) {
+  const rows = await db.all<{ wd: number; expense: number; cnt: number }>(
+    `SELECT CAST(strftime('%w', txn_date) AS INTEGER) AS wd,
+            COALESCE(SUM(amount_base_cents), 0) AS expense,
+            COUNT(*) AS cnt
+     FROM transactions
+     WHERE ledger_id = ? AND deleted_at IS NULL AND txn_date BETWEEN ? AND ?
+       AND type IN (${EXPENSE_TYPES.map(() => '?').join(',')})
+     GROUP BY wd`,
+    ledgerId,
+    start,
+    end,
+    ...EXPENSE_TYPES,
+  );
+  const byWd = new Map(rows.map((r) => [Number(r.wd), { expense: Number(r.expense), cnt: Number(r.cnt) }]));
+  return [1, 2, 3, 4, 5, 6, 0].map((wd) => {
+    const found = byWd.get(wd);
+    return {
+      wd,
+      label: WEEKDAYS[wd],
+      expense: found?.expense || 0,
+      cnt: found?.cnt || 0,
+    };
+  });
+}
+
+export async function* iterateAllForExport(
+  db: Db,
+  ledgerId: number,
+  chunkSize = 1000,
+): AsyncGenerator<TxnRow[]> {
+  let cursorDate: string | null = null;
+  let cursorId = 0;
+  while (true) {
+    const rows: TxnRow[] = cursorDate === null
+      ? await db.all<TxnRow>(
+          `${TXN_SELECT} WHERE t.ledger_id = ? AND t.deleted_at IS NULL ORDER BY t.txn_date DESC, t.id DESC LIMIT ?`,
+          ledgerId,
+          chunkSize,
+        )
+      : await db.all<TxnRow>(
+          `${TXN_SELECT} WHERE t.ledger_id = ? AND t.deleted_at IS NULL AND (t.txn_date < ? OR (t.txn_date = ? AND t.id < ?)) ORDER BY t.txn_date DESC, t.id DESC LIMIT ?`,
+          ledgerId,
+          cursorDate,
+          cursorDate,
+          cursorId,
+          chunkSize,
+        );
+    if (!rows.length) break;
+    yield rows.map((r) => decorate(r)!);
+    if (rows.length < chunkSize) break;
+    const last = rows[rows.length - 1];
+    cursorDate = last.txn_date;
+    cursorId = Number(last.id);
+  }
+}
+
+export async function listAllForExport(db: Db, ledgerId: number, chunkSize = 1000): Promise<TxnRow[]> {
+  const all: TxnRow[] = [];
+  for await (const batch of iterateAllForExport(db, ledgerId, chunkSize)) {
+    all.push(...batch);
+  }
+  return all;
 }

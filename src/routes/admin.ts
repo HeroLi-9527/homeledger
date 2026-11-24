@@ -25,7 +25,7 @@ import {
   validateAndBuildRestorePlan,
   type TableColumnInfo,
 } from '../lib/backup.js';
-import { EXPORT_HEADER, exportRows, importRecords, parseBill, toCsv, type ParsedBillRecord } from '../lib/importers.js';
+import { csvLine, EXPORT_HEADER, exportRows, importRecords, parseBill, type ParsedBillRecord } from '../lib/importers.js';
 import { cleanupOrphanR2, runScheduled } from '../lib/scheduler.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
@@ -56,6 +56,8 @@ const USERNAME_RE = /^[A-Za-z0-9_.@-]{3,32}$/;
 const toBoolSetting = (v: unknown): 'true' | 'false' =>
   v === true || v === 1 || v === '1' || v === 'true' || v === 'on' ? 'true' : 'false';
 
+const PREVIEW_TTL_MS = 2 * 3600 * 1000;
+
 const previewCache = new Map<
   string,
   {
@@ -65,6 +67,7 @@ const previewCache = new Map<
     fileName: string;
     records: ParsedBillRecord[];
     neutralRecords: ParsedBillRecord[];
+    created_at: number;
   }
 >();
 
@@ -851,6 +854,7 @@ adminRoutes.post('/api/import/preview', async (c) => {
       fileName,
       records: parsed.records,
       neutralRecords: parsed.neutralRecords,
+      created_at: Date.now(),
     };
 
     if (env.ATTACHMENTS) {
@@ -876,6 +880,17 @@ adminRoutes.post('/api/import/preview', async (c) => {
       }
     }
 
+    const decorateSample = (rec: ParsedBillRecord) => ({
+      ...rec,
+      type_label: rec.type === 'income' ? '收入' : rec.type === 'transfer' ? '转账' : '支出',
+      guess_category:
+        rec.category_hint ||
+        classifyByKeywords(rec.text)?.category ||
+        (rec.type === 'transfer' ? '转账' : rec.type === 'income' ? '其他收入' : '其他支出'),
+      guess_account: rec.account_hint || null,
+      guess_account_missing: !rec.account_hint,
+    });
+
     const sourceLabel = parsed.source === 'alipay' ? '支付宝账单' : parsed.source === 'wechat' ? '微信账单' : '通用 CSV';
     return c.json({
       ok: true,
@@ -886,16 +901,10 @@ adminRoutes.post('/api/import/preview', async (c) => {
       count: parsed.records.length,
       neutralCount: parsed.neutralRecords.length,
       skipped: parsed.skipped,
+      skippedDates: parsed.skippedDates,
       stat: { expense, income, transfer, minDate, maxDate },
-      sample: parsed.records.slice(0, 60).map((rec) => ({
-        ...rec,
-        type_label: rec.type === 'income' ? '收入' : rec.type === 'transfer' ? '转账' : '支出',
-        guess_category:
-          rec.category_hint ||
-          classifyByKeywords(rec.text)?.category ||
-          (rec.type === 'transfer' ? '转账' : rec.type === 'income' ? '其他收入' : '其他支出'),
-        guess_account: rec.account_hint || null,
-      })),
+      sample: parsed.records.slice(0, 60).map(decorateSample),
+      neutralSample: parsed.neutralRecords.slice(0, 5).map(decorateSample),
     });
   } catch (e) {
     return c.json({ ok: false, error: toPublicError(e) }, 400);
@@ -922,6 +931,11 @@ adminRoutes.post('/api/import/commit', async (c) => {
   }
   if (!payload || Number(payload.ledgerId) !== Number(ctx.ledger!.id) || Number(payload.userId) !== Number(ctx.user!.id)) {
     return c.json({ ok: false, error: '导入预览已失效，请重新上传文件预览' }, 400);
+  }
+  if (!payload.created_at || Date.now() - Number(payload.created_at) > PREVIEW_TTL_MS) {
+    previewCache.delete(token);
+    if (env.ATTACHMENTS) await env.ATTACHMENTS.delete(r2Key).catch(() => {});
+    return c.json({ ok: false, error: '导入预览已过期（超过 2 小时），请重新上传文件预览' }, 400);
   }
 
   try {
@@ -1010,11 +1024,29 @@ adminRoutes.get('/export/csv', async (c) => {
   if (r) return r;
   const db = dbOf(c);
   const ledgerId = Number(c.get('ctx').ledger!.id);
-  const res = await txn.listTransactions(db, ledgerId, { page: 1, pageSize: 50000 });
-  const csv = toCsv(EXPORT_HEADER, exportRows(ledgerId, res.rows));
-  c.header('Content-Type', 'text/csv; charset=utf-8');
-  c.header('Content-Disposition', `attachment; filename="homeledger-${todayStr()}.csv"`);
-  return c.body(csv);
+  const enc = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        controller.enqueue(enc.encode(`\uFEFF${csvLine(EXPORT_HEADER)}`));
+        for await (const batch of txn.iterateAllForExport(db, ledgerId)) {
+          const rows = exportRows(ledgerId, batch);
+          let chunk = '';
+          for (const row of rows) chunk += csvLine(row);
+          if (chunk) controller.enqueue(enc.encode(chunk));
+        }
+        controller.close();
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="homeledger-${todayStr()}.csv"`,
+    },
+  });
 });
 
 adminRoutes.get('/export/json', async (c) => {

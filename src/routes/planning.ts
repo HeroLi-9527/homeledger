@@ -1,11 +1,12 @@
 import { Hono } from 'hono';
-import { nowStr, todayStr } from '../db.js';
+import { getSetting, nowStr, todayStr } from '../db.js';
 import { accountOptionsHtml } from '../lib/accounts.js';
 import { ledgerWriterIds, notify } from '../lib/auth.js';
 import { progressBar } from '../lib/charts.js';
 import * as fd from '../lib/formdata.js';
 import {
   advanceDate,
+  budgetAmountInBaseCents,
   budgetPeriodRange,
   budgetUsedInRange,
   effectiveBudget,
@@ -22,6 +23,7 @@ import type { AccountRow, CategoryRow, HonoEnv } from '../types.js';
 import { layout, simpleTable } from '../views/layout.js';
 import { budgetsPage } from '../views/planning.js';
 import { bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
+import { assertAccountInLedger, assertCategoryInLedger } from './openapi-helpers.js';
 
 export const planningRoutes = new Hono<HonoEnv>();
 const csrfInput = (c: { get: (k: 'csrf') => string }) => `<input type="hidden" name="_csrf" value="${esc(c.get('csrf') || '')}">`;
@@ -34,13 +36,14 @@ planningRoutes.get('/budgets', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
-  const [rows, cats, accounts] = await Promise.all([
+  const [rows, cats, accounts, baseCurrency] = await Promise.all([
     db.all<BudgetRow & { category_name?: string | null }>(
-      'SELECT b.*, c.name AS category_name FROM budgets b LEFT JOIN categories c ON c.id = b.category_id WHERE b.ledger_id = ? ORDER BY b.is_active DESC, b.id',
+      'SELECT b.*, c.name AS category_name FROM budgets b LEFT JOIN categories c ON c.id = b.category_id AND (c.ledger_id IS NULL OR c.ledger_id = b.ledger_id) WHERE b.ledger_id = ? ORDER BY b.is_active DESC, b.id',
       lid,
     ),
     db.all<CategoryRow>("SELECT * FROM categories WHERE (ledger_id IS NULL OR ledger_id = ?) AND kind = 'expense' ORDER BY sort_order", lid),
     db.all<AccountRow>('SELECT * FROM accounts WHERE ledger_id = ? AND is_archived = 0', lid),
+    getSetting(db, 'site.currency', 'CNY'),
   ]);
   const ref = tzRefDate();
   const items = await Promise.all(
@@ -49,13 +52,15 @@ planningRoutes.get('/budgets', async (c) => {
       const isUnset = b.period === 'custom' && (!b.start_date || !b.end_date);
       const [used, eff] = await Promise.all([
         isUnset ? Promise.resolve(null) : budgetUsedInRange(db, b, r2.start, r2.end),
-        isUnset ? Promise.resolve({ amount: Number(b.amount_cents), rollover: 0 }) : effectiveBudget(db, b, ref),
+        isUnset ? budgetAmountInBaseCents(db, b).then((amount) => ({ amount, rollover: 0 })) : effectiveBudget(db, b, ref),
       ]);
       const catLabel = b.category_id ? b.category_name || '分类已删除' : '全部';
       const rangeLabel = isUnset ? '周期未设置' : r2.label;
       return {
         ...b,
         used,
+        orig_amount_cents: Number(b.amount_cents),
+        baseCurrency: String(baseCurrency || 'CNY').toUpperCase(),
         amount_cents: eff.amount,
         rollover: eff.rollover,
         catLabel,
@@ -91,31 +96,50 @@ planningRoutes.post('/budgets', async (c) => {
   }
   const scope = ['overall', 'category', 'account'].includes(String(body.scope)) ? String(body.scope) : 'overall';
   const period = ['monthly', 'yearly', 'weekly', 'custom'].includes(String(body.period)) ? String(body.period) : 'monthly';
-  if (period === 'custom' && (!body.start_date || !body.end_date)) {
+  const startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.start_date || '')) ? String(body.start_date) : '';
+  const endDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.end_date || '')) ? String(body.end_date) : '';
+  if (period === 'custom' && (!startDate || !endDate)) {
     setFlash(c, 'error', '自定义周期请填写起止日期');
+    return c.redirect('/budgets');
+  }
+  if (period === 'custom' && startDate > endDate) {
+    setFlash(c, 'error', '开始日期不能晚于结束日期');
     return c.redirect('/budgets');
   }
   let effScope = scope;
   if (scope === 'category' && !body.category_id) effScope = 'overall';
   if (scope === 'account' && !body.account_id) effScope = 'overall';
+  const currency = String(body.currency || 'CNY').trim().toUpperCase().slice(0, 8) || 'CNY';
+  const triggerType: 'expense' | 'income' = body.trigger_type === 'income' ? 'income' : 'expense';
+  const lid = ledgerId(c);
+  const categoryId = effScope === 'category' && body.category_id ? Number(body.category_id) : null;
+  const accountId = effScope === 'account' && body.account_id ? Number(body.account_id) : null;
+  try {
+    await txn.resolveRate(db, currency);
+    if (categoryId !== null) await assertCategoryInLedger(db, lid, categoryId, triggerType);
+    if (accountId !== null) await assertAccountInLedger(db, lid, accountId);
+  } catch (e) {
+    setFlash(c, 'error', toPublicError(e));
+    return c.redirect('/budgets');
+  }
 
   await db.run(
     `INSERT INTO budgets (ledger_id, name, scope, category_id, account_id, period, amount_cents, currency,
       trigger_type, rollover, alert_pct, start_date, end_date, is_active, created_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`,
-    ledgerId(c),
+    lid,
     name.slice(0, 30),
     effScope,
-    effScope === 'category' && body.category_id ? Number(body.category_id) : null,
-    effScope === 'account' && body.account_id ? Number(body.account_id) : null,
+    categoryId,
+    accountId,
     period,
     amount,
-    String(body.currency || 'CNY'),
-    body.trigger_type === 'income' ? 'income' : 'expense',
+    currency,
+    triggerType,
     body.rollover ? 1 : 0,
     Number(body.alert_pct) || 80,
-    body.start_date || null,
-    body.end_date || null,
+    period === 'custom' ? startDate : null,
+    period === 'custom' ? endDate : null,
     nowStr(),
   );
   setFlash(c, 'success', `预算「${name}」已创建`);
@@ -132,7 +156,7 @@ planningRoutes.get('/budgets/:id/edit', async (c) => {
   const b = await db.get<BudgetRow>('SELECT * FROM budgets WHERE id = ? AND ledger_id = ?', Number(c.req.param('id')), lid);
   if (!b) return c.redirect('/budgets');
   const [cats, accounts] = await Promise.all([
-    db.all<CategoryRow>("SELECT * FROM categories WHERE (ledger_id IS NULL OR ledger_id = ?) AND kind = 'expense' ORDER BY sort_order", lid),
+    db.all<CategoryRow>('SELECT * FROM categories WHERE (ledger_id IS NULL OR ledger_id = ?) ORDER BY kind DESC, sort_order', lid),
     db.all<AccountRow>('SELECT * FROM accounts WHERE ledger_id = ? AND is_archived = 0', lid),
   ]);
   return c.html(
@@ -143,12 +167,15 @@ planningRoutes.get('/budgets/:id/edit', async (c) => {
       siteName: meta.siteName,
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
+      flash: takeFlash(c),
       body: `<div class="card"><form method="post" action="/budgets/${b.id}">${csrfInput(c)}
 <div class="grid grid-2">
   <div class="field"><label>名称</label><input name="name" value="${esc(b.name)}" required></div>
   <div class="field"><label>金额（元）</label><input name="amount" inputmode="decimal" value="${(b.amount_cents / 100).toFixed(2)}" required></div>
+  <div class="field"><label>类型</label><select name="trigger_type"><option value="expense" ${b.trigger_type !== 'income' ? 'selected' : ''}>支出预算</option><option value="income" ${b.trigger_type === 'income' ? 'selected' : ''}>收入预算</option></select></div>
+  <div class="field"><label>币种</label><input name="currency" value="${esc(b.currency || 'CNY')}" maxlength="8"></div>
   <div class="field"><label>范围</label><select name="scope"><option value="overall" ${b.scope === 'overall' ? 'selected' : ''}>总预算</option><option value="category" ${b.scope === 'category' ? 'selected' : ''}>按分类</option><option value="account" ${b.scope === 'account' ? 'selected' : ''}>按账户</option></select></div>
-  <div class="field"><label>分类</label><select name="category_id"><option value="">—</option>${cats.map((cc) => `<option value="${cc.id}" ${Number(b.category_id) === Number(cc.id) ? 'selected' : ''}>${esc(cc.name)}</option>`).join('')}</select></div>
+  <div class="field"><label>分类</label><select name="category_id"><option value="">—</option>${cats.map((cc) => `<option value="${cc.id}" ${Number(b.category_id) === Number(cc.id) ? 'selected' : ''}>${cc.kind === 'income' ? '[收] ' : ''}${esc(cc.name)}</option>`).join('')}</select></div>
   <div class="field"><label>账户</label><select name="account_id"><option value="">—</option>${accounts.map((a) => `<option value="${a.id}" ${Number(b.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></div>
   <div class="field"><label>周期</label><select name="period"><option value="monthly" ${b.period === 'monthly' ? 'selected' : ''}>每月</option><option value="weekly" ${b.period === 'weekly' ? 'selected' : ''}>每周</option><option value="yearly" ${b.period === 'yearly' ? 'selected' : ''}>每年</option><option value="custom" ${b.period === 'custom' ? 'selected' : ''}>自定义</option></select></div>
   <div class="field"><label>自定义开始</label><input type="date" name="start_date" value="${esc(b.start_date || '')}"></div>
@@ -175,24 +202,61 @@ planningRoutes.post('/budgets/:id', async (c) => {
     return c.redirect(`/budgets/${id}/edit`);
   }
   const period = ['monthly', 'yearly', 'weekly', 'custom'].includes(String(body.period)) ? String(body.period) : b.period;
+  const startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.start_date || '')) ? String(body.start_date) : '';
+  const endDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.end_date || '')) ? String(body.end_date) : '';
+  if (period === 'custom' && (!startDate || !endDate)) {
+    setFlash(c, 'error', '自定义周期请填写起止日期');
+    return c.redirect(`/budgets/${id}/edit`);
+  }
+  if (period === 'custom' && startDate > endDate) {
+    setFlash(c, 'error', '开始日期不能晚于结束日期');
+    return c.redirect(`/budgets/${id}/edit`);
+  }
+  const triggerType: 'expense' | 'income' =
+    body.trigger_type !== undefined ? (body.trigger_type === 'income' ? 'income' : 'expense') : b.trigger_type === 'income' ? 'income' : 'expense';
+  const currency =
+    body.currency !== undefined
+      ? String(body.currency || '').trim().toUpperCase().slice(0, 8) || 'CNY'
+      : b.currency || 'CNY';
   let effScope = ['overall', 'category', 'account'].includes(String(body.scope)) ? String(body.scope) : b.scope;
   if (effScope === 'category' && !body.category_id) effScope = 'overall';
   if (effScope === 'account' && !body.account_id) effScope = 'overall';
+  const categoryId = effScope === 'category' && body.category_id ? Number(body.category_id) : null;
+  const accountId = effScope === 'account' && body.account_id ? Number(body.account_id) : null;
+  const lid = ledgerId(c);
+  try {
+    await txn.resolveRate(db, currency);
+    if (categoryId !== null) {
+      await assertCategoryInLedger(db, lid, categoryId, triggerType, {
+        allowArchived: categoryId === Number(b.category_id),
+      });
+    }
+    if (accountId !== null) {
+      await assertAccountInLedger(db, lid, accountId, {
+        allowArchived: accountId === Number(b.account_id),
+      });
+    }
+  } catch (e) {
+    setFlash(c, 'error', toPublicError(e));
+    return c.redirect(`/budgets/${id}/edit`);
+  }
   await db.run(
-    `UPDATE budgets SET name=?, scope=?, category_id=?, account_id=?, period=?, amount_cents=?, rollover=?, alert_pct=?, start_date=?, end_date=?, is_active=? WHERE id=? AND ledger_id=?`,
+    `UPDATE budgets SET name=?, scope=?, category_id=?, account_id=?, period=?, amount_cents=?, currency=?, trigger_type=?, rollover=?, alert_pct=?, start_date=?, end_date=?, is_active=? WHERE id=? AND ledger_id=?`,
     String(body.name || b.name).slice(0, 30),
     effScope,
-    effScope === 'category' && body.category_id ? Number(body.category_id) : null,
-    effScope === 'account' && body.account_id ? Number(body.account_id) : null,
+    categoryId,
+    accountId,
     period,
     amount,
+    currency,
+    triggerType,
     body.rollover ? 1 : 0,
     Number(body.alert_pct) || Number(b.alert_pct),
-    body.start_date || null,
-    body.end_date || null,
+    period === 'custom' ? startDate : null,
+    period === 'custom' ? endDate : null,
     body.is_active ? 1 : 0,
     id,
-    ledgerId(c),
+    lid,
   );
   setFlash(c, 'success', '预算已更新');
   return c.redirect('/budgets');
@@ -289,7 +353,11 @@ planningRoutes.get('/recurring', async (c) => {
       .map((x) => {
         const items = parseRecurringPayload(x.payload).items;
         const total = items.reduce((s, i) => s + Math.abs(Number(i.amount_cents) || 0), 0);
-        return `<tr><td><b>${esc(x.name)}</b></td><td class="num amount">${fmtAmount(total)}</td><td>${esc(x.frequency)}</td><td>${esc(x.next_run_at)}</td><td><span class="chip">${x.is_active ? '启用' : '停用'}</span></td>
+        const anchorHint =
+          x.frequency === 'monthly' && x.day_of_month && Number(x.next_run_at.slice(8, 10)) !== Number(x.day_of_month)
+            ? ` <span class="tiny muted">（锚点 ${x.day_of_month} 日）</span>`
+            : '';
+        return `<tr><td><b>${esc(x.name)}</b></td><td class="num amount">${fmtAmount(total)}</td><td>${esc(x.frequency)}</td><td>${esc(x.next_run_at)}${anchorHint}</td><td><span class="chip">${x.is_active ? '启用' : '停用'}</span></td>
 <td><div class="row wrap">
   <a class="btn btn-sm" href="/recurring/${x.id}/edit">编辑</a>
   <form method="post" action="/recurring/${x.id}/run" style="display:inline">${csrfInput(c)}<input type="hidden" name="next_run_at" value="${esc(x.next_run_at)}"><button class="btn btn-sm" type="submit">立即执行</button></form>
@@ -384,11 +452,32 @@ planningRoutes.get('/recurring/:id/edit', async (c) => {
   );
 });
 
+async function validateRecurringItems(
+  db: Parameters<typeof assertAccountInLedger>[0],
+  lid: number,
+  items: RecurringItemRow[],
+  prevItems: RecurringItemRow[] = [],
+): Promise<void> {
+  const prevAcctIds = new Set(prevItems.map((x) => Number(x.account_id)).filter((n) => Number.isInteger(n) && n > 0));
+  const prevCatIds = new Set(prevItems.map((x) => Number(x.category_id)).filter((n) => Number.isInteger(n) && n > 0));
+  for (const it of items) {
+    if (it.account_id !== null) {
+      await assertAccountInLedger(db, lid, Number(it.account_id), { allowArchived: prevAcctIds.has(Number(it.account_id)) });
+    }
+    if (it.category_id !== null) {
+      await assertCategoryInLedger(db, lid, Number(it.category_id), it.type === 'income' ? 'income' : 'expense', {
+        allowArchived: prevCatIds.has(Number(it.category_id)),
+      });
+    }
+  }
+}
+
 planningRoutes.post('/recurring', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
+  const lid = ledgerId(c);
   const body = await bodyOf(c);
   const name = String(body.name || '').trim();
   if (!name) {
@@ -398,6 +487,12 @@ planningRoutes.post('/recurring', async (c) => {
   const items = readRecurringItems(body, name);
   if (!items.length) {
     setFlash(c, 'error', '请至少填写一项金额');
+    return c.redirect('/recurring');
+  }
+  try {
+    await validateRecurringItems(db, lid, items);
+  } catch (e) {
+    setFlash(c, 'error', toPublicError(e));
     return c.redirect('/recurring');
   }
   const frequency = ['daily', 'weekly', 'monthly', 'yearly'].includes(String(body.frequency))
@@ -447,6 +542,13 @@ planningRoutes.post('/recurring/:id', async (c) => {
     setFlash(c, 'error', '请至少保留一项有效金额的明细');
     return c.redirect(`/recurring/${id}/edit`);
   }
+  const prevPayload = parseRecurringPayload(old.payload);
+  try {
+    await validateRecurringItems(db, lid, items, prevPayload.items);
+  } catch (e) {
+    setFlash(c, 'error', toPublicError(e));
+    return c.redirect(`/recurring/${id}/edit`);
+  }
   const frequency = ['daily', 'weekly', 'monthly', 'yearly'].includes(String(body.frequency))
     ? String(body.frequency)
     : old.frequency;
@@ -460,7 +562,6 @@ planningRoutes.post('/recurring/:id', async (c) => {
       next = advanceDate(next, { frequency, interval_n: intervalN, day_of_month: dayOfMonth });
     }
   }
-  const prevPayload = parseRecurringPayload(old.payload);
   await db.run(
     'UPDATE recurring_rules SET name=?, payload=?, frequency=?, interval_n=?, day_of_month=?, next_run_at=?, auto_post=?, is_active=? WHERE id=? AND ledger_id=?',
     name.slice(0, 40),
@@ -484,24 +585,38 @@ planningRoutes.post('/recurring/:id/run', async (c) => {
   const db = dbOf(c);
   const id = Number(c.req.param('id'));
   const body = await bodyOf(c);
-  const rule = await db.get<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, ledgerId(c));
+  const lid = ledgerId(c);
+  const rule = await db.get<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, lid);
   if (!rule) return c.redirect('/recurring');
   try {
+    const bad = await ruleBadAccount(db, rule);
+    if (bad) {
+      setFlash(c, 'error', `无法执行：${bad}`);
+      return c.redirect('/recurring');
+    }
     const { stmts, created } = await recurringPostStmts(db, rule, todayStr());
     const period = String(body.next_run_at || rule.next_run_at);
     const next = advanceDate(period, rule);
-    const claim = await db.run('UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND next_run_at = ?', next, id, period);
+    const claim = await db.run(
+      'UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND ledger_id = ? AND next_run_at = ?',
+      next,
+      id,
+      lid,
+      period,
+    );
     if (claim.changes !== 1) {
       setFlash(c, 'error', '该期已执行，请勿重复提交');
       return c.redirect('/recurring');
     }
-    const bad = await ruleBadAccount(db, rule);
-    if (bad) {
-      setFlash(c, 'error', `本期已跳过：${bad}`);
-      return c.redirect('/recurring');
+    try {
+      stmts.push(['UPDATE recurring_rules SET last_run_at = ? WHERE id = ?', [nowStr(), id]]);
+      await db.batch(stmts);
+    } catch (e) {
+      await db
+        .run('UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND next_run_at = ?', period, id, next)
+        .catch(() => {});
+      throw e;
     }
-    stmts.push(['UPDATE recurring_rules SET last_run_at = ? WHERE id = ?', [nowStr(), id]]);
-    await db.batch(stmts);
     setFlash(c, 'success', `已立即记账 ${created} 笔`);
   } catch (e) {
     setFlash(c, 'error', `执行失败：${toPublicError(e)}`);
@@ -858,16 +973,32 @@ planningRoutes.get('/goals', async (c) => {
     ),
     fd.accounts(db, lid),
   ]);
+  const today = todayStr();
   const bodyRows =
     rows
       .map((g) => {
         const pct = g.target_cents > 0 ? Math.min(100, Math.round((g.saved_cents / g.target_cents) * 100)) : 0;
+        let dateExtra = '';
+        if (g.target_date && g.status !== 'completed') {
+          const diffDays = Math.round(
+            (Date.parse(`${g.target_date}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86400000,
+          );
+          const leftCents = Math.max(0, Number(g.target_cents) - Number(g.saved_cents));
+          if (diffDays < 0) {
+            dateExtra = `<div class="tiny" style="color:var(--expense)">已逾期 ${Math.abs(diffDays)} 天</div>`;
+          } else if (diffDays === 0) {
+            dateExtra = '<div class="tiny" style="color:var(--warn)">今日到期</div>';
+          } else {
+            const perMonth = leftCents > 0 ? Math.ceil(leftCents / Math.max(1, diffDays / 30)) : 0;
+            dateExtra = `<div class="tiny muted">剩 ${diffDays} 天${perMonth > 0 ? ` · 约 ${fmtAmount(perMonth)}/月` : ''}</div>`;
+          }
+        }
         return `<tr>
   <td>${esc(g.icon)} <b>${esc(g.name)}</b></td>
   <td class="num amount">${fmtAmount(g.target_cents)}</td>
   <td class="num amount">${fmtAmount(g.saved_cents)}</td>
   <td style="min-width:140px">${progressBar(g.saved_cents, g.target_cents)} <span class="tiny muted">${pct}%</span></td>
-  <td>${esc(g.target_date || '—')}</td>
+  <td>${esc(g.target_date || '—')}${dateExtra}</td>
   <td><span class="chip ${g.status === 'completed' ? 'income' : ''}">${g.status === 'completed' ? '已完成' : '进行中'}</span></td>
   <td><div class="row wrap">
     <form method="post" action="/goals/${g.id}/deposit" class="row" style="display:inline-flex">${csrfInput(c)}<input name="amount" placeholder="存入（元）" inputmode="decimal" style="width:90px"><select name="account_id" style="width:auto"><option value="">账户</option>${accounts.map((a) => `<option value="${a.id}" ${Number(g.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><label class="check tiny"><input type="checkbox" name="create_txn" value="1" checked>记流水</label><button class="btn btn-sm btn-primary" type="submit">存入</button></form>
@@ -958,6 +1089,15 @@ planningRoutes.post('/goals/:id', async (c) => {
     setFlash(c, 'error', '请填写目标名称与大于 0 的目标金额');
     return c.redirect(`/goals/${id}/edit`);
   }
+  const accountId = body.account_id ? Number(body.account_id) : null;
+  if (accountId !== null) {
+    try {
+      await assertAccountInLedger(db, lid, accountId, { allowArchived: accountId === Number(g.account_id) });
+    } catch (e) {
+      setFlash(c, 'error', toPublicError(e));
+      return c.redirect(`/goals/${id}/edit`);
+    }
+  }
   const saved = Math.max(0, u.parseAmountToCents(body.saved_amount));
   const status = saved >= target ? 'completed' : 'active';
   await db.run(
@@ -966,7 +1106,7 @@ planningRoutes.post('/goals/:id', async (c) => {
     String(body.icon || '🎯').slice(0, 8) || '🎯',
     target,
     saved,
-    body.account_id ? Number(body.account_id) : null,
+    accountId,
     body.target_date || null,
     status,
     body.note ? String(body.note).slice(0, 200) : null,
@@ -981,21 +1121,31 @@ planningRoutes.post('/goals', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
   const db = dbOf(c);
+  const lid = ledgerId(c);
   const body = await bodyOf(c);
   const target = Math.abs(u.parseAmountToCents(body.target));
   if (!target) {
     setFlash(c, 'error', '目标金额无效');
     return c.redirect('/goals');
   }
+  const accountId = body.account_id ? Number(body.account_id) : null;
+  if (accountId !== null) {
+    try {
+      await assertAccountInLedger(db, lid, accountId);
+    } catch (e) {
+      setFlash(c, 'error', toPublicError(e));
+      return c.redirect('/goals');
+    }
+  }
   const saved = Math.max(0, u.parseAmountToCents(body.saved_amount));
   await db.run(
     'INSERT INTO goals (ledger_id, name, icon, target_cents, saved_cents, account_id, target_date, status, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-    ledgerId(c),
+    lid,
     String(body.name || '').trim().slice(0, 30),
     String(body.icon || '🎯'),
     target,
     saved,
-    body.account_id ? Number(body.account_id) : null,
+    accountId,
     body.target_date || null,
     saved >= target ? 'completed' : 'active',
     body.note ? String(body.note).slice(0, 200) : null,
@@ -1011,10 +1161,11 @@ planningRoutes.post('/goals/:id/deposit', async (c) => {
   const ctx = c.get('ctx');
   const body = await bodyOf(c);
   const id = Number(c.req.param('id'));
+  const lid = ledgerId(c);
   const g = await db.get<{ id: number; name: string; target_cents: number; saved_cents: number; account_id: number | null; status: string }>(
     'SELECT * FROM goals WHERE id = ? AND ledger_id = ?',
     id,
-    ledgerId(c),
+    lid,
   );
   if (!g) return c.redirect('/goals');
   const rawAmt = u.parseAmountToCents(body.amount);
@@ -1032,13 +1183,31 @@ planningRoutes.post('/goals/:id/deposit', async (c) => {
       setFlash(c, 'error', '生成流水需要选择账户');
       return c.redirect('/goals');
     }
+    try {
+      await assertAccountInLedger(db, lid, accountId);
+    } catch (e) {
+      setFlash(c, 'error', toPublicError(e));
+      return c.redirect('/goals');
+    }
   }
-  const saved = Math.max(0, Number(g.saved_cents) + amt);
+  const prevSaved = Number(g.saved_cents);
+  const saved = Math.max(0, prevSaved + amt);
   const done = Number(g.target_cents) > 0 && saved >= Number(g.target_cents);
-  await db.run('UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ?', saved, done ? 'completed' : 'active', id, ledgerId(c));
+  const claim = await db.run(
+    'UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ? AND saved_cents = ?',
+    saved,
+    done ? 'completed' : 'active',
+    id,
+    lid,
+    prevSaved,
+  );
+  if (Number(claim.changes || 0) !== 1) {
+    setFlash(c, 'error', '储蓄目标刚被更新，请刷新重试');
+    return c.redirect('/goals');
+  }
   if (body.create_txn && accountId) {
     try {
-      await txn.createTransaction(db, ledgerId(c), ctx.user!.id, {
+      await txn.createTransaction(db, lid, ctx.user!.id, {
         type: amt > 0 ? 'expense' : 'income',
         amount_cents: Math.abs(amt),
         account_id: accountId,
@@ -1047,8 +1216,20 @@ planningRoutes.post('/goals/:id/deposit', async (c) => {
         source: 'manual',
       });
     } catch (e) {
-      await db.run('UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ?', g.saved_cents, g.status, id, ledgerId(c));
-      throw e;
+      await db
+        .run(
+          `UPDATE goals
+           SET saved_cents = MAX(0, saved_cents - ?),
+               status = CASE WHEN target_cents > 0 AND MAX(0, saved_cents - ?) >= target_cents THEN 'completed' ELSE 'active' END
+           WHERE id = ? AND ledger_id = ?`,
+          amt,
+          amt,
+          id,
+          lid,
+        )
+        .catch(() => {});
+      setFlash(c, 'error', toPublicError(e));
+      return c.redirect('/goals');
     }
   }
   if (done && g.status !== 'completed') {

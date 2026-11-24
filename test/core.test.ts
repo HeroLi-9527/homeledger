@@ -12,12 +12,14 @@ import {
   verifyPassword,
   verifySession,
 } from '../src/lib/auth.js';
+import { APP, CHANGELOG, FEATURES, TECH, issuesUrl, repoUrl } from '../src/lib/about.js';
 import { barChart, donutChart, heatmapChart, lineChart } from '../src/lib/charts.js';
 import { advanceDate } from '../src/lib/scheduler.js';
 import { decorateCard } from '../src/lib/session-cards.js';
 import { advance, firstChargeDate } from '../src/lib/subscriptions.js';
 import { BACKUP_TABLES, MAX_SQL_PARAMS, validateAndBuildRestorePlan, type TableColumnInfo } from '../src/lib/backup.js';
 import { safeInternalPath } from '../src/lib/util.js';
+import { parseReportRange } from '../src/routes/reports.js';
 
 test('PBKDF2 密码哈希与校验', async () => {
   const hash = await hashPassword('secret-pass-123');
@@ -388,4 +390,47 @@ test('validateAndBuildRestorePlan 前置校验、异构键并集、分块上限�
   );
   const lastStmt = plan.stmts[plan.stmts.length - 1];
   assert.ok(lastStmt[0].includes('token_version'));
+});
+
+test('parseReportRange 支持自定义区间、反转纠偏、合法日校验与年份参数', () => {
+  const rCustom = parseReportRange({ preset: 'custom', from: '2026-03-10', to: '2026-03-20' });
+  assert.equal(rCustom.preset, 'custom');
+  assert.equal(rCustom.start, '2026-03-10');
+  assert.equal(rCustom.end, '2026-03-20');
+  assert.equal(rCustom.label, '2026-03-10 ~ 2026-03-20');
+  assert.equal(rCustom.from, '2026-03-10');
+  assert.equal(rCustom.to, '2026-03-20');
+
+  const rSwapped = parseReportRange({ preset: 'custom', from: '2026-05-20', to: '2026-05-01' });
+  assert.equal(rSwapped.start, '2026-05-01');
+  assert.equal(rSwapped.end, '2026-05-20');
+
+  const rBadDay = parseReportRange({ preset: 'custom', month: '2026-02', from: '2026-02-30', to: '2026-02-28' });
+  assert.equal(rBadDay.start, '2026-02-01');
+  assert.equal(rBadDay.end, '2026-02-28');
+
+  const rYear = parseReportRange({ preset: 'year', year: '2025' });
+  assert.equal(rYear.preset, 'year');
+  assert.equal(rYear.start, '2025-01-01');
+  assert.equal(rYear.end, '2025-12-31');
+  assert.equal(rYear.label, '2025全年');
+  assert.equal(rYear.year, '2025');
+});
+
+test('about 模块常量与 GitHub Issues 链接推导', () => {
+  assert.ok(APP.name.includes('HomeLedger'));
+  assert.ok(FEATURES.length >= 6);
+  assert.ok(CHANGELOG.length >= 2);
+  assert.ok(TECH.length >= 4);
+  assert.equal(repoUrl({ HOMELEDGER_GITHUB_REPO: 'https://github.com/org/repo/' }), 'https://github.com/org/repo');
+  assert.equal(
+    issuesUrl({ HOMELEDGER_GITHUB_REPO: 'https://github.com/org/repo///' }),
+    'https://github.com/org/repo/issues',
+  );
+  assert.equal(issuesUrl({ HOMELEDGER_GITHUB_REPO: 'https://gitlab.example.com/org/repo' }), null);
+  assert.equal(repoUrl({ HOMELEDGER_GITHUB_REPO: 'javascript:alert(1)' }), '');
+  assert.equal(repoUrl({ HOMELEDGER_GITHUB_REPO: 'data:text/html,hi' }), '');
+  assert.equal(safeInternalPath('/\tevil.com', '/'), '/');
+  assert.equal(safeInternalPath('/\\evil.com', '/'), '/');
+  assert.equal(safeInternalPath('/transactions?a=1#h', '/'), '/transactions?a=1#h');
 });

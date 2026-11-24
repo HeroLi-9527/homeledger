@@ -9,12 +9,37 @@ import { dbOf, requireLogin, siteMeta, takeFlash } from './helpers.js';
 
 export const reportsRoutes = new Hono<HonoEnv>();
 
-export function parseReportRange(q: Record<string, string | undefined>) {
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function validDay(s: string): boolean {
+  if (!DAY_RE.test(s)) return false;
+  const dt = new Date(`${s}T00:00:00Z`);
+  return !Number.isNaN(dt.getTime()) && dt.toISOString().slice(0, 10) === s;
+}
+
+export function parseReportRange(q: Record<string, string | undefined>): {
+  start: string;
+  end: string;
+  label: string;
+  preset: string;
+  month: string;
+  from?: string;
+  to?: string;
+  year?: string;
+} {
   const today = todayStr();
   const defMonth = today.slice(0, 7);
   const month = /^\d{4}-\d{2}$/.test(String(q.month || '')) ? String(q.month) : defMonth;
-  const preset = ['month', 'quarter', 'year', 'all'].includes(String(q.preset)) ? String(q.preset) : 'month';
+  const preset = ['month', 'quarter', 'year', 'all', 'custom'].includes(String(q.preset))
+    ? String(q.preset)
+    : 'month';
 
+  if (preset === 'custom') {
+    let from = validDay(String(q.from || '')) ? String(q.from) : `${month}-01`;
+    let to = validDay(String(q.to || '')) ? String(q.to) : u.monthEnd(month);
+    if (from > to) [from, to] = [to, from];
+    return { start: from, end: to, label: `${from} ~ ${to}`, preset, month: to.slice(0, 7), from, to };
+  }
   if (preset === 'quarter') {
     const y = Number(month.slice(0, 4));
     const m = Number(month.slice(5, 7));
@@ -26,8 +51,8 @@ export function parseReportRange(q: Record<string, string | undefined>) {
     return { start, end, label: `${y}年 Q${qi + 1}`, preset, month };
   }
   if (preset === 'year') {
-    const y = month.slice(0, 4);
-    return { start: `${y}-01-01`, end: `${y}-12-31`, label: `${y}全年`, preset, month };
+    const y = /^\d{4}$/.test(String(q.year || '')) ? String(q.year) : month.slice(0, 4);
+    return { start: `${y}-01-01`, end: `${y}-12-31`, label: `${y}全年`, preset, month, year: y };
   }
   if (preset === 'all') {
     return { start: '1970-01-01', end: '2099-12-31', label: '全部历史', preset, month };
@@ -58,13 +83,14 @@ reportsRoutes.get('/reports', async (c) => {
   const prevM = u.addMonths(heatmapMonth, -1);
   const lastYearM = u.addMonths(heatmapMonth, -12);
 
-  const [sum, cats, subcats, trend, days, members, netWorth, overview, expRow, prevSum, lastYearSum] =
+  const [sum, cats, subcats, trend, days, weekdayExpense, members, netWorth, overview, expRow, prevSum, lastYearSum] =
     await Promise.all([
       txn.summary(db, ledgerId, range.start, range.end),
       txn.categoryBreakdown(db, ledgerId, range.start, range.end, kind),
       txn.subcategoryBreakdown(db, ledgerId, range.start, range.end, kind, selectedCat),
       txn.monthlyTrend(db, ledgerId, 12),
       txn.dailyBreakdown(db, ledgerId, `${heatmapMonth}-01`, u.monthEnd(heatmapMonth)),
+      txn.weekdayExpenseBreakdown(db, ledgerId, range.start, range.end),
       txn.memberBreakdown(db, ledgerId, range.start, range.end),
       txn.netWorthTrend(db, ledgerId, 12),
       txn.accountOverview(db, ledgerId),
@@ -90,8 +116,13 @@ reportsRoutes.get('/reports', async (c) => {
 
   const linkWith = (overrides: Record<string, string>, opts?: { keepPeriod?: boolean }) => {
     const next = new URLSearchParams();
-    if (opts?.keepPeriod !== false && q.preset) next.set('preset', q.preset);
-    if (opts?.keepPeriod !== false && q.month) next.set('month', q.month);
+    if (opts?.keepPeriod !== false) {
+      if (q.preset) next.set('preset', q.preset);
+      if (q.month) next.set('month', q.month);
+      if (q.from) next.set('from', q.from);
+      if (q.to) next.set('to', q.to);
+      if (q.year) next.set('year', q.year);
+    }
     if (q.kind) next.set('kind', q.kind);
     if (q.cat) next.set('cat', q.cat);
     for (const [k, v] of Object.entries(overrides)) {
@@ -121,6 +152,7 @@ reportsRoutes.get('/reports', async (c) => {
         subcats,
         trend,
         days,
+        weekdayExpense,
         members,
         netWorth,
         overview,

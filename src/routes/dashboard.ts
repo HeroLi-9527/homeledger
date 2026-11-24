@@ -55,6 +55,7 @@ dashboardRoutes.get('/', async (c) => {
     prev,
     trend,
     catsAll,
+    incomeCats,
     overview,
     budgetsRaw,
     recentRes,
@@ -64,11 +65,14 @@ dashboardRoutes.get('/', async (c) => {
     aiReady,
     subs,
     sessionCards,
+    todayRow,
+    upcomingRows,
   ] = await Promise.all([
     txn.summary(db, ledgerId, `${month}-01`, u.monthEnd(month)),
     txn.summary(db, ledgerId, `${prevMonth}-01`, u.monthEnd(prevMonth)),
     txn.monthlyTrend(db, ledgerId, 6),
     txn.categoryBreakdown(db, ledgerId, `${month}-01`, u.monthEnd(month), 'expense'),
+    txn.categoryBreakdown(db, ledgerId, `${month}-01`, u.monthEnd(month), 'income'),
     txn.accountOverview(db, ledgerId),
     db.all<BudgetRow>(
       `SELECT b.*, c.name AS category_name FROM budgets b
@@ -92,7 +96,42 @@ dashboardRoutes.get('/', async (c) => {
     isAiUsable(db),
     subsOverview(db, ledgerId),
     listSessionCards(db, ledgerId),
+    db.get<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND deleted_at IS NULL AND txn_date = ?',
+      ledgerId,
+      todayStr(),
+    ),
+    db.all<{ id: number; name: string; frequency: string; next_run_at: string; payload: string }>(
+      'SELECT id, name, frequency, next_run_at, payload FROM recurring_rules WHERE ledger_id = ? AND is_active = 1 ORDER BY next_run_at LIMIT 4',
+      ledgerId,
+    ),
   ]);
+
+  const upcoming = upcomingRows.map((row) => {
+    let amountCents = 0;
+    try {
+      const parsed = JSON.parse(row.payload || '{}') as unknown;
+      const items = Array.isArray(parsed)
+        ? parsed
+        : parsed && typeof parsed === 'object' && Array.isArray((parsed as { items?: unknown[] }).items)
+          ? (parsed as { items: unknown[] }).items
+          : [parsed];
+      for (const it of items) {
+        if (it && typeof it === 'object') {
+          amountCents += Math.abs(Number((it as { amount_cents?: number }).amount_cents) || 0);
+        }
+      }
+    } catch {
+      amountCents = 0;
+    }
+    return {
+      id: row.id,
+      name: row.name,
+      frequency: row.frequency,
+      next_run_at: row.next_run_at,
+      amount_cents: amountCents,
+    };
+  });
 
   const recent = recentRes.rows;
   const trendChart = barChart({
@@ -145,6 +184,9 @@ dashboardRoutes.get('/', async (c) => {
         overview,
         trendChart,
         cats: catsAll,
+        incomeCats: incomeCats.slice(0, 6),
+        todayCount: Number(todayRow?.c || 0),
+        upcoming,
         budgets,
         recentGroups,
         debts,
@@ -238,17 +280,26 @@ dashboardRoutes.get('/search', async (c) => {
   if (!ctx.ledger) return c.redirect('/');
   const ledgerId = Number(ctx.ledger.id);
   const q = c.req.query();
+  const minRaw = q.min ? Math.abs(u.parseAmountToCents(q.min)) : 0;
+  const maxRaw = q.max ? Math.abs(u.parseAmountToCents(q.max)) : 0;
   const f: txn.TxnFilter = {
     keyword: String(q.q || '').trim(),
     type: q.type || '',
     categoryId: q.category_id ? Number(q.category_id) : undefined,
     accountId: q.account_id ? Number(q.account_id) : undefined,
+    memberId: q.member_id ? Number(q.member_id) : undefined,
+    tagId: q.tag_id ? Number(q.tag_id) : undefined,
+    source: q.source ? String(q.source).trim() : '',
+    minCents: minRaw > 0 ? minRaw : undefined,
+    maxCents: maxRaw > 0 ? maxRaw : undefined,
     from: q.from || '',
     to: q.to || '',
     page: Number(q.page || 1),
     pageSize: 30,
   };
-  const hasFilter = Boolean(f.keyword || f.type || f.categoryId || f.accountId || f.from || f.to);
+  const hasFilter = Boolean(
+    f.keyword || f.type || f.categoryId || f.accountId || f.memberId || f.tagId || f.source || f.minCents || f.maxCents || f.from || f.to,
+  );
   const [result, form, cats] = await Promise.all([
     hasFilter ? txn.listTransactions(db, ledgerId, f) : Promise.resolve({ rows: [], total: 0, page: 1, pageSize: 30, pages: 1, sum: { income: 0, expense: 0 } }),
     fd.txFormData(db, ledgerId),
@@ -259,9 +310,23 @@ dashboardRoutes.get('/search', async (c) => {
     type: f.type || undefined,
     category_id: f.categoryId,
     account_id: f.accountId,
+    member_id: f.memberId,
+    tag_id: f.tagId,
+    source: f.source || undefined,
+    min: q.min || undefined,
+    max: q.max || undefined,
     from: f.from || undefined,
     to: f.to || undefined,
   };
+  const SOURCE_OPTS: Array<[string, string]> = [
+    ['manual', '手工记账'],
+    ['ai_screenshot', 'AI 截图'],
+    ['ai_text', 'AI 文字'],
+    ['import', '账单导入'],
+    ['recurring', '周期账单'],
+    ['subscription', '订阅扣费'],
+    ['openapi', '开放 API'],
+  ];
   return c.html(
     layout({
       title: '搜索筛选',
@@ -276,8 +341,13 @@ dashboardRoutes.get('/search', async (c) => {
   <select name="type"><option value="">全部类型</option>${Object.entries(TXN_TYPE_MAP).map(([k, v]) => `<option value="${k}" ${f.type === k ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}</select>
   <select name="category_id"><option value="">全部分类</option>${cats.map((cc) => `<option value="${cc.id}" ${f.categoryId === cc.id ? 'selected' : ''}>${esc(cc.path)}</option>`).join('')}</select>
   <select name="account_id">${accountOptionsHtml(form.accounts, { selectedId: f.accountId, emptyLabel: '全部账户' })}</select>
-  <input type="date" name="from" value="${esc(f.from)}">
-  <input type="date" name="to" value="${esc(f.to)}">
+  <select name="member_id"><option value="">全部成员</option>${form.members.map((m) => `<option value="${m.user_id}" ${f.memberId === Number(m.user_id) ? 'selected' : ''}>${esc(m.display_name)}</option>`).join('')}</select>
+  <select name="tag_id"><option value="">全部标签</option>${form.tags.map((tg) => `<option value="${tg.id}" ${f.tagId === Number(tg.id) ? 'selected' : ''}>#${esc(tg.name)}</option>`).join('')}</select>
+  <select name="source"><option value="">全部来源</option>${SOURCE_OPTS.map(([k, lbl]) => `<option value="${k}" ${f.source === k ? 'selected' : ''}>${lbl}</option>`).join('')}</select>
+  <input name="min" value="${esc(q.min || '')}" placeholder="最小金额（元）" inputmode="decimal">
+  <input name="max" value="${esc(q.max || '')}" placeholder="最大金额（元）" inputmode="decimal">
+  <input type="date" name="from" value="${esc(f.from)}" title="开始日期">
+  <input type="date" name="to" value="${esc(f.to)}" title="结束日期">
 </div>
 <div class="row mt12"><button class="btn btn-primary" type="submit">搜索</button>${hasFilter ? `<a class="btn" href="/search">清空</a><span class="muted small">共 ${result.total} 笔</span>` : ''}</div>
 </form></div>
