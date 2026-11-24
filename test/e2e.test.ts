@@ -67,7 +67,18 @@ function createSqliteD1(sqlite: SqliteDatabase): D1Database {
     },
     async batch(statements: Array<{ run: () => Promise<unknown> }>) {
       const out = [];
-      for (const s of statements) out.push(await s.run());
+      sqlite.exec('BEGIN');
+      try {
+        for (const s of statements) out.push(await s.run());
+        sqlite.exec('COMMIT');
+      } catch (err) {
+        try {
+          sqlite.exec('ROLLBACK');
+        } catch {
+          /* ignore rollback error */
+        }
+        throw err;
+      }
       return out;
     },
     async exec(sql: string) {
@@ -452,9 +463,9 @@ test('P0 回归：AI 配置保存、默认账户兜底、CSV 导入预览、邀�
     }),
   });
   assert.equal(setupRes.status, 302);
-  const cookieHeader = extractSidCookie(setupRes);
+  let cookieHeader = extractSidCookie(setupRes);
   const homeHtml = await (await req('/', { headers: { Cookie: cookieHeader } })).text();
-  const csrf = extractCsrf(homeHtml);
+  let csrf = extractCsrf(homeHtml);
 
   // 1. AI 配置真值保存与回读
   const aiSaveOn = await req('/settings/ai', {
@@ -727,9 +738,9 @@ test('Phase 1：账户三层分层、账户编辑、信用额度提醒与次卡�
     }),
   });
   assert.equal(setupRes.status, 302);
-  const cookieHeader = extractSidCookie(setupRes);
+  let cookieHeader = extractSidCookie(setupRes);
   const homeHtml = await (await req('/', { headers: { Cookie: cookieHeader } })).text();
-  const csrf = extractCsrf(homeHtml);
+  let csrf = extractCsrf(homeHtml);
 
   // 1. 新建花呗（信用账户）：正数录入当前待还 320.50 -> 后台自动转为 -32050
   const createCreditRes = await req('/accounts', {
@@ -1070,6 +1081,19 @@ test('Phase 1：账户三层分层、账户编辑、信用额度提醒与次卡�
   assert.equal(restoreJson.ok, true);
   assert.ok(restoreJson.restored.session_cards >= 2);
 
+  // 恢复后全端旧会话强制失效，需重新登录
+  const staleAfterRestore = await req('/', { redirect: 'manual', headers: { Cookie: cookieHeader } });
+  assert.equal(staleAfterRestore.status, 302);
+  const reloginRes = await req('/login', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({ username: 'alice', password: 'password123' }),
+  });
+  assert.equal(reloginRes.status, 302);
+  cookieHeader = extractSidCookie(reloginRes);
+  csrf = extractCsrf(await (await req('/', { headers: { Cookie: cookieHeader } })).text());
+
   // 7. 删除次卡仅删台账与日志，保留已记账的购卡支出流水
   const delCardRes = await req(`/session-cards/${washCard.id}/delete`, {
     method: 'POST',
@@ -1090,4 +1114,610 @@ test('Phase 1：账户三层分层、账户编辑、信用额度提醒与次卡�
   const homeAfterHtml = await homeAfter.text();
   assert.ok(homeAfterHtml.includes('账户分层与余额'));
   assert.ok(homeAfterHtml.includes('有效次卡'));
+});
+
+test('Phase 2（P1 部署前必做）：附件闭环、分页筛选与通知跳转、报表下钻、分类/规划编辑与账本/管理加固', async () => {
+  const { sqlite, env, r2Store } = setupEnv();
+  const req = (p: string, init: RequestInit = {}) =>
+    app.fetch(new Request(`http://localhost${p}`, init), env);
+
+  // 初始化管理员与账本
+  const setupRes = await req('/setup', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({
+      username: 'alice',
+      display_name: 'Alice',
+      password: 'password123',
+      password2: 'password123',
+      site_name: 'P1验收账本',
+    }),
+  });
+  assert.equal(setupRes.status, 302);
+  let cookieHeader = extractSidCookie(setupRes);
+  const homeHtml = await (await req('/', { headers: { Cookie: cookieHeader } })).text();
+  let csrf = extractCsrf(homeHtml);
+  assert.ok(homeHtml.includes('href="/attachments"'), '侧栏应包含 /attachments 入口');
+
+  const pngBuf = Buffer.from(PNG_1X1_DATA_URL.split(',')[1], 'base64');
+
+  // ---- Item 1：交易编辑页附件查看 / JSON 与 multipart 补传 / 6 张上限 / 单删同步删 R2 ----
+  const createTxn = await req('/transactions', {
+    method: 'POST',
+    headers: { Cookie: cookieHeader, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: 'expense',
+      amount: '88.00',
+      account_id: 1,
+      category_id: 1,
+      txn_date: '2026-11-23',
+      merchant: '附件测试商户',
+      note: '测试票据',
+    }),
+  });
+  assert.equal(createTxn.status, 200);
+  const { id: txnId } = (await createTxn.json()) as { id: number };
+
+  const editBefore = await (await req(`/transactions/${txnId}/edit`, { headers: { Cookie: cookieHeader } })).text();
+  assert.ok(editBefore.includes('凭证与附件'));
+  assert.ok(editBefore.includes('0 / 6'));
+
+  // JSON 补传 2 张
+  const upJsonRes = await req(`/transactions/${txnId}/attachments`, {
+    method: 'POST',
+    headers: { Cookie: cookieHeader, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      images: [
+        { dataUrl: PNG_1X1_DATA_URL, name: 'r1.png' },
+        { dataUrl: PNG_1X1_DATA_URL, name: 'r2.png' },
+      ],
+    }),
+  });
+  assert.equal(upJsonRes.status, 200);
+  const upJson = (await upJsonRes.json()) as { ok: boolean; attachments: Array<{ id: number; rel: string }>; total: number };
+  assert.equal(upJson.total, 2);
+  assert.equal(r2Store.size, 2);
+
+  // multipart/form-data 补传 1 张
+  const mpForm = new FormData();
+  mpForm.append('_csrf', csrf);
+  mpForm.append('files', new File([pngBuf], 'r3.png', { type: 'image/png' }));
+  const upMpRes = await req(`/transactions/${txnId}/attachments`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader },
+    body: mpForm,
+  });
+  assert.equal(upMpRes.status, 302);
+  assert.equal(upMpRes.headers.get('location'), `/transactions/${txnId}/edit`);
+  assert.equal(r2Store.size, 3);
+
+  // 超出 6 张上限应被拒绝且不落盘
+  const overRes = await req(`/transactions/${txnId}/attachments`, {
+    method: 'POST',
+    headers: { Cookie: cookieHeader, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ images: [PNG_1X1_DATA_URL, PNG_1X1_DATA_URL, PNG_1X1_DATA_URL, PNG_1X1_DATA_URL] }),
+  });
+  assert.equal(overRes.status, 400);
+  assert.equal(r2Store.size, 3);
+
+  const editMid = await (await req(`/transactions/${txnId}/edit`, { headers: { Cookie: cookieHeader } })).text();
+  assert.ok(editMid.includes('3 / 6'));
+  assert.ok(editMid.includes(upJson.attachments[0].rel.replace(/^uploads\//, '/uploads/')));
+
+  // 单删 1 张并校验同步删 R2 且回跳编辑页
+  const delAttRes = await req(`/attachments/${upJson.attachments[0].id}/delete`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, back: `/transactions/${txnId}/edit` }),
+  });
+  assert.equal(delAttRes.status, 302);
+  assert.equal(delAttRes.headers.get('location'), `/transactions/${txnId}/edit`);
+  assert.equal(r2Store.size, 2);
+  assert.equal(r2Store.has(upJson.attachments[0].rel), false);
+
+  const attListHtml = await (await req('/attachments', { headers: { Cookie: cookieHeader } })).text();
+  assert.ok(attListHtml.includes(`href="/transactions/${txnId}/edit"`), '附件页应链接到关联流水编辑页');
+
+  // ---- Item 2：/transactions 分页保留筛选、/search 补分页、/notifications 点击与跨账本跳转 ----
+  const subCatFood = sqlite.prepare("SELECT id, parent_id FROM categories WHERE parent_id IS NOT NULL AND kind = 'expense' ORDER BY id LIMIT 2").all() as Array<{ id: number; parent_id: number }>;
+  const parentCat = sqlite.prepare('SELECT name FROM categories WHERE id = ?').get(subCatFood[0].parent_id) as { name: string };
+  for (let i = 0; i < 45; i++) {
+    sqlite
+      .prepare(
+        `INSERT INTO transactions (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, category_id, user_id, txn_date, note, merchant, created_at, updated_at)
+         VALUES (1, 'expense', 1000, 'CNY', 1, 1000, 1, ?, 1, '2026-11-22', '分页测试备注', '分页测试商户', '2026-11-22 10:00:00', '2026-11-22 10:00:00')`,
+      )
+      .run(i % 2 === 0 ? subCatFood[0].id : subCatFood[1].id);
+  }
+  const txPageHtml = await (
+    await req(`/transactions?kind=expense&category_id=${subCatFood[0].id}&q=${encodeURIComponent('分页测试')}`, {
+      headers: { Cookie: cookieHeader },
+    })
+  ).text();
+  // 23 条（45 中偶数条）<= 40，改为不过滤 category_id 触发 45 条分页（> 40）
+  const txPagedAllHtml = await (
+    await req(`/transactions?kind=expense&q=${encodeURIComponent('分页测试')}`, { headers: { Cookie: cookieHeader } })
+  ).text();
+  assert.ok(txPagedAllHtml.includes('page=2'), '/transactions 超 40 条应渲染分页');
+  assert.ok(txPagedAllHtml.includes('kind=expense') && txPagedAllHtml.includes('q=%E5%88%86%E9%A1%B5%E6%B5%8B%E8%AF%95'), '分页链接应完整保留 kind 与 q');
+  assert.ok(txPageHtml.includes('清空筛选'));
+
+  const searchHtml = await (
+    await req(`/search?q=${encodeURIComponent('分页测试')}&type=expense`, { headers: { Cookie: cookieHeader } })
+  ).text();
+  assert.ok(searchHtml.includes('page=2'), '/search 超 30 条应渲染分页');
+  assert.ok(searchHtml.includes('type=expense') && searchHtml.includes('q=%E5%88%86%E9%A1%B5%E6%B5%8B%E8%AF%95'));
+  const searchP2 = await req(`/search?q=${encodeURIComponent('分页测试')}&type=expense&page=2`, {
+    headers: { Cookie: cookieHeader },
+  });
+  assert.equal(searchP2.status, 200);
+  assert.ok((await searchP2.text()).includes('分页测试商户'));
+
+  // 通知点击跳转：先创建第 2 个账本，并插入跨账本合法通知与危险伪协议通知
+  const createL2 = await req('/ledgers', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, name: '第二账本', kind: 'family', currency: 'CNY' }),
+  });
+  assert.equal(createL2.status, 302);
+  const l2Row = sqlite.prepare("SELECT id FROM ledgers WHERE name = '第二账本'").get() as { id: number };
+  // 切回账本 1
+  const swBack = await req('/ledgers/switch', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, ledger_id: '1' }),
+  });
+  cookieHeader = extractSidCookie(swBack) || cookieHeader;
+
+  sqlite
+    .prepare("INSERT INTO notifications (user_id, ledger_id, kind, title, body, link, created_at) VALUES (1, ?, 'warn', '跨账本预算预警', '查看账本二', '/budgets', '2026-11-23 12:00:00')")
+    .run(l2Row.id);
+  const nValid = sqlite.prepare("SELECT id FROM notifications WHERE title = '跨账本预算预警'").get() as { id: number };
+  sqlite
+    .prepare("INSERT INTO notifications (user_id, ledger_id, kind, title, body, link, created_at) VALUES (1, 1, 'info', '伪协议通知', '测试拦截', 'javascript:alert(1)', '2026-11-23 12:00:00')")
+    .run();
+  const nBad = sqlite.prepare("SELECT id FROM notifications WHERE title = '伪协议通知'").get() as { id: number };
+
+  const notifHtml = await (await req('/notifications', { headers: { Cookie: cookieHeader } })).text();
+  assert.ok(notifHtml.includes(`/notifications/${nValid.id}/open`));
+  assert.ok(!notifHtml.includes(`/notifications/${nBad.id}/open`), '非法外链/伪协议不应生成跳转入口');
+
+  const openValid = await req(`/notifications/${nValid.id}/open`, { redirect: 'manual', headers: { Cookie: cookieHeader } });
+  assert.equal(openValid.status, 302);
+  assert.equal(openValid.headers.get('location'), '/budgets');
+  const switchedCookie = extractSidCookie(openValid);
+  assert.ok(switchedCookie, '打开其他账本通知应重签 Cookie 切换账本');
+  const budgetsOnL2 = await (await req('/budgets', { headers: { Cookie: switchedCookie } })).text();
+  assert.ok(budgetsOnL2.includes('第二账本'));
+
+  const openBad = await req(`/notifications/${nBad.id}/open`, { redirect: 'manual', headers: { Cookie: switchedCookie } });
+  assert.equal(openBad.status, 302);
+  assert.equal(openBad.headers.get('location'), '/notifications');
+
+  // 切回账本 1
+  const sw1 = await req('/ledgers/switch', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: switchedCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, ledger_id: '1' }),
+  });
+  cookieHeader = extractSidCookie(sw1) || switchedCookie;
+
+  // ---- Item 3：/reports 渲染二级分类下钻明细与未分类 ----
+  sqlite
+    .prepare(
+      `INSERT INTO transactions (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, category_id, user_id, txn_date, note, created_at, updated_at)
+       VALUES (1, 'expense', 2500, 'CNY', 1, 2500, 1, NULL, 1, '2026-11-23', '无分类支出', '2026-11-23 12:00:00', '2026-11-23 12:00:00')`,
+    )
+    .run();
+  const reportsAllHtml = await (await req('/reports?month=2026-11', { headers: { Cookie: cookieHeader } })).text();
+  assert.ok(reportsAllHtml.includes('二级分类下钻明细'));
+  assert.ok(reportsAllHtml.includes('未分类'));
+  assert.ok(reportsAllHtml.includes(`category_id=${subCatFood[0].id}`));
+
+  const reportsDrillHtml = await (
+    await req(`/reports?month=2026-11&cat=${encodeURIComponent(parentCat.name)}`, { headers: { Cookie: cookieHeader } })
+  ).text();
+  assert.ok(reportsDrillHtml.includes('查看全部分类'));
+  assert.ok(!reportsDrillHtml.includes('<td>🏷️ <b>未分类</b></td>'), '选定大类后不应包含其他大类或未分类');
+
+  const reportsUncatHtml = await (
+    await req(`/reports?month=2026-11&cat=${encodeURIComponent('未分类')}`, { headers: { Cookie: cookieHeader } })
+  ).text();
+  assert.ok(reportsUncatHtml.includes('未分类'));
+
+  // ---- Item 4：二级分类新建/删除、周期/借贷/目标编辑、订阅删除与历史扣费 ----
+  // 4.1 分类：新建自定义一级与二级，拦截三级，删子后再删父
+  await req('/categories', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, kind: 'expense', name: '养宠测试', icon: '🐾' }),
+  });
+  const petRoot = sqlite.prepare("SELECT id FROM categories WHERE name = '养宠测试' AND ledger_id = 1").get() as { id: number };
+  await req('/categories', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, kind: 'expense', parent_id: String(petRoot.id), name: '宠物零食', icon: '🦴' }),
+  });
+  const petSub = sqlite.prepare("SELECT id FROM categories WHERE name = '宠物零食' AND parent_id = ?").get(petRoot.id) as { id: number };
+  assert.ok(petSub.id > 0);
+  // 禁止三级嵌套
+  await req('/categories', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, kind: 'expense', parent_id: String(petSub.id), name: '三级禁止' }),
+  });
+  assert.equal(sqlite.prepare("SELECT id FROM categories WHERE name = '三级禁止'").get(), undefined);
+  // 有子分类时禁删一级分类
+  await req(`/categories/${petRoot.id}/delete`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf }),
+  });
+  assert.ok(sqlite.prepare('SELECT id FROM categories WHERE id = ?').get(petRoot.id));
+  // 删二级再删一级
+  await req(`/categories/${petSub.id}/delete`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf }),
+  });
+  assert.equal(sqlite.prepare('SELECT id FROM categories WHERE id = ?').get(petSub.id), undefined);
+  await req(`/categories/${petRoot.id}/delete`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf }),
+  });
+  assert.equal(sqlite.prepare('SELECT id FROM categories WHERE id = ?').get(petRoot.id), undefined);
+
+  // 4.2 周期账单编辑
+  await req('/recurring', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      name: '旧房租',
+      frequency: 'monthly',
+      interval_n: '1',
+      next_run_at: '2026-12-01',
+      item_type: 'expense',
+      item_amount: '3000.00',
+      item_account_id: '1',
+      auto_post: '1',
+    }),
+  });
+  const recRow = sqlite.prepare("SELECT id FROM recurring_rules WHERE name = '旧房租'").get() as { id: number };
+  assert.equal((await req(`/recurring/${recRow.id}/edit`, { headers: { Cookie: cookieHeader } })).status, 200);
+  await req(`/recurring/${recRow.id}`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      name: '新房租水电',
+      frequency: 'monthly',
+      interval_n: '1',
+      next_run_at: '2026-12-05',
+      item_type: 'expense',
+      item_amount: '3200.00',
+      item_account_id: '1',
+      auto_post: '1',
+      is_active: '1',
+    }),
+  });
+  const recUpdated = sqlite.prepare('SELECT name, payload FROM recurring_rules WHERE id = ?').get(recRow.id) as { name: string; payload: string };
+  assert.equal(recUpdated.name, '新房租水电');
+  assert.ok(recUpdated.payload.includes('320000'));
+
+  // 4.3 借贷编辑（手工台账 + 自动汇总保留到期日）
+  await req('/debts', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      direction: 'receivable',
+      counterparty: '手工张三',
+      amount: '500.00',
+      due_date: '2026-12-10',
+      note: '旧借款',
+    }),
+  });
+  const manualDebt = sqlite.prepare("SELECT id FROM debts WHERE counterparty = '手工张三'").get() as { id: number };
+  assert.equal((await req(`/debts/${manualDebt.id}/edit`, { headers: { Cookie: cookieHeader } })).status, 200);
+  await req(`/debts/${manualDebt.id}`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      direction: 'receivable',
+      counterparty: '手工张三已清',
+      principal: '500.00',
+      balance: '0',
+      due_date: '2026-12-12',
+      status: 'open',
+      note: '已结清备注',
+    }),
+  });
+  const manualAfter = sqlite.prepare('SELECT counterparty, balance_cents, status FROM debts WHERE id = ?').get(manualDebt.id) as { counterparty: string; balance_cents: number; status: string };
+  assert.equal(manualAfter.counterparty, '手工张三已清');
+  assert.equal(manualAfter.balance_cents, 0);
+  assert.equal(manualAfter.status, 'closed');
+
+  // 联动流水借贷带上 due_date，再编辑 due_date 后再记一笔借出，验证 due_date 不丢失
+  await req('/debts', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      direction: 'receivable',
+      counterparty: '自动李四',
+      amount: '200.00',
+      account_id: '1',
+      due_date: '2026-12-15',
+      create_txn: '1',
+    }),
+  });
+  const autoDebt1 = sqlite
+    .prepare("SELECT id, due_date FROM debts WHERE counterparty = '自动李四' AND note = '系统自动汇总'")
+    .get() as { id: number; due_date: string | null };
+  assert.equal(autoDebt1.due_date, '2026-12-15');
+  await req(`/debts/${autoDebt1.id}`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, due_date: '2026-12-20' }),
+  });
+  await req('/transactions', {
+    method: 'POST',
+    headers: { Cookie: cookieHeader, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'lend', amount: '100.00', account_id: 1, merchant: '自动李四', txn_date: '2026-11-23' }),
+  });
+  const autoDebt2 = sqlite
+    .prepare("SELECT principal_cents, due_date FROM debts WHERE counterparty = '自动李四' AND note = '系统自动汇总'")
+    .get() as { principal_cents: number; due_date: string | null };
+  assert.equal(autoDebt2.principal_cents, 30000);
+  assert.equal(autoDebt2.due_date, '2026-12-20', 'syncDebts 重算应保留已设 due_date');
+
+  // 4.4 储蓄目标编辑
+  await req('/goals', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, name: '旅行基金', target: '2000.00', saved_amount: '500.00' }),
+  });
+  const goalRow = sqlite.prepare("SELECT id FROM goals WHERE name = '旅行基金'").get() as { id: number };
+  assert.equal((await req(`/goals/${goalRow.id}/edit`, { headers: { Cookie: cookieHeader } })).status, 200);
+  await req(`/goals/${goalRow.id}`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, name: '日本旅行基金', icon: '✈️', target: '2000.00', saved_amount: '2000.00' }),
+  });
+  const goalAfter = sqlite.prepare('SELECT name, status FROM goals WHERE id = ?').get(goalRow.id) as { name: string; status: string };
+  assert.equal(goalAfter.name, '日本旅行基金');
+  assert.equal(goalAfter.status, 'completed');
+
+  // 4.5 订阅删除按钮、历史扣费记录与删订阅留流水
+  await req('/subscriptions', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      name: 'CloudStorage',
+      amount: '21.00',
+      cycle: 'monthly',
+      account_id: '1',
+      next_charge_at: '2026-11-23',
+      status: 'active',
+    }),
+  });
+  const subRow = sqlite.prepare("SELECT id FROM subscriptions WHERE name = 'CloudStorage'").get() as { id: number };
+  await req(`/subscriptions/${subRow.id}/charge`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, next_charge_at: '2026-11-23' }),
+  });
+  const subTxn = sqlite
+    .prepare('SELECT id FROM transactions WHERE subscription_id = ? AND deleted_at IS NULL')
+    .get(subRow.id) as { id: number };
+  assert.ok(subTxn.id > 0);
+  const subsListHtml = await (await req('/subscriptions', { headers: { Cookie: cookieHeader } })).text();
+  assert.ok(subsListHtml.includes(`/subscriptions/${subRow.id}/delete`));
+  const subEditHtml = await (await req(`/subscriptions/${subRow.id}/edit`, { headers: { Cookie: cookieHeader } })).text();
+  assert.ok(subEditHtml.includes('历史扣费记录'));
+  assert.ok(subEditHtml.includes(`/transactions/${subTxn.id}/edit`));
+
+  await req(`/subscriptions/${subRow.id}/delete`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf }),
+  });
+  assert.equal(sqlite.prepare('SELECT id FROM subscriptions WHERE id = ?').get(subRow.id), undefined);
+  assert.ok(sqlite.prepare('SELECT id FROM transactions WHERE id = ? AND deleted_at IS NULL').get(subTxn.id), '删除订阅应保留历史扣费流水');
+
+  // ---- Item 5：账本改名与级联删除、/admin 重置密码、全库 JSON 恢复加固 ----
+  // 5.1 为第二账本填充子表数据、R2 附件、失败导入报告与绑定令牌
+  const swL2 = await req('/ledgers/switch', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, ledger_id: String(l2Row.id) }),
+  });
+  const l2Cookie = extractSidCookie(swL2) || cookieHeader;
+  const l2Acc = sqlite.prepare('SELECT id FROM accounts WHERE ledger_id = ? LIMIT 1').get(l2Row.id) as { id: number };
+  const l2TxnRes = await req('/transactions', {
+    method: 'POST',
+    headers: { Cookie: l2Cookie, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: 'expense',
+      amount: '99.00',
+      account_id: l2Acc.id,
+      tags: '清账标签',
+      splits: [{ member_name: 'Alice', share_cents: 9900 }],
+    }),
+  });
+  const { id: l2TxnId } = (await l2TxnRes.json()) as { id: number };
+  const l2AttRes = await req(`/transactions/${l2TxnId}/attachments`, {
+    method: 'POST',
+    headers: { Cookie: l2Cookie, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dataUrl: PNG_1X1_DATA_URL, name: 'l2.png' }),
+  });
+  const l2Att = ((await l2AttRes.json()) as { attachments: Array<{ rel: string }> }).attachments[0];
+  await env.ATTACHMENTS.put(`imports/failures-777.json`, '[]');
+  sqlite
+    .prepare("INSERT INTO import_jobs (id, ledger_id, user_id, source, total, imported, skipped, failed, status, created_at) VALUES (777, ?, 1, 'csv', 15, 0, 0, 15, 'done', '2026-11-23 12:00:00')")
+    .run(l2Row.id);
+  const l2TokRes = await req('/settings/api-tokens', {
+    method: 'POST',
+    headers: { Cookie: l2Cookie, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'L2Token' }),
+  });
+  const { token: l2ApiToken } = (await l2TokRes.json()) as { token: string };
+
+  // 改名第二账本
+  assert.equal((await req(`/ledgers/${l2Row.id}/edit`, { headers: { Cookie: l2Cookie } })).status, 200);
+  await req(`/ledgers/${l2Row.id}`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: l2Cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, name: '改名后账本', icon: '🏠', kind: 'family' }),
+  });
+  assert.equal((sqlite.prepare('SELECT name FROM ledgers WHERE id = ?').get(l2Row.id) as { name: string }).name, '改名后账本');
+
+  // 名称不匹配时拦截删除
+  const delWrong = await req(`/ledgers/${l2Row.id}/delete`, {
+    method: 'POST',
+    headers: { Cookie: l2Cookie, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirm_name: '写错的名字' }),
+  });
+  assert.equal(delWrong.status, 400);
+  assert.ok(sqlite.prepare('SELECT id FROM ledgers WHERE id = ?').get(l2Row.id));
+
+  // 名称匹配时级联删除全子表 + R2 + 吊销令牌并切回账本 1
+  const delRight = await req(`/ledgers/${l2Row.id}/delete`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: l2Cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, confirm_name: '改名后账本' }),
+  });
+  assert.equal(delRight.status, 302);
+  cookieHeader = extractSidCookie(delRight) || cookieHeader;
+  assert.equal(sqlite.prepare('SELECT id FROM ledgers WHERE id = ?').get(l2Row.id), undefined);
+  assert.equal((sqlite.prepare('SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ?').get(l2Row.id) as { c: number }).c, 0);
+  assert.equal((sqlite.prepare('SELECT COUNT(*) AS c FROM splits WHERE ledger_id = ?').get(l2Row.id) as { c: number }).c, 0);
+  assert.equal((sqlite.prepare('SELECT COUNT(*) AS c FROM transaction_tags WHERE transaction_id = ?').get(l2TxnId) as { c: number }).c, 0);
+  assert.equal(r2Store.has(l2Att.rel), false, '删账本应同步删 R2 附件');
+  assert.equal(r2Store.has('imports/failures-777.json'), false, '删账本应同步删 R2 失败报告');
+  const pingRevoked = await req('/api/open/ping', { headers: { Authorization: `Bearer ${l2ApiToken}` } });
+  assert.equal(pingRevoked.status, 401, '绑定被删账本的 API 令牌应自动吊销');
+
+  // 5.2 /admin 重置密码（no-store 一次性结果页 + 旧会话/令牌即时失效）
+  await req('/admin/users', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, username: 'bob', display_name: 'Bob', password: 'oldpass123' }),
+  });
+  const bobUser = sqlite.prepare('SELECT id FROM users WHERE username = ?').get('bob') as { id: number };
+  const bobLogin = await req('/login', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({ username: 'bob', password: 'oldpass123' }),
+  });
+  const bobCookie = extractSidCookie(bobLogin);
+  const adminHtml = await (await req('/admin', { headers: { Cookie: cookieHeader } })).text();
+  assert.ok(adminHtml.includes('重置密码'));
+
+  const resetRes = await req(`/admin/users/${bobUser.id}`, {
+    method: 'POST',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, action: 'reset_password', password: 'newpass999' }),
+  });
+  assert.equal(resetRes.status, 200);
+  assert.equal(resetRes.headers.get('cache-control'), 'no-store');
+  const resetHtml = await resetRes.text();
+  assert.ok(resetHtml.includes('newpass999'));
+  assert.equal((resetRes.headers.get('set-cookie') || '').includes('newpass999'), false, '新密码不得写入 Set-Cookie');
+
+  // Bob 旧 Cookie 失效，新密码可登录
+  assert.equal((await req('/', { redirect: 'manual', headers: { Cookie: bobCookie } })).status, 302);
+  const bobRelogin = await req('/login', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({ username: 'bob', password: 'newpass999' }),
+  });
+  assert.equal(bobRelogin.status, 302);
+
+  // 5.3 /backup/restore 坏包零污染拒绝 + 合法包原子恢复与强制重登
+  const validDump = (await (await req('/export/json', { headers: { Cookie: cookieHeader } })).json()) as {
+    app: string;
+    version: number;
+    tables: Record<string, Array<Record<string, unknown>>>;
+  };
+  const txnCountBefore = (sqlite.prepare('SELECT COUNT(*) AS c FROM transactions').get() as { c: number }).c;
+
+  // 缺少必填字段的坏备份应被前置拦截，不清空现有数据
+  const badBackup = structuredClone(validDump);
+  delete badBackup.tables.categories[0].name;
+  const badRestoreRes = await req('/backup/restore', {
+    method: 'POST',
+    headers: { Cookie: cookieHeader, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backup: badBackup }),
+  });
+  assert.equal(badRestoreRes.status, 400);
+  assert.equal(
+    (sqlite.prepare('SELECT COUNT(*) AS c FROM transactions').get() as { c: number }).c,
+    txnCountBefore,
+    '失败的备份恢复不得影响现有库记录',
+  );
+
+  // 合法恢复成功且全端旧 Cookie 失效
+  const goodRestoreRes = await req('/backup/restore', {
+    method: 'POST',
+    headers: { Cookie: cookieHeader, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backup: validDump }),
+  });
+  assert.equal(goodRestoreRes.status, 200);
+  assert.equal((await req('/', { redirect: 'manual', headers: { Cookie: cookieHeader } })).status, 302);
+  const finalLogin = await req('/login', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({ username: 'alice', password: 'password123' }),
+  });
+  assert.equal(finalLogin.status, 302);
+  cookieHeader = extractSidCookie(finalLogin);
+  csrf = extractCsrf(await (await req('/', { headers: { Cookie: cookieHeader } })).text());
+
+  // 5.4 允许删除最后一个账本并安全进入零账本引导态
+  const delLast = await req('/ledgers/1/delete', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, confirm_name: 'Alice的账本' }),
+  });
+  assert.equal(delLast.status, 302);
+  const lastCookie = extractSidCookie(delLast) || cookieHeader;
+  const zeroLedgerHome = await req('/', { headers: { Cookie: lastCookie } });
+  assert.equal(zeroLedgerHome.status, 200);
+  assert.ok((await zeroLedgerHome.text()).includes('还没有账本'));
 });

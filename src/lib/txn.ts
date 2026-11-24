@@ -814,7 +814,7 @@ export async function splitsOf(db: Db, txnId: number) {
 }
 
 export async function syncDebts(db: Db, ledgerId: number): Promise<void> {
-  const [rows, repayRows] = await Promise.all([
+  const [rows, repayRows, existingAuto] = await Promise.all([
     db.all<TxnRow>(
       `SELECT type, merchant, amount_base_cents, account_id, txn_date FROM transactions
        WHERE ledger_id = ? AND deleted_at IS NULL AND type IN ('lend','borrow')`,
@@ -825,7 +825,12 @@ export async function syncDebts(db: Db, ledgerId: number): Promise<void> {
        WHERE ledger_id = ? AND deleted_at IS NULL AND type IN ('repay_receive','repay_pay')`,
       ledgerId,
     ),
+    db.all<{ direction: string; counterparty: string; due_date: string | null }>(
+      "SELECT direction, counterparty, due_date FROM debts WHERE ledger_id = ? AND note = '系统自动汇总' AND due_date IS NOT NULL",
+      ledgerId,
+    ),
   ]);
+  const dueMap = new Map(existingAuto.map((r) => [`${r.direction}|${r.counterparty}`, r.due_date]));
   const map = new Map<
     string,
     { direction: string; counterparty: string; principal: number; account_id: number | null; earliest: string }
@@ -850,12 +855,13 @@ export async function syncDebts(db: Db, ledgerId: number): Promise<void> {
   }
   const stmts: BatchStatement[] = [["DELETE FROM debts WHERE ledger_id = ? AND note = '系统自动汇总'", [ledgerId]]];
   const now = nowStr();
-  for (const [key, v] of map) {
-    const paid = repay.get(key) || 0;
+  for (const [, v] of map) {
+    const key = `${v.direction}|${v.counterparty}`;
+    const paid = repay.get(`${v.direction === 'receivable' ? 'lend' : 'borrow'}|${v.counterparty}`) || 0;
     const balance = Math.max(0, v.principal - paid);
     stmts.push([
-      `INSERT INTO debts (ledger_id, direction, counterparty, principal_cents, balance_cents, account_id, status, note, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO debts (ledger_id, direction, counterparty, principal_cents, balance_cents, account_id, due_date, status, note, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
       [
         ledgerId,
         v.direction,
@@ -863,6 +869,7 @@ export async function syncDebts(db: Db, ledgerId: number): Promise<void> {
         v.principal,
         balance,
         v.account_id,
+        dueMap.get(key) ?? null,
         balance <= 0 ? 'closed' : 'open',
         '系统自动汇总',
         now,
@@ -931,8 +938,13 @@ export async function subcategoryBreakdown(
   topName: string | null = null,
 ) {
   const types = kind === 'income' ? INCOME_TYPES : EXPENSE_TYPES;
-  let sql = `SELECT c.name AS name, c.icon AS icon, c.color AS color, COALESCE(pc.name,'未分类') AS parent,
-              SUM(t.amount_base_cents) AS total, COUNT(*) AS cnt
+  let sql = `SELECT c.id AS category_id,
+                    COALESCE(c.name, '未分类') AS name,
+                    COALESCE(c.icon, '🏷️') AS icon,
+                    COALESCE(c.color, pc.color, '#8c8c8c') AS color,
+                    COALESCE(pc.name, c.name, '未分类') AS parent,
+                    SUM(t.amount_base_cents) AS total,
+                    COUNT(*) AS cnt
        FROM transactions t
        LEFT JOIN categories c ON c.id = t.category_id
        LEFT JOIN categories pc ON pc.id = c.parent_id
@@ -940,15 +952,25 @@ export async function subcategoryBreakdown(
          AND t.type IN (${types.map(() => '?').join(',')})`;
   const params: unknown[] = [ledgerId, start, end, ...types];
   if (topName) {
-    sql += ' AND COALESCE(pc.name, c.name) = ?';
+    sql += " AND COALESCE(pc.name, c.name, '未分类') = ?";
     params.push(topName);
   }
-  sql += ' GROUP BY c.id ORDER BY total DESC';
-  const rows = await db.all<{ name: string; icon: string; color: string; parent: string; total: number; cnt: number }>(
-    sql,
-    ...params,
-  );
-  return rows.map((r) => ({ ...r, total: Number(r.total), cnt: Number(r.cnt) }));
+  sql += ' GROUP BY COALESCE(c.id, 0) ORDER BY total DESC';
+  const rows = await db.all<{
+    category_id: number | null;
+    name: string;
+    icon: string;
+    color: string;
+    parent: string;
+    total: number;
+    cnt: number;
+  }>(sql, ...params);
+  return rows.map((r) => ({
+    ...r,
+    category_id: r.category_id != null ? Number(r.category_id) : null,
+    total: Number(r.total),
+    cnt: Number(r.cnt),
+  }));
 }
 
 export async function monthlyTrend(

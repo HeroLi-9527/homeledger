@@ -62,18 +62,33 @@ function checkMagicBytes(mime: string, buf: Buffer): void {
   }
 }
 
+export function validateImageBuffer(mimeInput: string, buf: Buffer): { mime: string; ext: string } {
+  const mime = String(mimeInput || '').toLowerCase().split(';')[0].trim();
+  if (!Object.prototype.hasOwnProperty.call(MIME_EXT, mime)) {
+    throw new Error(`不支持的图片类型：${mime || '未知'}`);
+  }
+  if (!buf.length) throw new Error('图片内容为空');
+  if (buf.length > MAX_IMAGE_BYTES) throw new Error('单张图片请小于 8MB');
+  const ext = MIME_EXT[mime];
+  const canonicalMime = EXT_MIME[ext];
+  checkMagicBytes(canonicalMime, buf);
+  return { mime: canonicalMime, ext };
+}
+
+export function inferImageMime(mimeInput: string | null | undefined, fileName?: string | null): string {
+  const clean = String(mimeInput || '').toLowerCase().split(';')[0].trim();
+  if (clean && clean !== 'application/octet-stream') return clean;
+  const m = /\.([a-z0-9]+)$/i.exec(String(fileName || ''));
+  const ext = m ? (m[1].toLowerCase() === 'jpeg' ? 'jpg' : m[1].toLowerCase()) : '';
+  return (ext && EXT_MIME[ext]) || clean;
+}
+
 export function parseDataUrl(dataUrl: string): { mime: string; buf: Buffer } {
   const m = /^data:([^;]+);base64,(.+)$/s.exec(String(dataUrl || '').trim());
   if (!m) throw new Error('图片格式无法识别（需要 data:image/...;base64,xxx）');
-  const mime = m[1].toLowerCase().split(';')[0];
-  if (!Object.prototype.hasOwnProperty.call(MIME_EXT, mime)) {
-    throw new Error(`不支持的图片类型：${mime}`);
-  }
   const buf = Buffer.from(m[2], 'base64');
-  if (!buf.length) throw new Error('图片内容为空');
-  if (buf.length > MAX_IMAGE_BYTES) throw new Error('单张图片请小于 8MB');
-  checkMagicBytes(mime, buf);
-  return { mime: EXT_MIME[MIME_EXT[mime]], buf };
+  const { mime } = validateImageBuffer(m[1], buf);
+  return { mime, buf };
 }
 
 export interface AttachmentRow {
@@ -91,35 +106,39 @@ export interface AttachmentRow {
   url?: string;
 }
 
-export async function saveDataUrlImage(
+export async function saveBufferImage(
   db: Db,
   env: Pick<Env, 'ATTACHMENTS'>,
   {
-    dataUrl,
+    buf,
+    mime: mimeInput,
     ledgerId,
     userId,
+    txnId = null,
     name,
     kind = 'screenshot',
     aiStatus = 'pending',
   }: {
-    dataUrl: string;
+    buf: Buffer;
+    mime: string;
     ledgerId: number;
     userId: number;
+    txnId?: number | null;
     name?: string;
     kind?: string;
     aiStatus?: string;
   },
 ) {
-  const { mime, buf } = parseDataUrl(dataUrl);
-  const ext = MIME_EXT[mime] || 'png';
+  const { mime, ext } = validateImageBuffer(mimeInput, buf);
   const ym = todayStr().slice(0, 4) + todayStr().slice(5, 7);
   const fileName = `${Date.now()}_${uid(8)}.${ext}`;
   const key = `uploads/${ym}/${fileName}`;
   await env.ATTACHMENTS.put(key, buf, { httpMetadata: { contentType: mime } });
   const info = await db.run(
     `INSERT INTO attachments (ledger_id, txn_id, user_id, kind, file_name, rel_path, mime, size, ai_status, created_at)
-     VALUES (?,NULL,?,?,?,?,?,?,?,?)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
     Number(ledgerId),
+    txnId != null ? Number(txnId) : null,
     Number(userId),
     kind,
     name || fileName,
@@ -136,7 +155,33 @@ export async function saveDataUrlImage(
     size: buf.length,
     mime,
     file_name: name || fileName,
+    txn_id: txnId != null ? Number(txnId) : null,
   };
+}
+
+export async function saveDataUrlImage(
+  db: Db,
+  env: Pick<Env, 'ATTACHMENTS'>,
+  {
+    dataUrl,
+    ledgerId,
+    userId,
+    txnId = null,
+    name,
+    kind = 'screenshot',
+    aiStatus = 'pending',
+  }: {
+    dataUrl: string;
+    ledgerId: number;
+    userId: number;
+    txnId?: number | null;
+    name?: string;
+    kind?: string;
+    aiStatus?: string;
+  },
+) {
+  const { mime, buf } = parseDataUrl(dataUrl);
+  return saveBufferImage(db, env, { buf, mime, ledgerId, userId, txnId, name, kind, aiStatus });
 }
 
 export async function linkImagesToTxns(
@@ -241,7 +286,9 @@ export async function resolveObject(env: Pick<Env, 'ATTACHMENTS'>, ledgerId: num
 
 export async function deleteKeysFromR2(env: Pick<Env, 'ATTACHMENTS'> | undefined, keys: string[]): Promise<void> {
   if (!env?.ATTACHMENTS) return;
-  const valid = keys.filter((k) => k && k.startsWith('uploads/') && !k.includes('..'));
+  const valid = keys.filter(
+    (k) => k && (k.startsWith('uploads/') || k.startsWith('imports/')) && !k.includes('..') && !k.includes('\\'),
+  );
   for (let i = 0; i < valid.length; i += 1000) {
     try {
       await env.ATTACHMENTS.delete(valid.slice(i, i + 1000));

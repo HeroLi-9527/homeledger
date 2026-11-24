@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { nowStr, todayStr } from '../db.js';
+import { accountOptionsHtml } from '../lib/accounts.js';
 import { ledgerWriterIds, notify } from '../lib/auth.js';
 import { progressBar } from '../lib/charts.js';
 import * as fd from '../lib/formdata.js';
@@ -215,6 +216,62 @@ planningRoutes.post('/budgets/:id/delete', async (c) => {
 });
 
 // ---- 周期账单 ----
+interface RecurringItemRow {
+  type: string;
+  amount_cents: number;
+  category_id: number | null;
+  account_id: number | null;
+  note: string;
+  currency?: string;
+}
+
+function parseRecurringPayload(raw: string): { items: RecurringItemRow[]; user_id?: number } {
+  try {
+    const p = JSON.parse(raw || '{}') as RecurringItemRow[] | { items?: RecurringItemRow[]; user_id?: number };
+    if (Array.isArray(p)) return { items: p };
+    if (Array.isArray(p.items)) return { items: p.items, user_id: p.user_id };
+    return { items: [p as RecurringItemRow], user_id: (p as { user_id?: number }).user_id };
+  } catch {
+    return { items: [] };
+  }
+}
+
+function readRecurringItems(body: Record<string, unknown>, fallbackNote: string): RecurringItemRow[] {
+  const types = ([] as unknown[]).concat(body.item_type || []);
+  const amounts = ([] as unknown[]).concat(body.item_amount || []);
+  const cats = ([] as unknown[]).concat(body.item_category_id || []);
+  const accs = ([] as unknown[]).concat(body.item_account_id || []);
+  const notes = ([] as unknown[]).concat(body.item_note || []);
+  const items: RecurringItemRow[] = [];
+  types.forEach((t, i) => {
+    const amt = Math.abs(u.parseAmountToCents(amounts[i]));
+    if (!amt) return;
+    items.push({
+      type: t === 'income' ? 'income' : 'expense',
+      amount_cents: amt,
+      category_id: cats[i] ? Number(cats[i]) : null,
+      account_id: accs[i] ? Number(accs[i]) : null,
+      note: String(notes[i] || fallbackNote),
+      currency: 'CNY',
+    });
+  });
+  return items;
+}
+
+function renderRecurringItemRow(
+  item: Partial<RecurringItemRow>,
+  cats: Array<CategoryRow & { path: string }>,
+  accounts: AccountRow[],
+): string {
+  return `<div class="grid grid-5 mb8 recurring-item-row">
+  <select name="item_type"><option value="expense" ${item.type !== 'income' ? 'selected' : ''}>支出</option><option value="income" ${item.type === 'income' ? 'selected' : ''}>收入</option></select>
+  <input name="item_amount" placeholder="金额（元）" inputmode="decimal" value="${item.amount_cents ? (Math.abs(Number(item.amount_cents)) / 100).toFixed(2) : ''}">
+  <select name="item_category_id"><option value="">分类</option>${cats.map((cc) => `<option value="${cc.id}" ${Number(item.category_id) === Number(cc.id) ? 'selected' : ''}>${esc(cc.path)}</option>`).join('')}</select>
+  <select name="item_account_id">${accountOptionsHtml(accounts, { selectedId: item.account_id, emptyLabel: '账户' })}</select>
+  <div class="row"><input name="item_note" placeholder="备注" value="${esc(item.note || '')}"><button type="button" class="btn btn-sm btn-ghost del-rec-item" title="移除明细">✕</button></div>
+</div>`;
+}
+
 planningRoutes.get('/recurring', async (c) => {
   const r = requireLedger(c);
   if (r) return r;
@@ -230,18 +287,15 @@ planningRoutes.get('/recurring', async (c) => {
   const bodyRows =
     rows
       .map((x) => {
-        let items: Array<{ amount_cents?: number }> = [];
-        try {
-          const p = JSON.parse(x.payload || '{}');
-          items = Array.isArray(p) ? p : Array.isArray(p.items) ? p.items : [p];
-        } catch {
-          items = [];
-        }
+        const items = parseRecurringPayload(x.payload).items;
         const total = items.reduce((s, i) => s + Math.abs(Number(i.amount_cents) || 0), 0);
         return `<tr><td><b>${esc(x.name)}</b></td><td class="num amount">${fmtAmount(total)}</td><td>${esc(x.frequency)}</td><td>${esc(x.next_run_at)}</td><td><span class="chip">${x.is_active ? '启用' : '停用'}</span></td>
-<td><form method="post" action="/recurring/${x.id}/run" style="display:inline">${csrfInput(c)}<input type="hidden" name="next_run_at" value="${esc(x.next_run_at)}"><button class="btn btn-sm" type="submit">立即执行</button></form>
-<form method="post" action="/recurring/${x.id}/toggle" style="display:inline">${csrfInput(c)}<button class="btn btn-sm" type="submit">${x.is_active ? '停用' : '启用'}</button></form>
-<form method="post" action="/recurring/${x.id}/delete" style="display:inline">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form></td></tr>`;
+<td><div class="row wrap">
+  <a class="btn btn-sm" href="/recurring/${x.id}/edit">编辑</a>
+  <form method="post" action="/recurring/${x.id}/run" style="display:inline">${csrfInput(c)}<input type="hidden" name="next_run_at" value="${esc(x.next_run_at)}"><button class="btn btn-sm" type="submit">立即执行</button></form>
+  <form method="post" action="/recurring/${x.id}/toggle" style="display:inline">${csrfInput(c)}<button class="btn btn-sm" type="submit">${x.is_active ? '停用' : '启用'}</button></form>
+  <form method="post" action="/recurring/${x.id}/delete" style="display:inline" data-confirm="确认删除该周期账单？">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
+</div></td></tr>`;
       })
       .join('') || '<tr><td colspan="6">暂无周期账单</td></tr>';
 
@@ -257,7 +311,7 @@ planningRoutes.get('/recurring', async (c) => {
       body:
         simpleTable('周期账单', ['名称', '金额', '频率', '下次执行', '状态', '操作'], bodyRows) +
         `<div class="card mt16"><div class="card-head"><b>新建周期账单</b></div>
-<form method="post" action="/recurring">${csrfInput(c)}
+<form method="post" action="/recurring" data-recurring-form>${csrfInput(c)}
   <div class="grid grid-3">
     <input name="name" placeholder="名称，如：房租" required>
     <select name="frequency"><option value="monthly">每月</option><option value="weekly">每周</option><option value="daily">每天</option><option value="yearly">每年</option></select>
@@ -265,20 +319,66 @@ planningRoutes.get('/recurring', async (c) => {
     <input name="day_of_month" type="number" min="1" max="31" placeholder="每月几号（默认取下次执行日）">
     <input type="date" name="next_run_at" value="${todayStr()}">
   </div>
-  <div class="mt12">
-    ${[0, 1]
-      .map(
-        () => `<div class="grid grid-5 mb8">
-  <select name="item_type"><option value="expense">支出</option><option value="income">收入</option></select>
-  <input name="item_amount" placeholder="金额（元）" inputmode="decimal">
-  <select name="item_category_id"><option value="">分类</option>${cats.map((cc) => `<option value="${cc.id}">${esc(cc.path)}</option>`).join('')}</select>
-  <select name="item_account_id"><option value="">账户</option>${accounts.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
-  <input name="item_note" placeholder="备注">
-</div>`,
-      )
-      .join('')}
+  <div class="mt12" data-rec-items>
+    ${[0, 1].map(() => renderRecurringItemRow({}, cats, accounts)).join('')}
   </div>
-  <div class="row mt12"><label class="check"><input type="checkbox" name="auto_post" checked> 到期自动入账</label><button class="btn btn-primary" type="submit">创建</button></div>
+  <div class="row mt12 wrap">
+    <button class="btn btn-sm" type="button" data-add-rec-item>+ 添加明细</button>
+    <label class="check"><input type="checkbox" name="auto_post" checked> 到期自动入账</label>
+    <span class="spacer"></span>
+    <button class="btn btn-primary" type="submit">创建</button>
+  </div>
+</form></div>`,
+    }),
+  );
+});
+
+planningRoutes.get('/recurring/:id/edit', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const meta = await siteMeta(c);
+  const lid = ledgerId(c);
+  const id = Number(c.req.param('id'));
+  const rule = await db.get<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, lid);
+  if (!rule) return c.redirect('/recurring');
+  const [accounts, cats] = await Promise.all([fd.accounts(db, lid), fd.flatCategories(db, lid)]);
+  const parsed = parseRecurringPayload(rule.payload);
+  const rows = [...parsed.items, {}];
+  return c.html(
+    layout({
+      title: '编辑周期账单',
+      activeNav: 'recurring',
+      ctx,
+      siteName: meta.siteName,
+      csrf: c.get('csrf') || '',
+      cspNonce: c.get('cspNonce'),
+      flash: takeFlash(c),
+      body: `<div class="card"><div class="card-head"><b>编辑周期账单：${esc(rule.name)}</b><a class="btn btn-sm" href="/recurring">← 返回列表</a></div>
+<form method="post" action="/recurring/${rule.id}" data-recurring-form>${csrfInput(c)}
+  <div class="grid grid-3">
+    <div class="field"><label>名称</label><input name="name" value="${esc(rule.name)}" required></div>
+    <div class="field"><label>频率</label><select name="frequency"><option value="monthly" ${rule.frequency === 'monthly' ? 'selected' : ''}>每月</option><option value="weekly" ${rule.frequency === 'weekly' ? 'selected' : ''}>每周</option><option value="daily" ${rule.frequency === 'daily' ? 'selected' : ''}>每天</option><option value="yearly" ${rule.frequency === 'yearly' ? 'selected' : ''}>每年</option></select></div>
+    <div class="field"><label>间隔</label><input name="interval_n" type="number" min="1" value="${rule.interval_n || 1}"></div>
+    <div class="field"><label>每月几号（1-31）</label><input name="day_of_month" type="number" min="1" max="31" value="${rule.day_of_month ?? ''}"></div>
+    <div class="field"><label>下次执行日期</label><input type="date" name="next_run_at" value="${esc(rule.next_run_at)}"></div>
+    <div class="field" style="justify-content:flex-end">
+      <div class="row wrap">
+        <label class="check"><input type="checkbox" name="auto_post" value="1" ${rule.auto_post ? 'checked' : ''}> 到期自动入账</label>
+        <label class="check"><input type="checkbox" name="is_active" value="1" ${rule.is_active ? 'checked' : ''}> 启用</label>
+      </div>
+    </div>
+  </div>
+  <div class="mt12" data-rec-items>
+    ${rows.map((item) => renderRecurringItemRow(item, cats, accounts)).join('')}
+  </div>
+  <div class="row mt12 wrap">
+    <button class="btn btn-sm" type="button" data-add-rec-item>+ 添加明细</button>
+    <span class="spacer"></span>
+    <a class="btn" href="/recurring">取消</a>
+    <button class="btn btn-primary" type="submit">保存修改</button>
+  </div>
 </form></div>`,
     }),
   );
@@ -295,24 +395,7 @@ planningRoutes.post('/recurring', async (c) => {
     setFlash(c, 'error', '请填写名称');
     return c.redirect('/recurring');
   }
-  const types = ([] as unknown[]).concat(body.item_type || []);
-  const amounts = ([] as unknown[]).concat(body.item_amount || []);
-  const cats = ([] as unknown[]).concat(body.item_category_id || []);
-  const accs = ([] as unknown[]).concat(body.item_account_id || []);
-  const notes = ([] as unknown[]).concat(body.item_note || []);
-  const items: Array<Record<string, unknown>> = [];
-  types.forEach((t, i) => {
-    const amt = u.parseAmountToCents(amounts[i]);
-    if (!amt) return;
-    items.push({
-      type: t || 'expense',
-      amount_cents: amt,
-      category_id: cats[i] ? Number(cats[i]) : null,
-      account_id: accs[i] ? Number(accs[i]) : null,
-      note: notes[i] || name,
-      currency: 'CNY',
-    });
-  });
+  const items = readRecurringItems(body, name);
   if (!items.length) {
     setFlash(c, 'error', '请至少填写一项金额');
     return c.redirect('/recurring');
@@ -341,6 +424,57 @@ planningRoutes.post('/recurring', async (c) => {
     nowStr(),
   );
   setFlash(c, 'success', `周期账单「${name}」已创建，下次执行 ${next}`);
+  return c.redirect('/recurring');
+});
+
+planningRoutes.post('/recurring/:id', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const id = Number(c.req.param('id'));
+  const lid = ledgerId(c);
+  const old = await db.get<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, lid);
+  if (!old) return c.redirect('/recurring');
+  const body = await bodyOf(c);
+  const name = String(body.name || '').trim();
+  if (!name) {
+    setFlash(c, 'error', '请填写周期账单名称');
+    return c.redirect(`/recurring/${id}/edit`);
+  }
+  const items = readRecurringItems(body, name);
+  if (!items.length) {
+    setFlash(c, 'error', '请至少保留一项有效金额的明细');
+    return c.redirect(`/recurring/${id}/edit`);
+  }
+  const frequency = ['daily', 'weekly', 'monthly', 'yearly'].includes(String(body.frequency))
+    ? String(body.frequency)
+    : old.frequency;
+  const intervalN = Math.max(1, Number(body.interval_n) || 1);
+  const dayOfMonth = body.day_of_month ? Math.max(1, Math.min(31, Number(body.day_of_month))) : null;
+  const rawNext = /^\d{4}-\d{2}-\d{2}$/.test(String(body.next_run_at || '')) ? String(body.next_run_at) : old.next_run_at;
+  let next = rawNext;
+  if (rawNext !== old.next_run_at) {
+    let guard = 0;
+    while (next < todayStr() && guard++ < 400) {
+      next = advanceDate(next, { frequency, interval_n: intervalN, day_of_month: dayOfMonth });
+    }
+  }
+  const prevPayload = parseRecurringPayload(old.payload);
+  await db.run(
+    'UPDATE recurring_rules SET name=?, payload=?, frequency=?, interval_n=?, day_of_month=?, next_run_at=?, auto_post=?, is_active=? WHERE id=? AND ledger_id=?',
+    name.slice(0, 40),
+    JSON.stringify({ items, user_id: prevPayload.user_id || old.created_by_user_id || ctx.user!.id }),
+    frequency,
+    intervalN,
+    dayOfMonth || Number(next.slice(8, 10)),
+    next,
+    body.auto_post ? 1 : 0,
+    body.is_active ? 1 : 0,
+    id,
+    lid,
+  );
+  setFlash(c, 'success', '周期账单已更新');
   return c.redirect('/recurring');
 });
 
@@ -393,6 +527,19 @@ planningRoutes.post('/recurring/:id/delete', async (c) => {
 });
 
 // ---- 借贷台账 ----
+interface DebtRow {
+  id: number;
+  ledger_id: number;
+  direction: string;
+  counterparty: string;
+  principal_cents: number;
+  balance_cents: number;
+  account_id: number | null;
+  due_date: string | null;
+  status: string;
+  note: string | null;
+}
+
 planningRoutes.get('/debts', async (c) => {
   const r = requireLedger(c);
   if (r) return r;
@@ -401,33 +548,35 @@ planningRoutes.get('/debts', async (c) => {
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
   const [rows, accounts] = await Promise.all([
-    db.all<{ id: number; direction: string; counterparty: string; principal_cents: number; balance_cents: number; account_id: number | null; due_date: string | null; status: string; note: string | null }>(
-      'SELECT * FROM debts WHERE ledger_id = ? ORDER BY status, id DESC',
-      lid,
-    ),
+    db.all<DebtRow>('SELECT * FROM debts WHERE ledger_id = ? ORDER BY status, id DESC', lid),
     fd.accounts(db, lid),
   ]);
   const bodyRows =
     rows
-      .map(
-        (d) => `<tr>
-  <td><b>${esc(d.counterparty)}</b>${d.note === '系统自动汇总' ? ' <span class="chip">自动汇总</span>' : ''}</td>
+      .map((d) => {
+        const isAuto = d.note === '系统自动汇总';
+        return `<tr>
+  <td><b>${esc(d.counterparty)}</b>${isAuto ? ' <span class="chip">自动汇总</span>' : ''}</td>
   <td><span class="chip ${d.direction === 'receivable' ? 'income' : 'expense'}">${d.direction === 'receivable' ? '借出/应收' : '借入/应付'}</span></td>
   <td class="num amount">${fmtAmount(d.principal_cents)}</td>
   <td class="num amount">${fmtAmount(d.balance_cents)}</td>
   <td>${esc(d.due_date || '—')}</td>
   <td>${d.status === 'open' ? '进行中' : '已结清'}</td>
-  <td>${
-    d.status === 'open'
-      ? `<form method="post" action="/debts/${d.id}/settle" class="row" style="display:inline-flex">${csrfInput(c)}<input name="amount" placeholder="金额" inputmode="decimal" style="width:90px"><select name="account_id" style="width:auto">${accounts.map((a) => `<option value="${a.id}" ${Number(d.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn btn-sm btn-primary" type="submit">结清</button></form>`
-      : ''
-  } ${
-    d.note === '系统自动汇总'
-      ? ''
-      : `<form method="post" action="/debts/${d.id}/delete" style="display:inline">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>`
-  }</td>
-</tr>`,
-      )
+  <td><div class="row wrap">
+    ${
+      d.status === 'open'
+        ? `<form method="post" action="/debts/${d.id}/settle" class="row" style="display:inline-flex">${csrfInput(c)}<input name="amount" placeholder="金额" inputmode="decimal" style="width:90px"><select name="account_id" style="width:auto">${accounts.map((a) => `<option value="${a.id}" ${Number(d.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn btn-sm btn-primary" type="submit">结清</button></form>`
+        : ''
+    }
+    <a class="btn btn-sm" href="/debts/${d.id}/edit">${isAuto ? '设到期日' : '编辑'}</a>
+    ${
+      isAuto
+        ? `<a class="btn btn-sm btn-ghost" href="/transactions?q=${encodeURIComponent(d.counterparty)}">关联流水</a>`
+        : `<form method="post" action="/debts/${d.id}/delete" style="display:inline" data-confirm="确认删除该借贷台账？">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>`
+    }
+  </div></td>
+</tr>`;
+      })
       .join('') || '<tr><td colspan="7">暂无借贷台账</td></tr>';
 
   return c.html(
@@ -448,10 +597,67 @@ planningRoutes.get('/debts', async (c) => {
     <input name="counterparty" placeholder="对方姓名" required>
     <input name="amount" placeholder="金额（元）" inputmode="decimal" required>
     <input type="date" name="due_date">
-    <select name="account_id"><option value="">关联账户</option>${accounts.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
+    <select name="account_id">${accountOptionsHtml(accounts, { emptyLabel: '关联账户' })}</select>
     <input name="note" placeholder="备注">
   </div>
   <div class="row mt12"><label class="check"><input type="checkbox" name="create_txn" value="1" checked> 同时生成账户流水</label><button class="btn btn-primary" type="submit">创建</button></div>
+</form></div>`,
+    }),
+  );
+});
+
+planningRoutes.get('/debts/:id/edit', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const meta = await siteMeta(c);
+  const lid = ledgerId(c);
+  const id = Number(c.req.param('id'));
+  const d = await db.get<DebtRow>('SELECT * FROM debts WHERE id = ? AND ledger_id = ?', id, lid);
+  if (!d) return c.redirect('/debts');
+  const accounts = await fd.accounts(db, lid);
+  const isAuto = d.note === '系统自动汇总';
+
+  return c.html(
+    layout({
+      title: isAuto ? '设置借贷到期日' : '编辑借贷台账',
+      activeNav: 'debts',
+      ctx,
+      siteName: meta.siteName,
+      csrf: c.get('csrf') || '',
+      cspNonce: c.get('cspNonce'),
+      flash: takeFlash(c),
+      body: isAuto
+        ? `<div class="card"><div class="card-head"><b>自动汇总借贷：${esc(d.counterparty)}</b><a class="btn btn-sm" href="/debts">← 返回列表</a></div>
+<div class="notice mb16">该借贷由「借出 / 借入」与「收款 / 还款」流水自动汇总生成，本金与余额不可直接修改。如需调整金额请前往修改对应流水；此处可设置或清空到期日（用于到期提醒并在重算时自动保留）。</div>
+<div class="kpi-grid mb16">
+  <div class="stat"><div class="label">方向</div><div class="value" style="font-size:18px">${d.direction === 'receivable' ? '借出（应收）' : '借入（应付）'}</div></div>
+  <div class="stat"><div class="label">本金</div><div class="value amount">${fmtAmount(d.principal_cents)}</div></div>
+  <div class="stat"><div class="label">待还/待收</div><div class="value amount">${fmtAmount(d.balance_cents)}</div></div>
+  <div class="stat"><div class="label">状态</div><div class="value" style="font-size:18px">${d.status === 'open' ? '进行中' : '已结清'}</div></div>
+</div>
+<form method="post" action="/debts/${d.id}">${csrfInput(c)}
+  <div class="field" style="max-width:260px"><label>到期日（留空则清除）</label><input type="date" name="due_date" value="${esc(d.due_date || '')}"></div>
+  <div class="row mt12 wrap">
+    <button class="btn btn-primary" type="submit">保存到期日</button>
+    <a class="btn" href="/transactions?q=${encodeURIComponent(d.counterparty)}">查看关联流水 →</a>
+    <a class="btn btn-ghost" href="/debts">取消</a>
+  </div>
+</form></div>`
+        : `<div class="card"><div class="card-head"><b>编辑借贷台账：${esc(d.counterparty)}</b><a class="btn btn-sm" href="/debts">← 返回列表</a></div>
+<form method="post" action="/debts/${d.id}">${csrfInput(c)}
+  <div class="grid grid-2">
+    <div class="field"><label>方向</label><select name="direction"><option value="receivable" ${d.direction === 'receivable' ? 'selected' : ''}>借出（应收）</option><option value="payable" ${d.direction === 'payable' ? 'selected' : ''}>借入（应付）</option></select></div>
+    <div class="field"><label>对方姓名</label><input name="counterparty" value="${esc(d.counterparty)}" required></div>
+    <div class="field"><label>本金（元）</label><input name="principal" inputmode="decimal" value="${(Number(d.principal_cents) / 100).toFixed(2)}" required></div>
+    <div class="field"><label>待还 / 待收余额（元）</label><input name="balance" inputmode="decimal" value="${(Number(d.balance_cents) / 100).toFixed(2)}" required></div>
+    <div class="field"><label>关联账户</label><select name="account_id">${accountOptionsHtml(accounts, { selectedId: d.account_id, emptyLabel: '无关联账户' })}</select></div>
+    <div class="field"><label>到期日</label><input type="date" name="due_date" value="${esc(d.due_date || '')}"></div>
+    <div class="field"><label>状态</label><select name="status"><option value="open" ${d.status === 'open' ? 'selected' : ''}>进行中</option><option value="closed" ${d.status === 'closed' ? 'selected' : ''}>已结清</option></select></div>
+    <div class="field"><label>备注</label><input name="note" value="${esc(d.note || '')}"></div>
+  </div>
+  <div class="row mt12"><button class="btn btn-primary" type="submit">保存修改</button><a class="btn" href="/debts">取消</a></div>
 </form></div>`,
     }),
   );
@@ -470,6 +676,8 @@ planningRoutes.post('/debts', async (c) => {
     return c.redirect('/debts');
   }
   const direction = body.direction === 'payable' ? 'payable' : 'receivable';
+  const dueDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.due_date || '')) ? String(body.due_date) : null;
+  const cleanName = counterparty.slice(0, 30);
   if (body.create_txn) {
     const accountId = body.account_id ? Number(body.account_id) : 0;
     if (!accountId) {
@@ -481,27 +689,97 @@ planningRoutes.post('/debts', async (c) => {
       amount_cents: amount,
       account_id: accountId,
       txn_date: String(body.date || todayStr()),
-      merchant: counterparty.slice(0, 30),
+      merchant: cleanName,
       note: String(body.note || (direction === 'receivable' ? '借出' : '借入')),
       source: 'manual',
     });
+    if (dueDate) {
+      await db.run(
+        "UPDATE debts SET due_date = ? WHERE ledger_id = ? AND direction = ? AND counterparty = ? AND note = '系统自动汇总'",
+        dueDate,
+        ledgerId(c),
+        direction,
+        cleanName,
+      );
+    }
     setFlash(c, 'success', '已记一笔并同步到借贷台账');
+    return c.redirect('/debts');
+  }
+  const rawNote = String(body.note || '').trim();
+  if (rawNote === '系统自动汇总') {
+    setFlash(c, 'error', '备注不能使用系统保留关键字「系统自动汇总」');
     return c.redirect('/debts');
   }
   await db.run(
     'INSERT INTO debts (ledger_id, direction, counterparty, principal_cents, balance_cents, account_id, due_date, status, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
     ledgerId(c),
     direction,
-    counterparty.slice(0, 30),
+    cleanName,
     amount,
     amount,
     body.account_id ? Number(body.account_id) : null,
-    body.due_date || null,
+    dueDate,
     'open',
-    String(body.note || ''),
+    rawNote.slice(0, 200),
     nowStr(),
   );
   await txn.syncDebts(db, ledgerId(c));
+  return c.redirect('/debts');
+});
+
+planningRoutes.post('/debts/:id', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const lid = ledgerId(c);
+  const id = Number(c.req.param('id'));
+  const d = await db.get<DebtRow>('SELECT * FROM debts WHERE id = ? AND ledger_id = ?', id, lid);
+  if (!d) return c.redirect('/debts');
+  const body = await bodyOf(c);
+  const dueRaw = String(body.due_date || '').trim();
+  if (dueRaw && !/^\d{4}-\d{2}-\d{2}$/.test(dueRaw)) {
+    setFlash(c, 'error', '到期日格式不正确');
+    return c.redirect(`/debts/${id}/edit`);
+  }
+  const dueDate = dueRaw || null;
+
+  if (d.note === '系统自动汇总') {
+    await db.run('UPDATE debts SET due_date = ? WHERE id = ? AND ledger_id = ?', dueDate, id, lid);
+    setFlash(c, 'success', '自动汇总借贷到期日已更新');
+    return c.redirect('/debts');
+  }
+
+  const counterparty = String(body.counterparty || '').trim().slice(0, 30);
+  const principal = Math.abs(u.parseAmountToCents(body.principal));
+  const balance =
+    body.balance !== undefined && String(body.balance).trim() !== ''
+      ? Math.max(0, u.parseAmountToCents(body.balance))
+      : Number(d.balance_cents);
+  if (!counterparty || !principal) {
+    setFlash(c, 'error', '请填写对方姓名与有效本金');
+    return c.redirect(`/debts/${id}/edit`);
+  }
+  const note = String(body.note || '').trim().slice(0, 200);
+  if (note === '系统自动汇总') {
+    setFlash(c, 'error', '备注不能使用系统保留关键字「系统自动汇总」');
+    return c.redirect(`/debts/${id}/edit`);
+  }
+  const direction = body.direction === 'payable' ? 'payable' : 'receivable';
+  const status = balance === 0 || body.status === 'closed' ? 'closed' : 'open';
+  await db.run(
+    'UPDATE debts SET direction=?, counterparty=?, principal_cents=?, balance_cents=?, account_id=?, due_date=?, status=?, note=? WHERE id=? AND ledger_id=?',
+    direction,
+    counterparty,
+    principal,
+    balance,
+    body.account_id ? Number(body.account_id) : null,
+    dueDate,
+    status,
+    note,
+    id,
+    lid,
+  );
+  setFlash(c, 'success', '借贷记录已更新');
   return c.redirect('/debts');
 });
 
@@ -552,6 +830,20 @@ planningRoutes.post('/debts/:id/delete', async (c) => {
 });
 
 // ---- 储蓄目标 ----
+interface GoalRow {
+  id: number;
+  ledger_id: number;
+  name: string;
+  icon: string;
+  target_cents: number;
+  saved_cents: number;
+  account_id: number | null;
+  target_date: string | null;
+  status: string;
+  note: string | null;
+  account_name?: string | null;
+}
+
 planningRoutes.get('/goals', async (c) => {
   const r = requireLedger(c);
   if (r) return r;
@@ -560,7 +852,7 @@ planningRoutes.get('/goals', async (c) => {
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
   const [rows, accounts] = await Promise.all([
-    db.all<{ id: number; name: string; icon: string; target_cents: number; saved_cents: number; account_id: number | null; target_date: string | null; status: string; account_name: string | null }>(
+    db.all<GoalRow>(
       'SELECT g.*, a.name AS account_name FROM goals g LEFT JOIN accounts a ON a.id = g.account_id WHERE g.ledger_id = ? ORDER BY g.status, g.id DESC',
       lid,
     ),
@@ -577,8 +869,11 @@ planningRoutes.get('/goals', async (c) => {
   <td style="min-width:140px">${progressBar(g.saved_cents, g.target_cents)} <span class="tiny muted">${pct}%</span></td>
   <td>${esc(g.target_date || '—')}</td>
   <td><span class="chip ${g.status === 'completed' ? 'income' : ''}">${g.status === 'completed' ? '已完成' : '进行中'}</span></td>
-  <td><form method="post" action="/goals/${g.id}/deposit" class="row" style="display:inline-flex">${csrfInput(c)}<input name="amount" placeholder="存入（元）" inputmode="decimal" style="width:90px"><select name="account_id" style="width:auto"><option value="">账户</option>${accounts.map((a) => `<option value="${a.id}" ${Number(g.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><label class="check tiny"><input type="checkbox" name="create_txn" value="1" checked>记流水</label><button class="btn btn-sm btn-primary" type="submit">存入</button></form>
-<form method="post" action="/goals/${g.id}/delete" style="display:inline">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form></td>
+  <td><div class="row wrap">
+    <form method="post" action="/goals/${g.id}/deposit" class="row" style="display:inline-flex">${csrfInput(c)}<input name="amount" placeholder="存入（元）" inputmode="decimal" style="width:90px"><select name="account_id" style="width:auto"><option value="">账户</option>${accounts.map((a) => `<option value="${a.id}" ${Number(g.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><label class="check tiny"><input type="checkbox" name="create_txn" value="1" checked>记流水</label><button class="btn btn-sm btn-primary" type="submit">存入</button></form>
+    <a class="btn btn-sm" href="/goals/${g.id}/edit">编辑</a>
+    <form method="post" action="/goals/${g.id}/delete" style="display:inline" data-confirm="确认删除该储蓄目标？">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
+  </div></td>
 </tr>`;
       })
       .join('') || '<tr><td colspan="7">暂无储蓄目标</td></tr>';
@@ -601,13 +896,85 @@ planningRoutes.get('/goals', async (c) => {
     <input name="target" placeholder="目标金额（元）" inputmode="decimal" required>
     <input type="date" name="target_date">
     <input name="saved_amount" placeholder="已存金额（元，可空）" inputmode="decimal">
-    <select name="account_id"><option value="">关联账户（可选）</option>${accounts.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
+    <select name="account_id">${accountOptionsHtml(accounts, { emptyLabel: '关联账户（可选）' })}</select>
     <input name="note" placeholder="备注">
   </div>
   <div class="row mt12"><button class="btn btn-primary" type="submit">创建目标</button></div>
 </form></div>`,
     }),
   );
+});
+
+planningRoutes.get('/goals/:id/edit', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const meta = await siteMeta(c);
+  const lid = ledgerId(c);
+  const id = Number(c.req.param('id'));
+  const g = await db.get<GoalRow>('SELECT * FROM goals WHERE id = ? AND ledger_id = ?', id, lid);
+  if (!g) return c.redirect('/goals');
+  const accounts = await fd.accounts(db, lid);
+  return c.html(
+    layout({
+      title: '编辑储蓄目标',
+      activeNav: 'goals',
+      ctx,
+      siteName: meta.siteName,
+      csrf: c.get('csrf') || '',
+      cspNonce: c.get('cspNonce'),
+      flash: takeFlash(c),
+      body: `<div class="card"><div class="card-head"><b>编辑储蓄目标：${esc(g.name)}</b><a class="btn btn-sm" href="/goals">← 返回列表</a></div>
+<div class="notice mb16">此处修改「已存金额」仅直接更新目标进度，不会自动生成账户收支流水；如需记账请返回列表使用「存入」。</div>
+<form method="post" action="/goals/${g.id}">${csrfInput(c)}
+  <div class="grid grid-2">
+    <div class="field"><label>目标名称</label><input name="name" value="${esc(g.name)}" required></div>
+    <div class="field"><label>图标</label><input name="icon" value="${esc(g.icon || '🎯')}"></div>
+    <div class="field"><label>目标金额（元）</label><input name="target" inputmode="decimal" value="${(Number(g.target_cents) / 100).toFixed(2)}" required></div>
+    <div class="field"><label>已存金额（元）</label><input name="saved_amount" inputmode="decimal" value="${(Number(g.saved_cents) / 100).toFixed(2)}"></div>
+    <div class="field"><label>关联账户</label><select name="account_id">${accountOptionsHtml(accounts, { selectedId: g.account_id, emptyLabel: '无关联账户' })}</select></div>
+    <div class="field"><label>目标日期</label><input type="date" name="target_date" value="${esc(g.target_date || '')}"></div>
+  </div>
+  <div class="field"><label>备注</label><input name="note" value="${esc(g.note || '')}"></div>
+  <div class="row mt12"><button class="btn btn-primary" type="submit">保存修改</button><a class="btn" href="/goals">取消</a></div>
+</form></div>`,
+    }),
+  );
+});
+
+planningRoutes.post('/goals/:id', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const lid = ledgerId(c);
+  const id = Number(c.req.param('id'));
+  const g = await db.get<GoalRow>('SELECT * FROM goals WHERE id = ? AND ledger_id = ?', id, lid);
+  if (!g) return c.redirect('/goals');
+  const body = await bodyOf(c);
+  const name = String(body.name || '').trim().slice(0, 30);
+  const target = Math.abs(u.parseAmountToCents(body.target));
+  if (!name || !target) {
+    setFlash(c, 'error', '请填写目标名称与大于 0 的目标金额');
+    return c.redirect(`/goals/${id}/edit`);
+  }
+  const saved = Math.max(0, u.parseAmountToCents(body.saved_amount));
+  const status = saved >= target ? 'completed' : 'active';
+  await db.run(
+    'UPDATE goals SET name=?, icon=?, target_cents=?, saved_cents=?, account_id=?, target_date=?, status=?, note=? WHERE id=? AND ledger_id=?',
+    name,
+    String(body.icon || '🎯').slice(0, 8) || '🎯',
+    target,
+    saved,
+    body.account_id ? Number(body.account_id) : null,
+    body.target_date || null,
+    status,
+    body.note ? String(body.note).slice(0, 200) : null,
+    id,
+    lid,
+  );
+  setFlash(c, 'success', '储蓄目标已更新');
+  return c.redirect('/goals');
 });
 
 planningRoutes.post('/goals', async (c) => {

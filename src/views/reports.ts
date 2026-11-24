@@ -1,16 +1,17 @@
-import { barChart, donutChart, donutLegend, heatmapChart, lineChart, progressBar } from '../lib/charts.js';
+import { barChart, donutChart, heatmapChart, lineChart, progressBar } from '../lib/charts.js';
 import { compactMoney, esc, fmtAmount } from '../lib/util.js';
 
 export interface ReportsViewProps {
   range: { start: string; end: string; label: string; preset: string; month?: string };
   kind: 'expense' | 'income';
+  selectedCat: string | null;
   sum: { income: number; expense: number; net: number; count: number };
   compare: {
     prevMonth: { label: string; income: number; expense: number };
     lastYear: { label: string; income: number; expense: number };
   } | null;
   cats: Array<{ name: string; icon: string; color: string; total: number; cnt: number }>;
-  subcats: Array<{ name: string; parent: string; total: number; cnt: number }>;
+  subcats: Array<{ category_id: number | null; name: string; icon: string; color: string; parent: string; total: number; cnt: number }>;
   trend: Array<{ month: string; income: number; expense: number }>;
   days: Array<{ date: string; income: number; expense: number; count: number }>;
   members: Array<{ id: number; name: string; color: string; expense: number; income: number; cnt: number }>;
@@ -24,7 +25,7 @@ export interface ReportsViewProps {
 export function reportsPage(p: ReportsViewProps): string {
   const maxDay = p.days.reduce<(typeof p.days)[number] | null>((a, b) => (b.expense > (a?.expense || 0) ? b : a), null);
   const activeDays = p.days.filter((d) => d.count > 0).length;
-  const donutTotal = (p.kind === 'expense' ? p.sum.expense : p.sum.income) / 100;
+  const kindTotalCents = Math.max(1, p.kind === 'expense' ? p.sum.expense : p.sum.income);
   const topCats = p.cats.slice(0, 8);
   const restTotal = p.cats.slice(8).reduce((a, x) => a + (x.total || 0), 0);
   const donutItems = topCats.map((x) => ({ name: x.name, value: x.total / 100, color: x.color }));
@@ -38,6 +39,40 @@ export function reportsPage(p: ReportsViewProps): string {
         centerTitle: p.kind === 'expense' ? '总支出' : '总收入',
       })
     : '<div class="empty">本期暂无数据</div>';
+
+  const catDrillRows = p.cats
+    .map((c) => {
+      const pct = ((Number(c.total) / kindTotalCents) * 100).toFixed(1);
+      const isSelected = p.selectedCat === c.name;
+      const href = p.linkWith({ cat: isSelected ? '' : c.name });
+      return `<a href="${esc(href)}" class="legend-row" style="padding:6px 8px;border-radius:6px;text-decoration:none;${isSelected ? 'background:var(--primary-soft);outline:1px solid var(--primary);' : ''}">
+  <span class="legend-dot" style="background:${esc(c.color)}"></span>
+  <span class="legend-name">${esc(c.icon)} ${esc(c.name)} <span class="tiny muted">${c.cnt}笔</span></span>
+  <span class="legend-bar"><i style="width:${pct}%;background:${esc(c.color)}"></i></span>
+  <span class="legend-pct">${pct}%</span>
+  <span class="legend-val amount">${fmtAmount(c.total)}</span>
+</a>`;
+    })
+    .join('');
+
+  const subTotalCents = Math.max(1, p.subcats.reduce((acc, s) => acc + Number(s.total || 0), 0));
+  const subcatRows = p.subcats
+    .map((s) => {
+      const pctNum = (Number(s.total) / subTotalCents) * 100;
+      const pctLabel = pctNum.toFixed(1);
+      const txnHref = s.category_id
+        ? `/transactions?category_id=${s.category_id}&from=${encodeURIComponent(p.range.start)}&to=${encodeURIComponent(p.range.end)}&kind=${p.kind}`
+        : `/transactions?from=${encodeURIComponent(p.range.start)}&to=${encodeURIComponent(p.range.end)}&kind=${p.kind}`;
+      return `<tr>
+  <td>${esc(s.icon)} <b>${esc(s.name)}</b></td>
+  <td><a class="chip ${p.selectedCat === s.parent ? 'primary' : ''}" href="${esc(p.linkWith({ cat: s.parent }))}">${esc(s.parent)}</a></td>
+  <td class="num">${s.cnt} 笔</td>
+  <td class="num amount">${fmtAmount(s.total)}</td>
+  <td style="min-width:160px"><div class="row">${progressBar(s.total, subTotalCents, { color: s.color || '#0F766E' })} <span class="tiny muted nowrap">${pctLabel}%</span></div></td>
+  <td><a class="btn btn-sm" href="${esc(txnHref)}">查看流水 →</a></td>
+</tr>`;
+    })
+    .join('');
 
   const trendChart = barChart({
     labels: p.trend.slice(-6).map((t) => `${t.month.slice(5)}月`),
@@ -90,18 +125,30 @@ export function reportsPage(p: ReportsViewProps): string {
     <div class="card-head">
       <b>${p.kind === 'expense' ? '支出' : '收入'}分类构成</b>
       <div class="row">
-        <a class="btn btn-sm ${p.kind === 'expense' ? 'btn-primary' : ''}" href="${esc(p.linkWith({ kind: 'expense' }))}">支出</a>
-        <a class="btn btn-sm ${p.kind === 'income' ? 'btn-primary' : ''}" href="${esc(p.linkWith({ kind: 'income' }))}">收入</a>
+        <a class="btn btn-sm ${p.kind === 'expense' ? 'btn-primary' : ''}" href="${esc(p.linkWith({ kind: 'expense', cat: '' }))}">支出</a>
+        <a class="btn btn-sm ${p.kind === 'income' ? 'btn-primary' : ''}" href="${esc(p.linkWith({ kind: 'income', cat: '' }))}">收入</a>
       </div>
     </div>
     <div style="display:flex;justify-content:center;margin-bottom:12px">${donut}</div>
-    ${p.cats.length ? donutLegend(donutItems, donutTotal, '元') : ''}
+    ${p.cats.length ? `<div class="tiny muted mb8">点击一级分类可下钻查看二级明细</div>${catDrillRows}` : ''}
   </div>
   <div class="card">
     <div class="card-head"><b>近 6 个月收支趋势</b></div>
     <div class="chart-box">${trendChart}</div>
     ${p.compare ? `<div class="notice mt12">上月（${esc(p.compare.prevMonth.label)}）：支出 ${fmtAmount(p.compare.prevMonth.expense)} · 收入 ${fmtAmount(p.compare.prevMonth.income)}<br>去年同期（${esc(p.compare.lastYear.label)}）：支出 ${fmtAmount(p.compare.lastYear.expense)} · 收入 ${fmtAmount(p.compare.lastYear.income)}</div>` : ''}
   </div>
+</div>
+
+<div class="card mb16">
+  <div class="card-head">
+    <b>${p.kind === 'expense' ? '支出' : '收入'}二级分类下钻明细${p.selectedCat ? ` · ${esc(p.selectedCat)}` : ''}</b>
+    ${p.selectedCat ? `<a class="btn btn-sm" href="${esc(p.linkWith({ cat: '' }))}">查看全部分类</a>` : '<span class="muted small">按二级分类汇总，点击所属大类可筛选</span>'}
+  </div>
+  ${
+    p.subcats.length
+      ? `<div class="scroll-x"><table class="table"><thead><tr><th>二级分类</th><th>所属大类</th><th class="num">笔数</th><th class="num">金额</th><th>${p.selectedCat ? '大类内占比' : '占比'}</th><th>操作</th></tr></thead><tbody>${subcatRows}</tbody></table></div>`
+      : '<div class="empty">本期暂无二级分类明细</div>'
+  }
 </div>
 
 <div class="grid grid-2 mb16">

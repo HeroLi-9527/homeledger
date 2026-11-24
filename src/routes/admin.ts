@@ -19,12 +19,18 @@ import {
 } from '../lib/ai.js';
 import * as attach from '../lib/attachments.js';
 import * as auth from '../lib/auth.js';
+import {
+  BACKUP_TABLES,
+  MAX_BACKUP_BYTES,
+  validateAndBuildRestorePlan,
+  type TableColumnInfo,
+} from '../lib/backup.js';
 import { EXPORT_HEADER, exportRows, importRecords, parseBill, toCsv, type ParsedBillRecord } from '../lib/importers.js';
 import { cleanupOrphanR2, runScheduled } from '../lib/scheduler.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
 import { esc } from '../lib/util.js';
-import type { HonoEnv, Role, UserRow } from '../types.js';
+import type { BatchStatement, HonoEnv, LedgerRow, Role, UserRow } from '../types.js';
 import { membersPage, settingsPage } from '../views/admin.js';
 import { layout, simpleTable } from '../views/layout.js';
 import {
@@ -49,32 +55,6 @@ export const adminRoutes = new Hono<HonoEnv>();
 const USERNAME_RE = /^[A-Za-z0-9_.@-]{3,32}$/;
 const toBoolSetting = (v: unknown): 'true' | 'false' =>
   v === true || v === 1 || v === '1' || v === 'true' || v === 'on' ? 'true' : 'false';
-
-const BACKUP_TABLES = [
-  'users',
-  'settings',
-  'ledgers',
-  'ledger_members',
-  'ledger_invites',
-  'accounts',
-  'categories',
-  'tags',
-  'transactions',
-  'transaction_tags',
-  'splits',
-  'attachments',
-  'session_cards',
-  'session_card_logs',
-  'budgets',
-  'recurring_rules',
-  'goals',
-  'subscriptions',
-  'debts',
-  'notifications',
-  'exchange_rates',
-  'import_jobs',
-  'api_tokens',
-] as const;
 
 const previewCache = new Map<
   string,
@@ -398,10 +378,11 @@ adminRoutes.get('/ledgers', async (c) => {
   <td>${esc(l.icon)} <b>${esc(l.name)}</b> ${Number(ctx.ledger?.id) === Number(l.id) ? '<span class="chip income">当前</span>' : ''} ${l.is_archived ? '<span class="chip">已归档</span>' : ''}</td>
   <td>${esc(l.currency)}</td>
   <td>${esc(auth.ROLE_LABEL[l.role as Role] || l.role)}</td>
-  <td>
+  <td><div class="row wrap">
     <form method="post" action="/ledgers/switch" style="display:inline">${csrfInput}<input type="hidden" name="ledger_id" value="${l.id}"><button class="btn btn-sm" type="submit">切换</button></form>
+    ${auth.canManage(l.role) ? `<a class="btn btn-sm" href="/ledgers/${l.id}/edit">编辑</a>` : ''}
     ${l.role === 'owner' ? `<form method="post" action="/ledgers/${l.id}/archive" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">${l.is_archived ? '取消归档' : '归档'}</button></form>` : ''}
-  </td>
+  </div></td>
 </tr>`,
     )
     .join('');
@@ -474,6 +455,65 @@ adminRoutes.post('/ledgers', async (c) => {
   return c.redirect('/ledgers');
 });
 
+adminRoutes.get('/ledgers/:id/edit', async (c) => {
+  const r = requireLogin(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const meta = await siteMeta(c);
+  const id = Number(c.req.param('id'));
+  const m = await auth.membership(db, ctx.user!.id, id);
+  const ledger = await db.get<LedgerRow>('SELECT * FROM ledgers WHERE id = ?', id);
+  if (!ledger || !m || !auth.canManage(m.role)) {
+    setFlash(c, 'error', '无权编辑该账本');
+    return c.redirect('/ledgers');
+  }
+  const csrf = c.get('csrf') || '';
+  const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
+  const kindLabel = { family: '家庭共享', personal: '个人私账', trip: '旅行专项' };
+
+  return c.html(
+    layout({
+      title: `编辑账本 · ${ledger.name}`,
+      activeNav: 'ledgers',
+      ctx,
+      siteName: meta.siteName,
+      csrf,
+      cspNonce: c.get('cspNonce'),
+      flash: takeFlash(c),
+      body: `<div class="grid grid-2">
+  <div class="card">
+    <div class="card-head"><b>编辑账本信息</b><a class="btn btn-sm" href="/ledgers">← 返回账本列表</a></div>
+    <form method="post" action="/ledgers/${ledger.id}">
+      ${csrfInput}
+      <div class="field"><label>账本名称</label><input name="name" value="${esc(ledger.name)}" maxlength="30" required></div>
+      <div class="grid grid-2">
+        <div class="field"><label>类型</label><select name="kind">${Object.entries(kindLabel).map(([k, lbl]) => `<option value="${k}" ${ledger.kind === k ? 'selected' : ''}>${lbl}</option>`).join('')}</select></div>
+        <div class="field"><label>本位币（创建后不可改）</label><input value="${esc(ledger.currency)}" disabled></div>
+      </div>
+      <div class="field"><label>图标</label><input name="icon" value="${esc(ledger.icon || '📒')}" maxlength="8"></div>
+      <div class="field"><label>备注（可选）</label><input name="note" value="${esc(ledger.note || '')}" maxlength="200"></div>
+      <button class="btn btn-primary" type="submit">保存账本信息</button>
+    </form>
+  </div>
+  ${
+    m.role === 'owner'
+      ? `<div class="card">
+    <div class="card-head"><b>危险操作：永久删除账本</b><span class="chip expense">不可恢复</span></div>
+    <div class="notice warn mb12">删除账本将永久清空该账本下的全部流水、账户、预算、周期账单、订阅、借贷、储蓄目标、次卡、通知、R2 附件及绑定在该账本的 API 令牌。</div>
+    <form method="post" action="/ledgers/${ledger.id}/delete" data-confirm="确认永久删除账本「${esc(ledger.name)}」及全部数据？">
+      ${csrfInput}
+      <div class="field"><label>请输入账本名称「${esc(ledger.name)}」以确认删除</label><input name="confirm_name" placeholder="${esc(ledger.name)}" required></div>
+      <button class="btn btn-danger btn-block" type="submit">确认永久删除该账本</button>
+    </form>
+  </div>`
+      : `<div class="card"><div class="card-head"><b>删除账本</b></div><div class="empty">仅账本所有者（owner）可执行永久删除操作。</div></div>`
+  }
+</div>`,
+    }),
+  );
+});
+
 adminRoutes.post('/ledgers/:id', async (c) => {
   const r = requireLogin(c);
   if (r) return r;
@@ -484,11 +524,24 @@ adminRoutes.post('/ledgers/:id', async (c) => {
     setFlash(c, 'error', '无权修改该账本');
     return c.redirect('/ledgers');
   }
+  const ledger = await db.get<LedgerRow>('SELECT * FROM ledgers WHERE id = ?', id);
+  if (!ledger) {
+    setFlash(c, 'error', '账本不存在');
+    return c.redirect('/ledgers');
+  }
   const body = await bodyOf(c);
   const name = String(body.name || '').trim().slice(0, 30);
-  if (name) {
-    await db.run('UPDATE ledgers SET name = ?, icon = ? WHERE id = ?', name, String(body.icon || '📒').slice(0, 8), id);
+  if (!name) {
+    setFlash(c, 'error', '账本名称不能为空');
+    return c.redirect(`/ledgers/${id}/edit`);
   }
+  const icon = body.icon !== undefined && String(body.icon).trim() ? String(body.icon).trim().slice(0, 8) : ledger.icon;
+  const kind =
+    body.kind !== undefined && ['family', 'personal', 'trip'].includes(String(body.kind))
+      ? String(body.kind)
+      : ledger.kind;
+  const note = body.note !== undefined ? String(body.note).trim().slice(0, 200) || null : ledger.note;
+  await db.run('UPDATE ledgers SET name = ?, icon = ?, kind = ?, note = ? WHERE id = ?', name, icon, kind, note, id);
   setFlash(c, 'success', '账本已更新');
   return c.redirect('/ledgers');
 });
@@ -512,18 +565,90 @@ adminRoutes.post('/ledgers/:id/delete', async (c) => {
   const r = requireLogin(c);
   if (r) return r;
   const db = dbOf(c);
+  const env = envOf(c);
+  const ctx = c.get('ctx');
   const id = Number(c.req.param('id'));
-  const m = await auth.membership(db, c.get('ctx').user!.id, id);
+  const body = await bodyOf(c);
+  const isJson = body._json === '1' || wantsJson(c);
+
+  const m = await auth.membership(db, ctx.user!.id, id);
   if (!m || m.role !== 'owner') {
+    if (isJson) return c.json({ ok: false, error: '仅账本所有者可删除' }, 403);
     setFlash(c, 'error', '仅账本所有者可删除');
     return c.redirect('/ledgers');
   }
-  await db.batch([
+  const ledger = await db.get<LedgerRow>('SELECT * FROM ledgers WHERE id = ?', id);
+  if (!ledger) {
+    if (isJson) return c.json({ ok: false, error: '账本不存在' }, 404);
+    setFlash(c, 'error', '账本不存在');
+    return c.redirect('/ledgers');
+  }
+  const confirmName = String(body.confirm_name || '').trim();
+  if (confirmName !== ledger.name) {
+    if (isJson) return c.json({ ok: false, error: '账本名称确认不匹配' }, 400);
+    setFlash(c, 'error', '输入的账本名称不匹配，已取消删除');
+    return c.redirect(`/ledgers/${id}/edit`);
+  }
+
+  const [attRows, jobRows] = await Promise.all([
+    db.all<{ rel_path: string }>('SELECT rel_path FROM attachments WHERE ledger_id = ?', id),
+    db.all<{ id: number }>('SELECT id FROM import_jobs WHERE ledger_id = ? AND failed > 10', id),
+  ]);
+  const r2Keys = [
+    ...attRows.map((a) => a.rel_path),
+    ...jobRows.map((j) => `imports/failures-${j.id}.json`),
+  ];
+
+  const stamp = nowStr();
+  const stmts: BatchStatement[] = [
+    [
+      'DELETE FROM transaction_tags WHERE transaction_id IN (SELECT id FROM transactions WHERE ledger_id = ?) OR tag_id IN (SELECT id FROM tags WHERE ledger_id = ?)',
+      [id, id],
+    ],
+    ['DELETE FROM splits WHERE ledger_id = ?', [id]],
+    ['DELETE FROM attachments WHERE ledger_id = ?', [id]],
+    ['DELETE FROM session_card_logs WHERE ledger_id = ?', [id]],
+    ['DELETE FROM session_cards WHERE ledger_id = ?', [id]],
+    ['DELETE FROM transactions WHERE ledger_id = ?', [id]],
+    ['DELETE FROM tags WHERE ledger_id = ?', [id]],
+    ['DELETE FROM categories WHERE ledger_id = ?', [id]],
+    ['DELETE FROM budgets WHERE ledger_id = ?', [id]],
+    ['DELETE FROM recurring_rules WHERE ledger_id = ?', [id]],
+    ['DELETE FROM goals WHERE ledger_id = ?', [id]],
+    ['DELETE FROM subscriptions WHERE ledger_id = ?', [id]],
+    ['DELETE FROM debts WHERE ledger_id = ?', [id]],
+    ['DELETE FROM notifications WHERE ledger_id = ?', [id]],
+    ['DELETE FROM import_jobs WHERE ledger_id = ?', [id]],
+    ['DELETE FROM accounts WHERE ledger_id = ?', [id]],
     ['DELETE FROM ledger_invites WHERE ledger_id = ?', [id]],
     ['DELETE FROM ledger_members WHERE ledger_id = ?', [id]],
+    ['UPDATE api_tokens SET revoked_at = ? WHERE ledger_id = ? AND revoked_at IS NULL', [stamp, id]],
     ['DELETE FROM ledgers WHERE id = ?', [id]],
-  ]);
-  setFlash(c, 'success', '账本已删除');
+  ];
+  await db.batch(stmts);
+
+  if (r2Keys.length) {
+    await attach.deleteKeysFromR2(env, r2Keys);
+  }
+
+  if (Number(ctx.ledger?.id) === id) {
+    const nextLedger = await db.get<{ id: number }>(
+      `SELECT l.id FROM ledgers l JOIN ledger_members lm ON lm.ledger_id = l.id
+       WHERE lm.user_id = ? AND l.is_archived = 0 ORDER BY l.sort_order, l.id LIMIT 1`,
+      ctx.user!.id,
+    );
+    const sess = c.get('sess');
+    if (sess) {
+      const token = await auth.signSession(
+        auth.createSessionPayload(sess.uid, nextLedger ? Number(nextLedger.id) : null, sess.tv, sess.csrf),
+        getSessionSecret(env),
+      );
+      c.header('Set-Cookie', auth.sessionCookie(token, env), { append: true });
+    }
+  }
+
+  if (isJson) return c.json({ ok: true });
+  setFlash(c, 'success', `账本「${ledger.name}」及相关数据已永久删除`);
   return c.redirect('/ledgers');
 });
 
@@ -911,61 +1036,46 @@ adminRoutes.post('/backup/restore', async (c) => {
   const r = requireAdmin(c);
   if (r) return r;
   const db = dbOf(c);
+  const env = envOf(c);
   const body = await bodyOf(c);
 
   try {
     let rawJson = '';
     if (body.dataUrl) {
-      rawJson = new TextDecoder('utf-8').decode(parseBase64Payload(String(body.dataUrl)));
+      const bytes = parseBase64Payload(String(body.dataUrl));
+      if (bytes.byteLength > MAX_BACKUP_BYTES) {
+        return c.json({ ok: false, error: '备份文件过大（请小于 20MB）' }, 400);
+      }
+      rawJson = new TextDecoder('utf-8').decode(bytes);
     } else if (body.backup) {
       rawJson = typeof body.backup === 'string' ? body.backup : JSON.stringify(body.backup);
+      if (Buffer.byteLength(rawJson, 'utf8') > MAX_BACKUP_BYTES) {
+        return c.json({ ok: false, error: '备份内容过大（请小于 20MB）' }, 400);
+      }
     }
     if (!rawJson) return c.json({ ok: false, error: '未提供备份 JSON 内容' }, 400);
 
-    const parsed = JSON.parse(rawJson) as { tables?: Record<string, Record<string, unknown>[]> };
-    if (!parsed || typeof parsed !== 'object' || !parsed.tables || typeof parsed.tables !== 'object') {
-      return c.json({ ok: false, error: '备份文件格式无效（缺少 tables 字段）' }, 400);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawJson);
+    } catch {
+      return c.json({ ok: false, error: '备份文件不是合法的 JSON 格式' }, 400);
     }
 
-    const existingCols = new Map<string, string[]>();
+    const schema = new Map<string, TableColumnInfo[]>();
     for (const tbl of BACKUP_TABLES) {
-      const info = await db.all<{ name: string }>(`PRAGMA table_info(${tbl})`);
-      existingCols.set(
-        tbl,
-        info.map((col) => col.name),
-      );
+      const info = await db.all<TableColumnInfo>(`PRAGMA table_info(${tbl})`);
+      schema.set(tbl, info);
     }
 
-    const stmts: Array<[string, unknown[]?]> = [];
-    for (const tbl of [...BACKUP_TABLES].reverse()) {
-      stmts.push([`DELETE FROM ${tbl}`]);
-    }
-    const counts: Record<string, number> = {};
-    for (const tbl of BACKUP_TABLES) {
-      const rows = Array.isArray(parsed.tables[tbl]) ? parsed.tables[tbl] : [];
-      const validCols = existingCols.get(tbl) || [];
-      if (!rows.length || !validCols.length) {
-        counts[tbl] = 0;
-        continue;
-      }
-      const cols = validCols.filter((col) => col in rows[0]);
-      if (!cols.length) {
-        counts[tbl] = 0;
-        continue;
-      }
-      const sql = `INSERT INTO ${tbl} (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`;
-      for (const row of rows) {
-        stmts.push([sql, cols.map((col) => (row[col] === undefined ? null : row[col]))]);
-      }
-      counts[tbl] = rows.length;
-    }
+    const { stmts, counts } = validateAndBuildRestorePlan(parsed, schema);
+    await db.batch(stmts);
 
-    for (let i = 0; i < stmts.length; i += 100) {
-      await db.batch(stmts.slice(i, i + 100));
-    }
     const ledgers = await db.all<{ id: number }>('SELECT id FROM ledgers');
     for (const l of ledgers) await recalcBalances(db, Number(l.id));
 
+    c.header('Set-Cookie', auth.clearSessionCookie(env), { append: true });
+    c.header('Cache-Control', 'no-store');
     return c.json({ ok: true, restored: counts });
   } catch (e) {
     return c.json({ ok: false, error: toPublicError(e) }, 400);
@@ -1009,8 +1119,11 @@ adminRoutes.get('/admin', async (c) => {
   <td class="tiny muted">${esc(usr.last_login_at || '从未登录')}</td>
   <td>${
     Number(usr.id) !== Number(ctx.user!.id)
-      ? `<form method="post" action="/admin/users/${usr.id}" style="display:inline">${csrfInput}<input type="hidden" name="action" value="toggle_status"><button class="btn btn-sm" type="submit">${usr.status === 'active' ? '停用' : '启用'}</button></form>
-         <form method="post" action="/admin/users/${usr.id}" style="display:inline">${csrfInput}<input type="hidden" name="action" value="toggle_admin"><button class="btn btn-sm" type="submit">${usr.is_admin ? '取消管理' : '设为管理'}</button></form>`
+      ? `<div class="row wrap">
+         <form method="post" action="/admin/users/${usr.id}" style="display:inline">${csrfInput}<input type="hidden" name="action" value="toggle_status"><button class="btn btn-sm" type="submit">${usr.status === 'active' ? '停用' : '启用'}</button></form>
+         <form method="post" action="/admin/users/${usr.id}" style="display:inline">${csrfInput}<input type="hidden" name="action" value="toggle_admin"><button class="btn btn-sm" type="submit">${usr.is_admin ? '取消管理' : '设为管理'}</button></form>
+         <form method="post" action="/admin/users/${usr.id}" style="display:inline-flex;gap:4px;align-items:center" data-confirm="确认重置 @${esc(usr.username)} 的密码并令其全部登录失效？">${csrfInput}<input type="hidden" name="action" value="reset_password"><input type="password" name="password" placeholder="新密码(留空随机)" minlength="6" style="width:130px;padding:3px 7px;font-size:12px"><button class="btn btn-sm btn-danger" type="submit">重置密码</button></form>
+         </div>`
       : '<span class="tiny muted">当前账号</span>'
   }</td>
 </tr>`,
@@ -1123,13 +1236,39 @@ adminRoutes.post('/admin/users/:id', async (c) => {
     await db.run('UPDATE users SET is_admin = ? WHERE id = ?', target.is_admin ? 0 : 1, id);
     setFlash(c, 'success', '管理员权限已更新');
   } else if (action === 'reset_password') {
-    const newPwd = String(body.password || u.uid(12));
+    const rawPwd = String(body.password || '').trim();
+    if (rawPwd && rawPwd.length < 6) {
+      if (body._json === '1' || wantsJson(c)) return c.json({ ok: false, error: '自定义新密码长度至少 6 位' }, 400);
+      setFlash(c, 'error', '自定义新密码长度至少 6 位');
+      return c.redirect('/admin');
+    }
+    const newPwd = rawPwd || u.uid(12);
     const hash = await auth.hashPassword(newPwd);
     await db.batch([
       ['UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?', [hash, id]],
       ['UPDATE api_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL', [stamp, id]],
     ]);
-    setFlash(c, 'success', `密码已重置为 ${newPwd}，原有登录已失效`);
+    c.header('Cache-Control', 'no-store');
+    if (body._json === '1' || wantsJson(c)) {
+      return c.json({ ok: true, user_id: id, username: target.username, password: newPwd });
+    }
+    const meta = await siteMeta(c);
+    return c.html(
+      layout({
+        title: '用户密码已重置',
+        activeNav: 'admin',
+        ctx: c.get('ctx'),
+        siteName: meta.siteName,
+        csrf: c.get('csrf') || '',
+        cspNonce: c.get('cspNonce'),
+        body: `<div class="card">
+  <div class="card-head"><b>用户密码重置成功</b><span class="chip income">仅此一次展示</span></div>
+  <p class="muted small mb12">已重置用户 <b>${esc(target.display_name)}</b>（@${esc(target.username)}）的登录密码，其全部旧会话与 API 令牌已立即失效。请立即复制并转交本人：</p>
+  <div class="notice mb16"><code>${esc(newPwd)}</code></div>
+  <a class="btn btn-primary" href="/admin">返回管理面板</a>
+</div>`,
+      }),
+    );
   }
   return c.redirect('/admin');
 });

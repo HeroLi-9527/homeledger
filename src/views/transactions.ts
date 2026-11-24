@@ -1,5 +1,6 @@
 import { PRIMARY_TXN_TYPES, TXN_TYPES, TXN_TYPE_MAP } from '../db.js';
 import { accountOptionsHtml } from '../lib/accounts.js';
+import { MAX_IMAGES, webUrl, type AttachmentRow } from '../lib/attachments.js';
 import type { AccountRow, CategoryRow } from '../types.js';
 import { esc } from '../lib/util.js';
 
@@ -18,6 +19,7 @@ export interface TxnFormViewProps {
   cspNonce?: string;
   action: string;
   splitRows?: Array<{ member_name: string; share_cents: number }>;
+  attachments?: AttachmentRow[];
   error?: string;
 }
 
@@ -30,6 +32,7 @@ export function txnFormPage({
   cspNonce = '',
   action,
   splitRows = [],
+  attachments = [],
   error = '',
 }: TxnFormViewProps): string {
   const curType = String(t.type || 'expense');
@@ -189,7 +192,59 @@ export function txnFormPage({
   </form>
 </div>`;
 
-  if (mode === 'edit') return formCard;
+  if (mode === 'edit') {
+    const txnId = Number(t.id);
+    const listHtml = attachments.length
+      ? attachments
+          .map((a) => {
+            const imgUrl = webUrl(a.rel_path);
+            return `<div class="between" style="border-bottom:1px solid var(--border);padding:8px 0">
+  <div class="row" style="min-width:0;flex:1">
+    <a href="${esc(imgUrl)}" target="_blank" rel="noopener"><img src="${esc(imgUrl)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:8px;border:1px solid var(--border)"></a>
+    <div style="min-width:0;flex:1">
+      <div class="small bold" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${esc(imgUrl)}" target="_blank" rel="noopener">${esc(a.file_name || a.rel_path)}</a></div>
+      <div class="tiny muted">${esc(a.created_at)}${a.size ? ` · ${(Number(a.size) / 1024).toFixed(1)} KB` : ''}</div>
+    </div>
+  </div>
+  <div class="row">
+    <a class="btn btn-sm" href="${esc(imgUrl)}" target="_blank" rel="noopener">查看</a>
+    <form method="post" action="/attachments/${a.id}/delete" style="display:inline" data-confirm="确认删除该附件？将同步从 R2 存储移除。">
+      <input type="hidden" name="_csrf" value="${esc(csrf)}">
+      <input type="hidden" name="back" value="/transactions/${txnId}/edit">
+      <button class="btn btn-sm btn-danger" type="submit">删除</button>
+    </form>
+  </div>
+</div>`;
+          })
+          .join('')
+      : '<div class="empty">暂无关联凭证图片</div>';
+
+    const remainingQuota = Math.max(0, MAX_IMAGES - attachments.length);
+    const attachmentsCard = `<div class="card">
+  <div class="card-head"><b>凭证与附件</b><span class="chip">${attachments.length} / ${MAX_IMAGES}</span></div>
+  ${listHtml}
+  <div class="mt16">
+    ${
+      remainingQuota > 0
+        ? `<div id="txn-att-dropzone" class="dropzone" data-txn-id="${txnId}" data-existing="${attachments.length}" data-max="${MAX_IMAGES}">
+      <div style="font-size:22px;margin-bottom:4px">📎</div>
+      <div>拖拽图片至此、点击选择文件，或 <b>Ctrl+V</b> 粘贴补传（还可传 ${remainingQuota} 张，单张 ≤ 8MB）</div>
+    </div>
+    <form id="txn-att-form" method="post" action="/transactions/${txnId}/attachments" enctype="multipart/form-data" class="mt12">
+      <input type="hidden" name="_csrf" value="${esc(csrf)}">
+      <div class="row wrap">
+        <input type="file" id="txn-att-file" name="files" accept="image/*" multiple style="flex:1;min-width:180px">
+        <button class="btn btn-primary btn-sm" type="submit" id="txn-att-submit">补传附件</button>
+      </div>
+    </form>`
+        : `<div class="notice warn">已达到单笔流水最多 ${MAX_IMAGES} 个附件上限，请先删除旧附件后再补传。</div>`
+    }
+    <div class="row mt12"><a class="btn btn-sm btn-ghost" href="/attachments">全部附件存档 →</a></div>
+  </div>
+</div>`;
+
+    return `<div class="split-workspace">${formCard}${attachmentsCard}</div>`;
+  }
 
   const aiSideCard = `<div class="card">
   <div class="card-head"><b>AI 智能小票与文本感知</b><span class="chip primary">双引擎</span></div>

@@ -936,12 +936,132 @@
     });
   }
 
+  /* ============================ 交易编辑页附件与周期账单动态行 ============================ */
+  function initTxnAttachments() {
+    const zone = $('#txn-att-dropzone');
+    if (!zone) return;
+    const txnId = Number(zone.dataset.txnId || 0);
+    const existing = Number(zone.dataset.existing || 0);
+    const maxCount = Number(zone.dataset.max || 6);
+    const input = $('#txn-att-file');
+    const form = $('#txn-att-form');
+    if (!txnId) return;
+
+    async function uploadFiles(files) {
+      const list = Array.prototype.slice.call(files || []);
+      if (!list.length) return;
+      const quota = Math.max(0, maxCount - existing);
+      if (quota <= 0) return toast('已达单笔流水最多 ' + maxCount + ' 个附件上限', 'warn');
+      if (list.length > quota) return toast('当前最多还能补传 ' + quota + ' 张图片', 'warn');
+      const images = [];
+      for (const f of list) {
+        if (!/^image\//.test(f.type)) {
+          toast('只支持图片文件：' + f.name, 'warn');
+          return;
+        }
+        if (f.size > 8 * 1024 * 1024) {
+          toast('单张图片请小于 8MB：' + f.name, 'warn');
+          return;
+        }
+        images.push({ dataUrl: await fileToDataUrl(f), name: f.name });
+      }
+      const btn = $('#txn-att-submit');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '上传中…';
+      }
+      const res = await postJson('/transactions/' + txnId + '/attachments', { images });
+      if (res.ok) {
+        toast('已上传 ' + images.length + ' 个附件', 'success');
+        setTimeout(() => window.location.reload(), 400);
+      } else {
+        toast(res.error || '上传失败', 'error');
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = '补传附件';
+        }
+      }
+    }
+
+    zone.addEventListener('click', () => input && input.click());
+    if (input) {
+      input.addEventListener('change', () => {
+        if (input.files && input.files.length) uploadFiles(input.files);
+      });
+    }
+    ['dragenter', 'dragover'].forEach((ev) =>
+      zone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        zone.classList.add('dragover');
+      }),
+    );
+    ['dragleave', 'drop'].forEach((ev) =>
+      zone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+      }),
+    );
+    zone.addEventListener('drop', (e) => {
+      if (e.dataTransfer && e.dataTransfer.files) uploadFiles(e.dataTransfer.files);
+    });
+    document.addEventListener('paste', (e) => {
+      if (!e.clipboardData) return;
+      const items = Array.prototype.slice.call(e.clipboardData.items || []);
+      const files = items.filter((it) => it.kind === 'file').map((it) => it.getAsFile()).filter(Boolean);
+      if (files.length) uploadFiles(files);
+    });
+    if (form) {
+      form.addEventListener('submit', (e) => {
+        if (!input || !input.files || !input.files.length) {
+          e.preventDefault();
+          toast('请先选择图片', 'warn');
+        }
+      });
+    }
+  }
+
+  function initRecurringForm() {
+    $$('form[data-recurring-form]').forEach((form) => {
+      const box = $('[data-rec-items]', form);
+      const addBtn = $('[data-add-rec-item]', form);
+      if (!box) return;
+      const bindDel = (row) => {
+        const del = $('.del-rec-item', row);
+        if (del) {
+          del.addEventListener('click', () => {
+            if ($$('.recurring-item-row', box).length <= 1) {
+              $$('input', row).forEach((inp) => (inp.value = ''));
+              return;
+            }
+            row.remove();
+          });
+        }
+      };
+      $$('.recurring-item-row', box).forEach(bindDel);
+      if (addBtn) {
+        addBtn.addEventListener('click', () => {
+          const tpl = $('.recurring-item-row', box);
+          if (!tpl) return;
+          const clone = tpl.cloneNode(true);
+          $$('input', clone).forEach((inp) => (inp.value = ''));
+          $$('select', clone).forEach((sel) => {
+            sel.value = sel.name === 'item_type' ? 'expense' : '';
+          });
+          box.appendChild(clone);
+          bindDel(clone);
+        });
+      }
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     initThemeToggle();
     initMobileNav();
     initUserMenu();
     initAvatarUpload();
     initTxnForm();
+    initTxnAttachments();
+    initRecurringForm();
     initAccountForms();
     initAiPage();
     initImportPage();

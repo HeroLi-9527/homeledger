@@ -6,7 +6,7 @@ import * as subs from '../lib/subscriptions.js';
 import * as u from '../lib/util.js';
 import { esc } from '../lib/util.js';
 import type { HonoEnv } from '../types.js';
-import { layout } from '../views/layout.js';
+import { layout, simpleTable } from '../views/layout.js';
 import { subscriptionsPage } from '../views/planning.js';
 import { bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
 
@@ -100,10 +100,34 @@ subscriptionsRoutes.get('/subscriptions/:id/edit', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
-  const s = await db.get<subs.SubscriptionRow>('SELECT * FROM subscriptions WHERE id = ? AND ledger_id = ?', Number(c.req.param('id')), lid);
+  const id = Number(c.req.param('id'));
+  const s = await db.get<subs.SubscriptionRow>('SELECT * FROM subscriptions WHERE id = ? AND ledger_id = ?', id, lid);
   if (!s) return c.redirect('/subscriptions');
-  const [accounts, cats] = await Promise.all([fd.accounts(db, lid), fd.flatCategories(db, lid, 'expense')]);
+  const [accounts, cats, charges, statRow] = await Promise.all([
+    fd.accounts(db, lid),
+    fd.flatCategories(db, lid, 'expense'),
+    subs.chargesOf(db, lid, s.id, 50),
+    db.get<{ cnt: number; total: number }>(
+      'SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_base_cents),0) AS total FROM transactions WHERE ledger_id = ? AND subscription_id = ? AND deleted_at IS NULL',
+      lid,
+      s.id,
+    ),
+  ]);
   const csrf = c.get('csrf') || '';
+  const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
+  const chargeRows =
+    charges
+      .map(
+        (ch) => `<tr>
+  <td>${esc(ch.txn_date)}</td>
+  <td class="num amount">-${u.fmtAmount(ch.amount_base_cents)}</td>
+  <td><span class="chip ${ch.status === 'pending' ? 'warn' : 'income'}">${ch.status === 'pending' ? '待确认' : '已入账'}</span></td>
+  <td>${esc(ch.note || '—')}</td>
+  <td><a class="btn btn-sm" href="/transactions/${ch.id}/edit">查看流水 →</a></td>
+</tr>`,
+      )
+      .join('') || '<tr><td colspan="5">暂无历史扣费流水</td></tr>';
+
   return c.html(
     layout({
       title: '编辑订阅',
@@ -112,7 +136,9 @@ subscriptionsRoutes.get('/subscriptions/:id/edit', async (c) => {
       siteName: meta.siteName,
       csrf,
       cspNonce: c.get('cspNonce'),
-      body: `<div class="card"><form method="post" action="/subscriptions/${s.id}" data-require-trial-end><input type="hidden" name="_csrf" value="${esc(csrf)}">
+      flash: takeFlash(c),
+      body: `<div class="card mb16"><div class="card-head"><b>编辑订阅：${esc(s.name)}</b><form method="post" action="/subscriptions/${s.id}/delete" style="display:inline" data-confirm="确认永久删除该订阅？（不会删除已生成的历史扣费流水）">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除订阅</button></form></div>
+<form method="post" action="/subscriptions/${s.id}" data-require-trial-end>${csrfInput}
 <div class="grid grid-2">
   <div class="field"><label>名称</label><input name="name" value="${esc(s.name)}" required></div>
   <div class="field"><label>金额（元）</label><input name="amount" inputmode="decimal" value="${(s.amount_cents / 100).toFixed(2)}" required></div>
@@ -125,9 +151,12 @@ subscriptionsRoutes.get('/subscriptions/:id/edit', async (c) => {
   <div class="field"><label>扣费账户</label><select name="account_id"><option value="">—</option>${accounts.map((a) => `<option value="${a.id}" ${Number(s.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></div>
   <div class="field"><label>分类</label><select name="category_id"><option value="">—</option>${cats.map((cc) => `<option value="${cc.id}" ${Number(s.category_id) === Number(cc.id) ? 'selected' : ''}>${esc(cc.path)}</option>`).join('')}</select></div>
   <div class="field"><label>套餐</label><input name="plan" value="${esc(s.plan || '')}"></div>
-  <div class="field"><label><input type="checkbox" name="auto_renew" ${s.auto_renew ? 'checked' : ''}> 到期自动扣费记账</label></div>
+  <div class="field"><label>提前提醒天数</label><input name="reminder_days" type="number" min="0" max="60" value="${Number(s.reminder_days ?? 3)}"></div>
+  <div class="field"><label>备注</label><input name="note" value="${esc(s.note || '')}"></div>
+  <div class="field" style="justify-content:flex-end"><label class="check"><input type="checkbox" name="auto_renew" ${s.auto_renew ? 'checked' : ''}> 到期自动扣费记账</label></div>
 </div>
-<div class="row mt12"><button class="btn btn-primary" type="submit">保存</button><a class="btn" href="/subscriptions">取消</a></div></form></div>`,
+<div class="row mt12"><button class="btn btn-primary" type="submit">保存</button><a class="btn" href="/subscriptions">取消</a></div></form></div>
+${simpleTable('历史扣费记录', ['扣费日期', '本位币金额', '状态', '备注', '操作'], chargeRows, `<span class="muted small amount">累计 ${Number(statRow?.cnt || 0)} 期 · 合计 ${u.fmtAmount(Number(statRow?.total || 0))}</span>`)}`,
     }),
   );
 });
@@ -324,6 +353,11 @@ subscriptionsRoutes.post('/subscriptions/:id/cancel', async (c) => {
 subscriptionsRoutes.post('/subscriptions/:id/delete', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
-  await dbOf(c).run('DELETE FROM subscriptions WHERE id = ? AND ledger_id = ?', Number(c.req.param('id')), ledgerId(c));
+  const res = await dbOf(c).run(
+    'DELETE FROM subscriptions WHERE id = ? AND ledger_id = ?',
+    Number(c.req.param('id')),
+    ledgerId(c),
+  );
+  setFlash(c, res.changes ? 'success' : 'error', res.changes ? '订阅已删除（历史扣费流水已保留）' : '订阅不存在');
   return c.redirect('/subscriptions');
 });

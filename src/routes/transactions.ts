@@ -1,12 +1,13 @@
 import { Hono } from 'hono';
 import { isCreditGroupType, todayStr, TXN_TYPE_MAP } from '../db.js';
 import { accountOptionsHtml } from '../lib/accounts.js';
+import * as attach from '../lib/attachments.js';
 import * as fd from '../lib/formdata.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
 import { esc } from '../lib/util.js';
 import type { HonoEnv } from '../types.js';
-import { groupList, layout } from '../views/layout.js';
+import { groupList, layout, paginationHtml } from '../views/layout.js';
 import { txnFormPage } from '../views/transactions.js';
 import { bodyOf, dbOf, envOf, requireLedger, requireLogin, requireWrite, setFlash, siteMeta, takeFlash, toPublicError, wantsJson } from './helpers.js';
 
@@ -73,8 +74,33 @@ txnRoutes.get('/transactions', async (c) => {
     fd.txFormData(db, ledgerId),
   ]);
   const groups = await txn.groupByDate(result.rows, db);
-  const pages: number[] = [];
-  for (let p = 1; p <= result.pages; p++) pages.push(p);
+  const filterQuery: Record<string, string | number | undefined> = {
+    type: f.type,
+    kind: f.kind,
+    category_id: f.categoryId,
+    account_id: f.accountId,
+    member_id: f.memberId,
+    tag_id: f.tagId,
+    source: f.source,
+    month: f.month,
+    from: f.from,
+    to: f.to,
+    q: f.keyword,
+    reimbursable: f.reimbursable,
+    sort: q.sort || undefined,
+  };
+  const hasAnyFilter = Object.values(filterQuery).some((v) => v !== undefined && v !== '');
+  const hiddenFilters = [
+    f.kind ? ['kind', f.kind] : null,
+    f.accountId ? ['account_id', String(f.accountId)] : null,
+    f.memberId ? ['member_id', String(f.memberId)] : null,
+    f.tagId ? ['tag_id', String(f.tagId)] : null,
+    f.source ? ['source', f.source] : null,
+    f.from ? ['from', f.from] : null,
+    f.to ? ['to', f.to] : null,
+    f.reimbursable ? ['reimbursable', f.reimbursable] : null,
+    q.sort ? ['sort', q.sort] : null,
+  ].filter((x): x is [string, string] => Boolean(x));
 
   return c.html(
     layout({
@@ -86,6 +112,7 @@ txnRoutes.get('/transactions', async (c) => {
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
       body: `<div class="card"><form method="get" action="/transactions">
+  ${hiddenFilters.map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`).join('')}
   <div class="grid grid-4">
     <select name="type"><option value="">全部类型</option>${Object.entries(TXN_TYPE_MAP).map(([k, v]) => `<option value="${k}" ${f.type === k ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}</select>
     <select name="category_id"><option value="">全部分类</option>${cats.map((cc) => `<option value="${cc.id}" ${f.categoryId === cc.id ? 'selected' : ''}>${esc(cc.path)}</option>`).join('')}</select>
@@ -95,6 +122,7 @@ txnRoutes.get('/transactions', async (c) => {
   <div class="row mt12 wrap">
     <button class="btn btn-primary" type="submit">筛选</button>
     <a class="btn" href="/transactions?reimbursable=yes">待报销</a>
+    ${hasAnyFilter ? '<a class="btn" href="/transactions">清空筛选</a>' : ''}
     <span class="muted small amount">共 ${result.total} 笔 · 收入 +${u.fmtAmount(result.sum.income)} · 支出 -${u.fmtAmount(result.sum.expense)}</span>
   </div>
 </form></div>
@@ -119,7 +147,7 @@ txnRoutes.get('/transactions', async (c) => {
   </div>
 </form>
 </div>
-${result.pages > 1 ? `<div class="row mt16 wrap">${pages.map((p) => `<a class="btn btn-sm ${p === result.page ? 'btn-primary' : ''}" href="/transactions?page=${p}${f.month ? `&month=${f.month}` : ''}${f.type ? `&type=${f.type}` : ''}">${p}</a>`).join('')}</div>` : ''}`,
+${paginationHtml('/transactions', filterQuery, result.page, result.pages, result.total)}`,
     }),
   );
 });
@@ -329,7 +357,11 @@ txnRoutes.get('/transactions/:id/edit', async (c) => {
       404,
     );
   }
-  const [form, splits] = await Promise.all([fd.txFormData(db, Number(ctx.ledger!.id)), txn.splitsOf(db, t.id)]);
+  const [form, splits, attachments] = await Promise.all([
+    fd.txFormData(db, Number(ctx.ledger!.id)),
+    txn.splitsOf(db, t.id),
+    attach.listByTxn(db, t.id),
+  ]);
   return c.html(
     layout({
       title: '编辑记账',
@@ -338,6 +370,7 @@ txnRoutes.get('/transactions/:id/edit', async (c) => {
       siteName: meta.siteName,
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
+      flash: takeFlash(c),
       body: txnFormPage({
         form,
         t: { ...t, amount: (t.amount_cents / 100).toFixed(2), tag_names: t.tag_names || '' },
@@ -347,9 +380,95 @@ txnRoutes.get('/transactions/:id/edit', async (c) => {
         cspNonce: c.get('cspNonce'),
         action: `/transactions/${t.id}`,
         splitRows: splits as Array<{ member_name: string; share_cents: number }>,
+        attachments,
       }),
     }),
   );
+});
+
+txnRoutes.post('/transactions/:id/attachments', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const env = envOf(c);
+  const ctx = c.get('ctx');
+  const ledgerId = Number(ctx.ledger!.id);
+  const userId = Number(ctx.user!.id);
+  const id = Number(c.req.param('id'));
+  const body = await bodyOf(c);
+  const isJson = body._json === '1' || wantsJson(c);
+
+  const row = await db.get<{ id: number }>(
+    'SELECT id FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at IS NULL',
+    id,
+    ledgerId,
+  );
+  if (!row) {
+    if (isJson) return c.json({ ok: false, error: '记录不存在或已删除' }, 404);
+    setFlash(c, 'error', '记录不存在或已删除');
+    return c.redirect('/transactions');
+  }
+
+  try {
+    if (!env.ATTACHMENTS) throw new Error('当前环境未挂载 R2 存储桶');
+    const prepared: Array<{ buf: Buffer; mime: string; name?: string }> = [];
+
+    const rawImages = Array.isArray(body.images)
+      ? body.images
+      : typeof body.dataUrl === 'string' && body.dataUrl
+        ? [{ dataUrl: body.dataUrl, name: typeof body.name === 'string' ? body.name : undefined }]
+        : [];
+    for (const item of rawImages) {
+      const dataUrl = typeof item === 'string' ? item : String((item as { dataUrl?: string })?.dataUrl || '');
+      const name = typeof item === 'object' && item ? String((item as { name?: string })?.name || '') : undefined;
+      if (!dataUrl) continue;
+      const parsed = attach.parseDataUrl(dataUrl);
+      prepared.push({ buf: parsed.buf, mime: parsed.mime, name: name || undefined });
+    }
+
+    const rawFiles = ([] as unknown[]).concat(body.files ?? [], body.file ?? []);
+    for (const f of rawFiles) {
+      if (!f || typeof f !== 'object' || !('arrayBuffer' in f)) continue;
+      const file = f as File;
+      if (file.size === 0 && !file.name) continue;
+      const buf = Buffer.from(await file.arrayBuffer());
+      const mime = attach.inferImageMime(file.type, file.name);
+      const checked = attach.validateImageBuffer(mime, buf);
+      prepared.push({ buf, mime: checked.mime, name: file.name || undefined });
+    }
+
+    if (!prepared.length) throw new Error('请选择要上传的图片');
+
+    const existing = await attach.listByTxn(db, id);
+    if (existing.length + prepared.length > attach.MAX_IMAGES) {
+      throw new Error(`单笔流水最多保存 ${attach.MAX_IMAGES} 个附件（当前已有 ${existing.length} 个）`);
+    }
+
+    const saved = [];
+    for (const img of prepared) {
+      saved.push(
+        await attach.saveBufferImage(db, env, {
+          buf: img.buf,
+          mime: img.mime,
+          ledgerId,
+          userId,
+          txnId: id,
+          name: img.name,
+          kind: 'receipt',
+          aiStatus: 'linked',
+        }),
+      );
+    }
+
+    if (isJson) return c.json({ ok: true, attachments: saved, total: existing.length + saved.length });
+    setFlash(c, 'success', `已上传 ${saved.length} 个附件`);
+    return c.redirect(`/transactions/${id}/edit`);
+  } catch (e) {
+    const msg = toPublicError(e);
+    if (isJson) return c.json({ ok: false, error: msg }, 400);
+    setFlash(c, 'error', msg);
+    return c.redirect(`/transactions/${id}/edit`);
+  }
 });
 
 txnRoutes.post('/transactions/:id', async (c) => {
@@ -367,7 +486,12 @@ txnRoutes.post('/transactions/:id', async (c) => {
     return c.redirect(String(body.back || '/transactions'));
   } catch (e) {
     if (isJson) return c.json({ ok: false, error: toPublicError(e) }, 400);
-    const [form, meta] = await Promise.all([fd.txFormData(db, Number(ctx.ledger!.id)), siteMeta(c)]);
+    const id = Number(c.req.param('id'));
+    const [form, meta, attachments] = await Promise.all([
+      fd.txFormData(db, Number(ctx.ledger!.id)),
+      siteMeta(c),
+      attach.listByTxn(db, id),
+    ]);
     return c.html(
       layout({
         title: '编辑记账',
@@ -378,13 +502,14 @@ txnRoutes.post('/transactions/:id', async (c) => {
         cspNonce: c.get('cspNonce'),
         body: txnFormPage({
           form,
-          t: { ...data, amount: (data.amount_cents / 100).toFixed(2) },
+          t: { ...data, id, amount: (data.amount_cents / 100).toFixed(2) },
           mode: 'edit',
           back: String(body.back || '/transactions'),
           csrf: c.get('csrf') || '',
           cspNonce: c.get('cspNonce'),
-          action: `/transactions/${c.req.param('id')}`,
+          action: `/transactions/${id}`,
           splitRows: (data.splits || []).map((s) => ({ member_name: s.member_name || '', share_cents: s.share_cents })),
+          attachments,
           error: toPublicError(e),
         }),
       }),

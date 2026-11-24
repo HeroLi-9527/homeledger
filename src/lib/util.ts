@@ -216,3 +216,13 @@ export function avatarUrl(u: { avatar_path?: string | null; avatar_ver?: number 
   const p = String(u.avatar_path).replace(/^uploads\/avatars\//, '');
   return `/uploads/avatars/${encodeURIComponent(p)}?v=${Number(u.avatar_ver) || 0}`;
 }
+
+/** 仅放行站内相对路径，拦截外链与伪协议（如 javascript:、//evil.com） */
+export function safeInternalPath(raw: unknown, fallback = '/'): string {
+  if (typeof raw !== 'string') return fallback;
+  const s = raw.trim();
+  if (!s || !s.startsWith('/') || s.startsWith('//') || s.startsWith('/\\') || /[\r\n\0]/.test(s)) {
+    return fallback;
+  }
+  return s;
+}

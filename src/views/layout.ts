@@ -97,6 +97,7 @@ export function layout({
         ['ai', '/ai', '🤖', 'AI 智能记账'],
         ['calendar', '/calendar', '🗓️', '记账日历'],
         ['search', '/search', '🔍', '搜索筛选'],
+        ['attachments', '/attachments', '📎', '附件存档'],
       ],
     },
     {
@@ -305,5 +306,55 @@ function txnRowHtml(t: TxnRow, opts: { bulk?: boolean }): string {
       <button class="btn btn-sm btn-ghost" type="button" data-del-txn="${t.id}">删除</button>
     </div>
   </div>
+</div>`;
+}
+
+export function paginationHtml(
+  basePath: string,
+  query: Record<string, string | number | undefined | null>,
+  page: number,
+  totalPages: number,
+  total?: number,
+): string {
+  if (totalPages <= 1) return '';
+  const buildHref = (p: number) => {
+    const sp = new URLSearchParams();
+    for (const [k, v] of Object.entries(query)) {
+      if (v === undefined || v === null || v === '') continue;
+      sp.set(k, String(v));
+    }
+    sp.set('page', String(p));
+    return `${basePath}?${sp.toString()}`;
+  };
+
+  const items: Array<number | '...'> = [];
+  if (totalPages <= 9) {
+    for (let i = 1; i <= totalPages; i++) items.push(i);
+  } else {
+    const set = new Set<number>([1, totalPages]);
+    for (let i = Math.max(1, page - 2); i <= Math.min(totalPages, page + 2); i++) set.add(i);
+    const sorted = [...set].sort((a, b) => a - b);
+    for (let i = 0; i < sorted.length; i++) {
+      if (i > 0 && sorted[i] - sorted[i - 1] > 1) items.push('...');
+      items.push(sorted[i]);
+    }
+  }
+
+  const btns: string[] = [];
+  if (page > 1) btns.push(`<a class="btn btn-sm" href="${esc(buildHref(page - 1))}">← 上一页</a>`);
+  for (const it of items) {
+    if (it === '...') {
+      btns.push('<span class="muted small" style="padding:0 4px">…</span>');
+    } else {
+      btns.push(
+        `<a class="btn btn-sm ${it === page ? 'btn-primary' : ''}" href="${esc(buildHref(it))}">${it}</a>`,
+      );
+    }
+  }
+  if (page < totalPages) btns.push(`<a class="btn btn-sm" href="${esc(buildHref(page + 1))}">下一页 →</a>`);
+
+  return `<div class="between mt16 wrap">
+  <span class="muted small">第 ${page} / ${totalPages} 页${total != null ? `，共 ${total} 条` : ''}</span>
+  <div class="row wrap">${btns.join('')}</div>
 </div>`;
 }

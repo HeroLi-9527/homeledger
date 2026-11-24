@@ -480,32 +480,44 @@ export function categoriesPage({
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
   return `<div class="grid grid-2">
   ${(['expense', 'income'] as const)
-    .map(
-      (kind) => `<div class="card">
-  <div class="card-head"><b>${kind === 'expense' ? '支出分类' : '收入分类'}</b><span class="muted small">内置 209 个系统分类 + 自定义分类</span></div>
-  ${tree
-    .filter((t) => t.kind === kind)
+    .map((kind) => {
+      const kindRoots = tree.filter((t) => t.kind === kind);
+      return `<div class="card">
+  <div class="card-head"><b>${kind === 'expense' ? '支出分类' : '收入分类'}</b><span class="muted small">内置 209 个系统分类 + 自定义一级/二级分类</span></div>
+  ${kindRoots
     .map(
       (root) => `<div class="mb12">
   <div class="between" style="padding:4px 0">
     <b>${esc(root.icon)} ${esc(root.name)}</b>
-    ${root.ledger_id ? `<form method="post" action="/categories/${root.id}/delete" style="display:inline">${csrfInput}<button class="btn btn-sm btn-ghost" type="submit">删</button></form>` : '<span class="tiny muted">内置</span>'}
+    ${root.ledger_id ? `<form method="post" action="/categories/${root.id}/delete" style="display:inline" data-confirm="确认删除一级分类「${esc(root.name)}」？">${csrfInput}<button class="btn btn-sm btn-ghost" type="submit">删</button></form>` : '<span class="tiny muted">内置</span>'}
   </div>
   <div class="row wrap">${(root.children || [])
-    .map((ch) => `<span class="chip">${esc(ch.icon)} ${esc(ch.name)}</span>`)
+    .map((ch) =>
+      ch.ledger_id
+        ? `<span class="chip" style="gap:4px"><span>${esc(ch.icon)} ${esc(ch.name)}</span><form method="post" action="/categories/${ch.id}/delete" style="display:inline" data-confirm="确认删除二级分类「${esc(ch.name)}」？">${csrfInput}<button type="submit" title="删除二级分类" style="border:0;background:transparent;color:var(--expense);cursor:pointer;padding:0 2px;font-size:12px;line-height:1">✕</button></form></span>`
+        : `<span class="chip">${esc(ch.icon)} ${esc(ch.name)}</span>`,
+    )
     .join('')}</div>
 </div>`,
     )
     .join('')}
-  <form method="post" action="/categories" class="row mt12">
+  <form method="post" action="/categories" class="mt16" style="border-top:1px solid var(--border);padding-top:12px">
     ${csrfInput}
     <input type="hidden" name="kind" value="${kind}">
-    <input name="name" placeholder="新建${kind === 'expense' ? '支出' : '收入'}分类" required>
-    <input name="icon" value="🏷️" style="max-width:72px">
-    <button class="btn btn-primary" type="submit">添加</button>
+    <div class="grid grid-2 mb8">
+      <select name="parent_id">
+        <option value="">作为一级分类</option>
+        ${kindRoots.map((rt) => `<option value="${rt.id}">隶属于：${esc(rt.icon)} ${esc(rt.name)}</option>`).join('')}
+      </select>
+      <div class="row">
+        <input name="name" placeholder="新建${kind === 'expense' ? '支出' : '收入'}分类名称" required>
+        <input name="icon" value="🏷️" style="max-width:64px">
+      </div>
+    </div>
+    <button class="btn btn-primary btn-sm" type="submit">添加分类</button>
   </form>
-</div>`,
-    )
+</div>`;
+    })
     .join('')}
 </div>`;
 }

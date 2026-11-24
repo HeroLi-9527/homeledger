@@ -18,6 +18,7 @@ import {
   siteMeta,
   takeFlash,
   toPublicError,
+  wantsJson,
 } from './helpers.js';
 
 export const aiRoutes = new Hono<HonoEnv>();
@@ -342,8 +343,8 @@ aiRoutes.get('/attachments', async (c) => {
   const curPage = Math.min(page, totalPages);
   const offset = (curPage - 1) * pageSize;
 
-  const rows = await db.all<attach.AttachmentRow & { merchant?: string | null; amount_cents?: number | null }>(
-    `SELECT a.*, t.merchant, t.amount_base_cents AS amount_cents
+  const rows = await db.all<attach.AttachmentRow & { linked_txn_id?: number | null; txn_date?: string | null; merchant?: string | null; amount_cents?: number | null }>(
+    `SELECT a.*, t.id AS linked_txn_id, t.txn_date, t.merchant, t.amount_base_cents AS amount_cents
      FROM attachments a
      LEFT JOIN transactions t ON t.id = a.txn_id AND t.deleted_at IS NULL
      WHERE a.ledger_id = ?
@@ -373,7 +374,12 @@ aiRoutes.post('/attachments/:id/delete', async (c) => {
   const db = dbOf(c);
   const ledgerId = Number(c.get('ctx').ledger!.id);
   const id = Number(c.req.param('id'));
+  const body = await bodyOf(c);
   const ok = await attach.removeById(db, envOf(c), ledgerId, id);
+  if (body._json === '1' || wantsJson(c)) {
+    return c.json(ok ? { ok: true } : { ok: false, error: '附件不存在' }, ok ? 200 : 404);
+  }
+  const back = u.safeInternalPath(body.back, '/attachments');
   setFlash(c, ok ? 'success' : 'error', ok ? '附件已从数据库与 R2 存储删除' : '附件不存在');
-  return c.redirect('/attachments');
+  return c.redirect(back);
 });

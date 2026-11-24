@@ -16,6 +16,8 @@ import { barChart, donutChart, heatmapChart, lineChart } from '../src/lib/charts
 import { advanceDate } from '../src/lib/scheduler.js';
 import { decorateCard } from '../src/lib/session-cards.js';
 import { advance, firstChargeDate } from '../src/lib/subscriptions.js';
+import { BACKUP_TABLES, MAX_SQL_PARAMS, validateAndBuildRestorePlan, type TableColumnInfo } from '../src/lib/backup.js';
+import { safeInternalPath } from '../src/lib/util.js';
 
 test('PBKDF2 密码哈希与校验', async () => {
   const hash = await hashPassword('secret-pass-123');
@@ -212,4 +214,178 @@ test('次卡状态派生与单次成本计算', () => {
   const empty = decorateCard({ ...base, remaining_sessions: 0 }, '2026-11-23');
   assert.equal(empty.isExhausted, true);
   assert.equal(empty.status, 'exhausted');
+});
+
+test('safeInternalPath 仅放行单斜杠站内路径并拦截伪协议与协议相对 URL', () => {
+  assert.equal(safeInternalPath('/accounts/1?tab=edit#sec'), '/accounts/1?tab=edit#sec');
+  assert.equal(safeInternalPath('  /transactions?page=2  '), '/transactions?page=2');
+  assert.equal(safeInternalPath('//evil.com/phish', '/notifications'), '/notifications');
+  assert.equal(safeInternalPath('/\\evil.com', '/notifications'), '/notifications');
+  assert.equal(safeInternalPath('https://evil.com', '/'), '/');
+  assert.equal(safeInternalPath('javascript:alert(1)', '/'), '/');
+  assert.equal(safeInternalPath('/foo\r\nSet-Cookie: a=1', '/'), '/');
+  assert.equal(safeInternalPath(null, '/fallback'), '/fallback');
+});
+
+test('validateAndBuildRestorePlan 前置校验、异构键并集、分块上限与全员 token_version 自增', () => {
+  const mkSchema = () => {
+    const m = new Map<string, TableColumnInfo[]>();
+    for (const tbl of BACKUP_TABLES) {
+      m.set(tbl, [
+        { name: 'id', type: 'INTEGER', notnull: 0, dflt_value: null, pk: 1 },
+        { name: 'ledger_id', type: 'INTEGER', notnull: 0, dflt_value: null, pk: 0 },
+      ]);
+    }
+    m.set('users', [
+      { name: 'id', type: 'INTEGER', notnull: 0, dflt_value: null, pk: 1 },
+      { name: 'username', type: 'TEXT', notnull: 1, dflt_value: null, pk: 0 },
+      { name: 'password_hash', type: 'TEXT', notnull: 1, dflt_value: null, pk: 0 },
+      { name: 'display_name', type: 'TEXT', notnull: 1, dflt_value: null, pk: 0 },
+      { name: 'status', type: 'TEXT', notnull: 1, dflt_value: "'active'", pk: 0 },
+      { name: 'is_admin', type: 'INTEGER', notnull: 1, dflt_value: '0', pk: 0 },
+      { name: 'created_at', type: 'TEXT', notnull: 1, dflt_value: null, pk: 0 },
+    ]);
+    m.set('categories', [
+      { name: 'id', type: 'INTEGER', notnull: 0, dflt_value: null, pk: 1 },
+      { name: 'name', type: 'TEXT', notnull: 1, dflt_value: null, pk: 0 },
+    ]);
+    m.set('settings', [
+      { name: 'key', type: 'TEXT', notnull: 0, dflt_value: null, pk: 1 },
+      { name: 'value', type: 'TEXT', notnull: 1, dflt_value: null, pk: 0 },
+    ]);
+    // 25 列宽表模拟 transactions，验证参数分块 ≤ MAX_SQL_PARAMS
+    m.set(
+      'transactions',
+      Array.from({ length: 25 }, (_, i) => ({
+        name: i === 0 ? 'id' : `c${i}`,
+        type: i === 0 ? 'INTEGER' : 'TEXT',
+        notnull: 0,
+        dflt_value: null,
+        pk: i === 0 ? 1 : 0,
+      })),
+    );
+    return m;
+  };
+  const schema = mkSchema();
+  const validBase = () => ({
+    app: 'homeledger',
+    version: 2,
+    tables: {
+      users: [
+        {
+          id: 1,
+          username: 'admin',
+          password_hash: 'pbkdf2$100000$aa$bb',
+          display_name: 'Admin',
+          is_admin: 1,
+          status: 'active',
+          created_at: '2026-11-23 10:00:00',
+        },
+      ],
+      categories: [{ id: 1, name: '餐饮' }],
+    },
+  });
+
+  // 拒绝非法 app / version / 缺活跃管理员 / 空分类
+  assert.throws(() => validateAndBuildRestorePlan({ ...validBase(), app: 'other' }, schema), /app 字段/);
+  assert.throws(() => validateAndBuildRestorePlan({ ...validBase(), version: 99 }, schema), /备份版本/);
+  assert.throws(
+    () =>
+      validateAndBuildRestorePlan(
+        {
+          app: 'homeledger',
+          version: 2,
+          tables: {
+            users: [{ ...validBase().tables.users[0], status: 'disabled' }],
+            categories: [{ id: 1, name: '餐饮' }],
+          },
+        },
+        schema,
+      ),
+    /站点管理员/,
+  );
+  assert.throws(
+    () =>
+      validateAndBuildRestorePlan(
+        { app: 'homeledger', version: 2, tables: { users: validBase().tables.users, categories: [] } },
+        schema,
+      ),
+    /categories 不能为空/,
+  );
+
+  // 拒绝缺必填列与重复主键 / 重复用户名
+  assert.throws(
+    () =>
+      validateAndBuildRestorePlan(
+        {
+          app: 'homeledger',
+          version: 2,
+          tables: {
+            users: validBase().tables.users,
+            categories: [{ id: 1 }],
+          },
+        },
+        schema,
+      ),
+    /缺少必填字段 name/,
+  );
+  assert.throws(
+    () =>
+      validateAndBuildRestorePlan(
+        {
+          app: 'homeledger',
+          version: 2,
+          tables: {
+            users: [
+              validBase().tables.users[0],
+              { ...validBase().tables.users[0], id: 2 },
+            ],
+            categories: [{ id: 1, name: '餐饮' }],
+          },
+        },
+        schema,
+      ),
+    /重复用户名/,
+  );
+
+  // 异构行键并集保留 + 宽表分块 ≤ MAX_SQL_PARAMS + token_version 自增
+  const wideRows = Array.from({ length: 7 }, (_, i) => {
+    const row: Record<string, unknown> = { id: i + 1 };
+    for (let c = 1; c < 25; c++) row[`c${c}`] = i === 6 && c === 24 ? 'tail-val' : `v${c}`;
+    if (i === 0) delete row.c24; // 第 0 行缺少 c24，仅后续行出现
+    return row;
+  });
+  const plan = validateAndBuildRestorePlan(
+    {
+      app: 'homeledger',
+      version: 2,
+      tables: {
+        users: [
+          validBase().tables.users[0],
+          {
+            id: 2,
+            username: 'bob',
+            password_hash: 'pbkdf2$100000$cc$dd',
+            display_name: 'Bob',
+            created_at: '2026-11-23 10:00:00',
+            // 故意省略带默认值的 status 与 is_admin
+          },
+        ],
+        categories: [{ id: 1, name: '餐饮' }],
+        transactions: wideRows,
+      },
+    },
+    schema,
+  );
+  const txnInserts = plan.stmts.filter(([sql]) => sql.startsWith('INSERT INTO transactions'));
+  assert.equal(txnInserts.length, 3, '7 行 × 25 列按 ≤95 参数应拆为 3+3+1 共 3 条多行 INSERT');
+  for (const [, params] of txnInserts) {
+    assert.ok((params?.length || 0) <= MAX_SQL_PARAMS);
+  }
+  assert.ok(
+    txnInserts.some(([, params]) => params?.includes('tail-val')),
+    '异构行后续出现列 c24 不得被静默丢弃',
+  );
+  const lastStmt = plan.stmts[plan.stmts.length - 1];
+  assert.ok(lastStmt[0].includes('token_version'));
 });

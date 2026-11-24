@@ -288,19 +288,44 @@ accountsRoutes.post('/categories', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
   const db = dbOf(c);
+  const ledgerId = Number(c.get('ctx').ledger!.id);
   const body = await bodyOf(c);
   const name = String(body.name || '').trim();
-  if (name) {
-    await db.run(
-      'INSERT INTO categories (ledger_id, parent_id, kind, name, icon, sort_order) VALUES (?,?,?,?,?,0)',
-      Number(c.get('ctx').ledger!.id),
-      body.parent_id ? Number(body.parent_id) : null,
-      body.kind === 'income' ? 'income' : 'expense',
-      name.slice(0, 20),
-      String(body.icon || '🏷️'),
-    );
-    setFlash(c, 'success', '分类已添加');
+  if (!name) {
+    setFlash(c, 'error', '请填写分类名称');
+    return c.redirect('/categories');
   }
+  let parentId: number | null = body.parent_id ? Number(body.parent_id) : null;
+  let kind: 'expense' | 'income' = body.kind === 'income' ? 'income' : 'expense';
+  let color = '#8c8c8c';
+  if (parentId) {
+    const parent = await db.get<CategoryRow>(
+      'SELECT id, kind, parent_id, color FROM categories WHERE id = ? AND (ledger_id IS NULL OR ledger_id = ?)',
+      parentId,
+      ledgerId,
+    );
+    if (!parent) {
+      setFlash(c, 'error', '所属一级分类不存在');
+      return c.redirect('/categories');
+    }
+    if (parent.parent_id != null) {
+      setFlash(c, 'error', '仅支持二级分类，不能在二级分类下继续新建子分类');
+      return c.redirect('/categories');
+    }
+    kind = parent.kind;
+    color = parent.color || color;
+    parentId = Number(parent.id);
+  }
+  await db.run(
+    'INSERT INTO categories (ledger_id, parent_id, kind, name, icon, color, sort_order) VALUES (?,?,?,?,?,?,0)',
+    ledgerId,
+    parentId,
+    kind,
+    name.slice(0, 20),
+    String(body.icon || '🏷️').slice(0, 8) || '🏷️',
+    color,
+  );
+  setFlash(c, 'success', parentId ? '二级分类已添加' : '一级分类已添加');
   return c.redirect('/categories');
 });
 
@@ -308,16 +333,45 @@ accountsRoutes.post('/categories/:id/delete', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
   const db = dbOf(c);
+  const ledgerId = Number(c.get('ctx').ledger!.id);
   const id = Number(c.req.param('id'));
+  const cat = await db.get<CategoryRow>(
+    'SELECT * FROM categories WHERE id = ? AND ledger_id = ? AND is_system = 0',
+    id,
+    ledgerId,
+  );
+  if (!cat) {
+    setFlash(c, 'error', '仅可删除当前账本的自定义分类');
+    return c.redirect('/categories');
+  }
+  const childCnt = Number(
+    (
+      await db.get<{ c: number }>(
+        'SELECT COUNT(*) AS c FROM categories WHERE parent_id = ? AND ledger_id = ?',
+        id,
+        ledgerId,
+      )
+    )?.c || 0,
+  );
+  if (childCnt) {
+    setFlash(c, 'error', `该分类下还有 ${childCnt} 个子分类，请先删除子分类`);
+    return c.redirect('/categories');
+  }
   const used = Number(
-    (await db.get<{ c: number }>('SELECT COUNT(*) AS c FROM transactions WHERE category_id = ? AND deleted_at IS NULL', id))
-      ?.c || 0,
+    (
+      await db.get<{ c: number }>(
+        'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND category_id = ? AND deleted_at IS NULL',
+        ledgerId,
+        id,
+      )
+    )?.c || 0,
   );
   if (used) {
     setFlash(c, 'error', `该分类下还有 ${used} 笔记账，无法删除`);
     return c.redirect('/categories');
   }
-  await db.run('DELETE FROM categories WHERE id = ? AND ledger_id = ?', id, Number(c.get('ctx').ledger!.id));
+  await db.run('DELETE FROM categories WHERE id = ? AND ledger_id = ? AND is_system = 0', id, ledgerId);
+  setFlash(c, 'success', '分类已删除');
   return c.redirect('/categories');
 });
 

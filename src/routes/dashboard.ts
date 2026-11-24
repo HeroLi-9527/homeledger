@@ -1,8 +1,9 @@
 import { Hono } from 'hono';
-import { todayStr } from '../db.js';
+import { todayStr, TXN_TYPE_MAP } from '../db.js';
 import { accountOptionsHtml } from '../lib/accounts.js';
 import { isAiUsable } from '../lib/ai.js';
 import { attachCounts } from '../lib/attachments.js';
+import * as auth from '../lib/auth.js';
 import { barChart, heatmapChart } from '../lib/charts.js';
 import * as fd from '../lib/formdata.js';
 import { budgetPeriodRange, budgetUsedInRange, effectiveBudget, type BudgetRow } from '../lib/scheduler.js';
@@ -13,8 +14,8 @@ import * as u from '../lib/util.js';
 import { esc } from '../lib/util.js';
 import type { HonoEnv } from '../types.js';
 import { dashboardPage } from '../views/dashboard.js';
-import { groupList, layout, simpleTable } from '../views/layout.js';
-import { dbOf, requireLogin, siteMeta, takeFlash } from './helpers.js';
+import { groupList, layout, paginationHtml, simpleTable } from '../views/layout.js';
+import { dbOf, envOf, getSessionSecret, requireLogin, setFlash, siteMeta, takeFlash } from './helpers.js';
 
 export const dashboardRoutes = new Hono<HonoEnv>();
 const monthOfToday = () => todayStr().slice(0, 7);
@@ -253,6 +254,14 @@ dashboardRoutes.get('/search', async (c) => {
     fd.txFormData(db, ledgerId),
     fd.flatCategories(db, ledgerId),
   ]);
+  const searchQuery = {
+    q: f.keyword || undefined,
+    type: f.type || undefined,
+    category_id: f.categoryId,
+    account_id: f.accountId,
+    from: f.from || undefined,
+    to: f.to || undefined,
+  };
   return c.html(
     layout({
       title: '搜索筛选',
@@ -264,7 +273,7 @@ dashboardRoutes.get('/search', async (c) => {
       body: `<div class="card"><form method="get" action="/search">
 <div class="grid grid-3">
   <input name="q" value="${esc(f.keyword)}" placeholder="关键词：商家 / 备注 / 分类">
-  <select name="type"><option value="">全部类型</option>${['expense', 'income', 'transfer', 'lend', 'borrow', 'adjust'].map((t) => `<option value="${t}" ${f.type === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
+  <select name="type"><option value="">全部类型</option>${Object.entries(TXN_TYPE_MAP).map(([k, v]) => `<option value="${k}" ${f.type === k ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}</select>
   <select name="category_id"><option value="">全部分类</option>${cats.map((cc) => `<option value="${cc.id}" ${f.categoryId === cc.id ? 'selected' : ''}>${esc(cc.path)}</option>`).join('')}</select>
   <select name="account_id">${accountOptionsHtml(form.accounts, { selectedId: f.accountId, emptyLabel: '全部账户' })}</select>
   <input type="date" name="from" value="${esc(f.from)}">
@@ -272,10 +281,19 @@ dashboardRoutes.get('/search', async (c) => {
 </div>
 <div class="row mt12"><button class="btn btn-primary" type="submit">搜索</button>${hasFilter ? `<a class="btn" href="/search">清空</a><span class="muted small">共 ${result.total} 笔</span>` : ''}</div>
 </form></div>
-<div class="card mt16">${hasFilter ? groupList(await txn.groupByDate(result.rows, db)) : '<div class="empty">输入条件后搜索账单</div>'}</div>`,
+<div class="card mt16">${hasFilter ? groupList(await txn.groupByDate(result.rows, db)) : '<div class="empty">输入条件后搜索账单</div>'}</div>
+${hasFilter ? paginationHtml('/search', searchQuery, result.page, result.pages, result.total) : ''}`,
     }),
   );
 });
+
+const NOTIF_KIND_CHIP: Record<string, { cls: string; label: string }> = {
+  danger: { cls: 'expense', label: '告警' },
+  warn: { cls: 'warn', label: '提醒' },
+  success: { cls: 'income', label: '达成' },
+  recurring: { cls: 'primary', label: '周期' },
+  info: { cls: '', label: '通知' },
+};
 
 dashboardRoutes.get('/notifications', async (c) => {
   const r = requireLogin(c);
@@ -283,8 +301,21 @@ dashboardRoutes.get('/notifications', async (c) => {
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
-  const rows = await db.all<{ id: number; created_at: string; title: string; body: string | null }>(
-    'SELECT id, created_at, title, body FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 50',
+  const rows = await db.all<{
+    id: number;
+    ledger_id: number | null;
+    kind: string;
+    title: string;
+    body: string | null;
+    link: string | null;
+    created_at: string;
+    ledger_name: string | null;
+  }>(
+    `SELECT n.id, n.ledger_id, n.kind, n.title, n.body, n.link, n.created_at, l.name AS ledger_name
+     FROM notifications n
+     LEFT JOIN ledgers l ON l.id = n.ledger_id
+     WHERE n.user_id = ?
+     ORDER BY n.id DESC LIMIT 50`,
     ctx.user!.id,
   );
   if (ctx.unreadCount > 0) {
@@ -298,13 +329,62 @@ dashboardRoutes.get('/notifications', async (c) => {
       siteName: meta.siteName,
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
+      flash: takeFlash(c),
       body: simpleTable(
         '通知中心',
-        ['时间', '标题', '内容'],
+        ['时间', '类型', '标题', '内容', '操作'],
         rows
-          .map((n) => `<tr><td class="tiny muted">${esc(n.created_at)}</td><td><b>${esc(n.title)}</b></td><td>${esc(n.body || '')}</td></tr>`)
-          .join('') || '<tr><td colspan="3">暂无通知</td></tr>',
+          .map((n) => {
+            const safeLink = u.safeInternalPath(n.link, '');
+            const kMeta = NOTIF_KIND_CHIP[n.kind] || NOTIF_KIND_CHIP.info;
+            const titleHtml = safeLink
+              ? `<a href="/notifications/${n.id}/open"><b>${esc(n.title)}</b></a>`
+              : `<b>${esc(n.title)}</b>`;
+            const ledgerChip = n.ledger_name ? ` <span class="chip">${esc(n.ledger_name)}</span>` : '';
+            const opHtml = safeLink
+              ? `<a class="btn btn-sm" href="/notifications/${n.id}/open">查看 →</a>`
+              : '<span class="tiny muted">—</span>';
+            return `<tr><td class="tiny muted nowrap">${esc(n.created_at)}</td><td><span class="chip ${kMeta.cls}">${kMeta.label}</span></td><td>${titleHtml}${ledgerChip}</td><td>${esc(n.body || '')}</td><td>${opHtml}</td></tr>`;
+          })
+          .join('') || '<tr><td colspan="5">暂无通知</td></tr>',
       ),
     }),
   );
+});
+
+dashboardRoutes.get('/notifications/:id/open', async (c) => {
+  const r = requireLogin(c);
+  if (r) return r;
+  const db = dbOf(c);
+  const ctx = c.get('ctx');
+  const sess = c.get('sess');
+  const id = Number(c.req.param('id'));
+  const row = await db.get<{ id: number; ledger_id: number | null; link: string | null }>(
+    'SELECT id, ledger_id, link FROM notifications WHERE id = ? AND user_id = ?',
+    id,
+    ctx.user!.id,
+  );
+  const target = row ? u.safeInternalPath(row.link, '') : '';
+  if (!row || !target) {
+    return c.redirect('/notifications');
+  }
+  if (row.ledger_id && Number(row.ledger_id) !== Number(ctx.ledger?.id)) {
+    const member = await db.get<{ role: string; is_archived: number }>(
+      `SELECT lm.role, l.is_archived
+       FROM ledger_members lm JOIN ledgers l ON l.id = lm.ledger_id
+       WHERE lm.user_id = ? AND lm.ledger_id = ?`,
+      ctx.user!.id,
+      Number(row.ledger_id),
+    );
+    if (!member || member.is_archived) {
+      setFlash(c, 'warn', '通知所属账本已归档或已无访问权限');
+      return c.redirect('/notifications');
+    }
+    if (sess) {
+      const nextPayload = auth.createSessionPayload(sess.uid, Number(row.ledger_id), sess.tv, sess.csrf);
+      const token = await auth.signSession(nextPayload, getSessionSecret(envOf(c)));
+      c.header('Set-Cookie', auth.sessionCookie(token, envOf(c)), { append: true });
+    }
+  }
+  return c.redirect(target);
 });

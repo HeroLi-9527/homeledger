@@ -76,17 +76,20 @@ export function subscriptionsPage({
     ov.items
       .map(
         (s) => `<tr>
-  <td>${esc(s.icon || '🧾')} <b>${esc(s.name)}</b> <span class="tiny muted">${esc(s.plan || '')}</span></td>
+  <td>${esc(s.icon || '🧾')} <b>${esc(s.name)}</b> <span class="tiny muted">${esc(s.plan || '')}</span><div class="tiny muted">已扣 ${Number(s.charge_count || 0)} 期</div></td>
   <td class="num amount">${fmtAmount(Number(s.amount_cents))}</td>
   <td>${esc(cycleLabel(String(s.cycle), Number(s.cycle_n)))}</td>
   <td>${esc(s.next_charge_at || '')}${s.daysLeft != null ? ` <span class="tiny muted">(${s.daysLeft}天)</span>` : ''}</td>
   <td><span class="chip">${esc(statusLabel(String(s.status)))}</span></td>
   <td>
-    <a class="btn btn-sm" href="/subscriptions/${s.id}/edit">编辑</a>
-    <form method="post" action="/subscriptions/${s.id}/charge" style="display:inline">${csrfInput}<input type="hidden" name="next_charge_at" value="${esc(s.next_charge_at || '')}"><button class="btn btn-sm" type="submit">扣费</button></form>
-    <form method="post" action="/subscriptions/${s.id}/skip" style="display:inline">${csrfInput}<input type="hidden" name="next_charge_at" value="${esc(s.next_charge_at || '')}"><button class="btn btn-sm" type="submit">跳过</button></form>
-    <form method="post" action="/subscriptions/${s.id}/toggle" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">${s.status === 'paused' || s.status === 'canceled' ? '恢复' : '暂停'}</button></form>
-    <form method="post" action="/subscriptions/${s.id}/cancel" style="display:inline">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">取消</button></form>
+    <div class="row wrap">
+      <a class="btn btn-sm" href="/subscriptions/${s.id}/edit">编辑</a>
+      <form method="post" action="/subscriptions/${s.id}/charge" style="display:inline">${csrfInput}<input type="hidden" name="next_charge_at" value="${esc(s.next_charge_at || '')}"><button class="btn btn-sm" type="submit">扣费</button></form>
+      <form method="post" action="/subscriptions/${s.id}/skip" style="display:inline">${csrfInput}<input type="hidden" name="next_charge_at" value="${esc(s.next_charge_at || '')}"><button class="btn btn-sm" type="submit">跳过</button></form>
+      <form method="post" action="/subscriptions/${s.id}/toggle" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">${s.status === 'paused' || s.status === 'canceled' ? '恢复' : '暂停'}</button></form>
+      <form method="post" action="/subscriptions/${s.id}/cancel" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">取消</button></form>
+      <form method="post" action="/subscriptions/${s.id}/delete" style="display:inline" data-confirm="确认永久删除该订阅？（不会删除已生成的历史扣费流水）">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
+    </div>
   </td>
 </tr>`,
       )

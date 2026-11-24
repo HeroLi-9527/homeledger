@@ -230,7 +230,7 @@ export async function overview(db: Db, ledgerId: number) {
 }
 
 export async function chargesOf(db: Db, ledgerId: number, subId: number, limit = 12) {
-  return db.all(
+  return db.all<{ id: number; amount_base_cents: number; txn_date: string; note: string | null; status: string }>(
     `SELECT id, amount_base_cents, txn_date, note, status FROM transactions
      WHERE ledger_id = ? AND subscription_id = ? AND deleted_at IS NULL
      ORDER BY txn_date DESC, id DESC LIMIT ?`,

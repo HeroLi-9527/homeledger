@@ -69,7 +69,7 @@ export function attachmentsPage({
   totalPages,
   csrf,
 }: {
-  rows: Array<AttachmentRow & { merchant?: string | null; amount_cents?: number | null }>;
+  rows: Array<AttachmentRow & { linked_txn_id?: number | null; txn_date?: string | null; merchant?: string | null; amount_cents?: number | null }>;
   page: number;
   total: number;
   totalPages: number;
@@ -77,15 +77,24 @@ export function attachmentsPage({
 }): string {
   const bodyRows =
     rows
-      .map(
-        (a) => `<tr>
-  <td><a href="${esc(webUrl(a.rel_path))}" target="_blank">${esc(a.file_name || a.rel_path)}</a></td>
-  <td>${a.merchant ? `${esc(a.merchant)} ${a.amount_cents ? (Number(a.amount_cents) / 100).toFixed(2) : ''}` : '—'}</td>
+      .map((a) => {
+        const imgUrl = webUrl(a.rel_path);
+        const txnLabel = a.linked_txn_id
+          ? `<a href="/transactions/${a.linked_txn_id}/edit">${esc(a.merchant || `流水 #${a.linked_txn_id}`)}${a.amount_cents != null ? ` · ¥${(Number(a.amount_cents) / 100).toFixed(2)}` : ''}${a.txn_date ? ` (${esc(a.txn_date)})` : ''}</a>`
+          : '—';
+        return `<tr>
+  <td>
+    <div class="row">
+      <a href="${esc(imgUrl)}" target="_blank" rel="noopener"><img src="${esc(imgUrl)}" alt="" style="width:38px;height:38px;object-fit:cover;border-radius:6px;border:1px solid var(--border)"></a>
+      <a href="${esc(imgUrl)}" target="_blank" rel="noopener">${esc(a.file_name || a.rel_path)}</a>
+    </div>
+  </td>
+  <td>${txnLabel}</td>
   <td><span class="chip">${esc(a.ai_status)}</span></td>
   <td class="tiny muted">${esc(a.created_at)}</td>
-  <td><form method="post" action="/attachments/${a.id}/delete" style="display:inline"><input type="hidden" name="_csrf" value="${esc(csrf)}"><button class="btn btn-sm btn-danger" type="submit">删除</button></form></td>
-</tr>`,
-      )
+  <td><form method="post" action="/attachments/${a.id}/delete" style="display:inline" data-confirm="确认删除该附件？将同步从 R2 存储移除。"><input type="hidden" name="_csrf" value="${esc(csrf)}"><button class="btn btn-sm btn-danger" type="submit">删除</button></form></td>
+</tr>`;
+      })
       .join('') || '<tr><td colspan="5">暂无附件</td></tr>';
 
   const pager =

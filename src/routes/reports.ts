@@ -53,6 +53,7 @@ reportsRoutes.get('/reports', async (c) => {
   const q = c.req.query();
   const range = parseReportRange(q);
   const kind: 'expense' | 'income' = q.kind === 'income' ? 'income' : 'expense';
+  const selectedCat = q.cat ? String(q.cat).trim() : null;
   const heatmapMonth = range.month || todayStr().slice(0, 7);
   const prevM = u.addMonths(heatmapMonth, -1);
   const lastYearM = u.addMonths(heatmapMonth, -12);
@@ -61,7 +62,7 @@ reportsRoutes.get('/reports', async (c) => {
     await Promise.all([
       txn.summary(db, ledgerId, range.start, range.end),
       txn.categoryBreakdown(db, ledgerId, range.start, range.end, kind),
-      txn.subcategoryBreakdown(db, ledgerId, range.start, range.end, kind, q.cat || null),
+      txn.subcategoryBreakdown(db, ledgerId, range.start, range.end, kind, selectedCat),
       txn.monthlyTrend(db, ledgerId, 12),
       txn.dailyBreakdown(db, ledgerId, `${heatmapMonth}-01`, u.monthEnd(heatmapMonth)),
       txn.memberBreakdown(db, ledgerId, range.start, range.end),
@@ -92,6 +93,7 @@ reportsRoutes.get('/reports', async (c) => {
     if (opts?.keepPeriod !== false && q.preset) next.set('preset', q.preset);
     if (opts?.keepPeriod !== false && q.month) next.set('month', q.month);
     if (q.kind) next.set('kind', q.kind);
+    if (q.cat) next.set('cat', q.cat);
     for (const [k, v] of Object.entries(overrides)) {
       if (v) next.set(k, v);
       else next.delete(k);
@@ -112,6 +114,7 @@ reportsRoutes.get('/reports', async (c) => {
       body: reportsPage({
         range,
         kind,
+        selectedCat,
         sum,
         compare,
         cats,
