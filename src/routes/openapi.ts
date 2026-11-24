@@ -6,13 +6,22 @@ import { analyzeBill } from '../lib/ai.js';
 import * as attach from '../lib/attachments.js';
 import * as auth from '../lib/auth.js';
 import * as fd from '../lib/formdata.js';
-import { budgetPeriodRange, budgetUsedInRange, effectiveBudget, tzRefDate, type BudgetRow } from '../lib/scheduler.js';
 import * as sc from '../lib/session-cards.js';
-import { decorate as decorateSub, overview as subsOverview, type SubscriptionRow } from '../lib/subscriptions.js';
+import { overview as subsOverview } from '../lib/subscriptions.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
-import type { AccountRow, HonoEnv, Role } from '../types.js';
+import type { AccountRow, CategoryRow, HonoEnv, Role } from '../types.js';
 import { dbOf, envOf, toPublicError } from './helpers.js';
+import {
+  parseAmountField,
+  parseBoolFlag,
+  parseOptionalDate,
+  parseOptionalRefId,
+  parsePositiveIntId,
+  readJsonObject,
+  requireWriteApi,
+} from './openapi-helpers.js';
+import { registerPlanningOpenApi } from './openapi-planning.js';
 
 export const openapiRoutes = new Hono<HonoEnv>();
 
@@ -82,14 +91,6 @@ openapiRoutes.use('*', async (c, next) => {
 
   await next();
 });
-
-function requireWriteApi(c: Context<HonoEnv>): Response | null {
-  const oa = c.get('openAuth');
-  if (!oa || !auth.canWrite(oa.role)) {
-    return c.json({ ok: false, error: '当前令牌成员角色为只读，禁止写入' }, 403);
-  }
-  return null;
-}
 
 openapiRoutes.get('/ping', (c) => {
   const oa = c.get('openAuth')!;
@@ -326,9 +327,13 @@ function enrichAccount(a: AccountRow) {
 
 openapiRoutes.get('/accounts', async (c) => {
   const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const includeArchived = c.req.query('include_archived') === '1' || c.req.query('include_archived') === 'true';
   const [accounts, ov] = await Promise.all([
-    fd.accounts(dbOf(c), oa.ledgerId),
-    txn.accountOverview(dbOf(c), oa.ledgerId),
+    includeArchived
+      ? db.all<AccountRow>('SELECT * FROM accounts WHERE ledger_id = ? ORDER BY is_archived, sort_order, id', oa.ledgerId)
+      : fd.accounts(db, oa.ledgerId),
+    txn.accountOverview(db, oa.ledgerId),
   ]);
   const summary = groupAccountsSummary(accounts);
   return c.json({
@@ -347,13 +352,26 @@ openapiRoutes.get('/accounts', async (c) => {
   });
 });
 
+openapiRoutes.get('/accounts/:id', async (c) => {
+  const oa = c.get('openAuth')!;
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '账户不存在' }, 404);
+  const acc = await dbOf(c).get<AccountRow>(
+    'SELECT * FROM accounts WHERE id = ? AND ledger_id = ?',
+    id,
+    oa.ledgerId,
+  );
+  if (!acc) return c.json({ ok: false, error: '账户不存在' }, 404);
+  return c.json({ ok: true, account: enrichAccount(acc) });
+});
+
 openapiRoutes.post('/accounts', async (c) => {
   const w = requireWriteApi(c);
   if (w) return w;
   const oa = c.get('openAuth')!;
   const db = dbOf(c);
   try {
-    const body = (await c.req.json()) as Record<string, unknown>;
+    const body = await readJsonObject(c);
     const data = normalizeAccountWrite(body, { mode: 'create', apiMode: true });
     const res = await db.run(
       `INSERT INTO accounts
@@ -389,15 +407,20 @@ async function handleApiAccountUpdate(c: Context<HonoEnv>) {
   if (w) return w;
   const oa = c.get('openAuth')!;
   const db = dbOf(c);
-  const id = Number(c.req.param('id'));
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '账户不存在' }, 404);
   try {
     const existing = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
     if (!existing) return c.json({ ok: false, error: '账户不存在' }, 404);
-    const body = (await c.req.json()) as Record<string, unknown>;
+    const body = await readJsonObject(c);
     const data = normalizeAccountWrite(body, { mode: 'edit', existing, apiMode: true });
+    const isArchived =
+      body.is_archived !== undefined
+        ? parseBoolFlag(body.is_archived, Number(existing.is_archived))
+        : Number(existing.is_archived);
     await db.run(
       `UPDATE accounts
-       SET name = ?, type = ?, icon = ?, currency = ?, include_in_net = ?, sort_order = ?,
+       SET name = ?, type = ?, icon = ?, currency = ?, include_in_net = ?, is_archived = ?, sort_order = ?,
            institution = ?, card_no = ?, note = ?, credit_limit = ?, bill_day = ?, due_day = ?
        WHERE id = ? AND ledger_id = ?`,
       data.name,
@@ -405,6 +428,7 @@ async function handleApiAccountUpdate(c: Context<HonoEnv>) {
       data.icon,
       data.currency,
       data.include_in_net,
+      isArchived,
       data.sort_order,
       data.institution,
       data.card_no,
@@ -424,6 +448,140 @@ async function handleApiAccountUpdate(c: Context<HonoEnv>) {
 
 openapiRoutes.put('/accounts/:id', handleApiAccountUpdate);
 openapiRoutes.patch('/accounts/:id', handleApiAccountUpdate);
+
+openapiRoutes.post('/accounts/:id/archive', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '账户不存在' }, 404);
+  const existing = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+  if (!existing) return c.json({ ok: false, error: '账户不存在' }, 404);
+  try {
+    const body = await readJsonObject(c, { optional: true });
+    const nextArchived =
+      body.is_archived !== undefined
+        ? parseBoolFlag(body.is_archived, Number(existing.is_archived))
+        : existing.is_archived
+          ? 0
+          : 1;
+    await db.run('UPDATE accounts SET is_archived = ? WHERE id = ? AND ledger_id = ?', nextArchived, id, oa.ledgerId);
+    const updated = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+    return c.json({ ok: true, id, account: updated ? enrichAccount(updated) : null });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+});
+
+openapiRoutes.post('/accounts/:id/adjust', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '账户不存在' }, 404);
+  const acc = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+  if (!acc) return c.json({ ok: false, error: '账户不存在' }, 404);
+  if (acc.is_archived) {
+    return c.json({ ok: false, error: '已归档账户不可校准余额，请先取消归档' }, 400);
+  }
+  try {
+    const body = await readJsonObject(c);
+    const target = parseAmountField(
+      body,
+      ['actual_balance_cents', 'balance_cents'],
+      ['actual_balance', 'balance'],
+      { allowZero: true, allowNegative: true, label: '目标余额' },
+    );
+    if (target === undefined) {
+      return c.json({ ok: false, error: '请填写目标余额' }, 400);
+    }
+    const adjustDate = parseOptionalDate(body.adjust_date ?? body.txn_date, todayStr(), '校准日期') || todayStr();
+    const diff = target - Number(acc.balance_cents);
+    if (diff === 0) {
+      return c.json({ ok: true, adjusted: false, diff_cents: 0, account: enrichAccount(acc), transaction: null });
+    }
+    const claim = await db.run(
+      'UPDATE accounts SET balance_cents = ? WHERE id = ? AND ledger_id = ? AND balance_cents = ?',
+      target,
+      id,
+      oa.ledgerId,
+      Number(acc.balance_cents),
+    );
+    if (claim.changes !== 1) {
+      return c.json({ ok: false, error: '账户余额已变动，请重试' }, 409);
+    }
+    let txnId: number;
+    try {
+      const note =
+        body.note != null && String(body.note).trim()
+          ? String(body.note).trim().slice(0, 300)
+          : `余额校准：${u.fmtAmount(acc.balance_cents)} → ${u.fmtAmount(target)}`;
+      txnId = await txn.createTransaction(db, oa.ledgerId, oa.userId, {
+        type: 'adjust',
+        amount_cents: diff,
+        currency: acc.currency || 'CNY',
+        rate: 1,
+        account_id: id,
+        txn_date: adjustDate,
+        note,
+        source: 'openapi',
+        skipBalanceDelta: true,
+      });
+    } catch (e) {
+      await db
+        .run(
+          'UPDATE accounts SET balance_cents = ? WHERE id = ? AND ledger_id = ? AND balance_cents = ?',
+          Number(acc.balance_cents),
+          id,
+          oa.ledgerId,
+          target,
+        )
+        .catch(() => {});
+      throw e;
+    }
+    const [updated, createdTxn] = await Promise.all([
+      db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId),
+      txn.getTransaction(db, txnId, oa.ledgerId),
+    ]);
+    return c.json({
+      ok: true,
+      adjusted: true,
+      diff_cents: diff,
+      account: updated ? enrichAccount(updated) : null,
+      transaction: createdTxn || null,
+    });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+});
+
+openapiRoutes.delete('/accounts/:id', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '账户不存在' }, 404);
+  const existing = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+  if (!existing) return c.json({ ok: false, error: '账户不存在' }, 404);
+  const used = Number(
+    (
+      await db.get<{ c: number }>(
+        'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND (account_id = ? OR to_account_id = ?) AND deleted_at IS NULL',
+        oa.ledgerId,
+        id,
+        id,
+      )
+    )?.c || 0,
+  );
+  if (used > 0) {
+    return c.json({ ok: false, error: `该账户还有 ${used} 笔未删除记账，无法删除` }, 400);
+  }
+  await db.run('DELETE FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+  return c.json({ ok: true });
+});
 
 openapiRoutes.get('/session-cards', async (c) => {
   const oa = c.get('openAuth')!;
@@ -543,6 +701,107 @@ openapiRoutes.post('/session-cards/:id/logs/:logId/undo', async (c) => {
   }
 });
 
+async function handleSessionCardUpdate(c: Context<HonoEnv>) {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '次卡不存在' }, 404);
+  const existing = await sc.getSessionCard(db, id, oa.ledgerId);
+  if (!existing) return c.json({ ok: false, error: '次卡不存在' }, 404);
+  try {
+    const body = await readJsonObject(c);
+    const totalCostCents = parseAmountField(body, ['total_cost_cents'], ['total_cost'], {
+      allowZero: true,
+      label: '购卡金额',
+    });
+    const expiresAt =
+      body.expires_at !== undefined
+        ? parseOptionalDate(body.expires_at, existing.expires_at, '有效期')
+        : undefined;
+    await sc.updateSessionCard(db, id, oa.ledgerId, {
+      name: body.name !== undefined ? String(body.name || '') : existing.name,
+      icon: body.icon !== undefined ? String(body.icon || '') : existing.icon,
+      merchant: body.merchant !== undefined ? (body.merchant == null ? null : String(body.merchant)) : undefined,
+      total_cost_cents: totalCostCents,
+      expires_at: expiresAt,
+      note: body.note !== undefined ? (body.note == null ? null : String(body.note)) : undefined,
+    });
+    if (body.is_archived !== undefined) {
+      const nextArchived = parseBoolFlag(body.is_archived, Number(existing.is_archived));
+      await db.run(
+        'UPDATE session_cards SET is_archived = ?, updated_at = ? WHERE id = ? AND ledger_id = ?',
+        nextArchived,
+        nowStr(),
+        id,
+        oa.ledgerId,
+      );
+    }
+    const card = await sc.getSessionCard(db, id, oa.ledgerId);
+    return c.json({ ok: true, id, card });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+}
+
+openapiRoutes.put('/session-cards/:id', handleSessionCardUpdate);
+openapiRoutes.patch('/session-cards/:id', handleSessionCardUpdate);
+
+openapiRoutes.post('/session-cards/:id/archive', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '次卡不存在' }, 404);
+  const existing = await sc.getSessionCard(db, id, oa.ledgerId);
+  if (!existing) return c.json({ ok: false, error: '次卡不存在' }, 404);
+  try {
+    const body = await readJsonObject(c, { optional: true });
+    const nextArchived =
+      body.is_archived !== undefined
+        ? parseBoolFlag(body.is_archived, Number(existing.is_archived))
+        : existing.is_archived
+          ? 0
+          : 1;
+    await db.run(
+      'UPDATE session_cards SET is_archived = ?, updated_at = ? WHERE id = ? AND ledger_id = ?',
+      nextArchived,
+      nowStr(),
+      id,
+      oa.ledgerId,
+    );
+    const card = await sc.getSessionCard(db, id, oa.ledgerId);
+    return c.json({ ok: true, id, card });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+});
+
+openapiRoutes.delete('/session-cards/:id', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '次卡不存在' }, 404);
+  const deleted = await sc.deleteSessionCard(dbOf(c), id, oa.ledgerId);
+  if (!deleted) return c.json({ ok: false, error: '次卡不存在' }, 404);
+  return c.json({ ok: true });
+});
+
+async function getCategoryWithPath(db: ReturnType<typeof dbOf>, id: number, ledgerId: number) {
+  const cat = await db.get<CategoryRow>(
+    `SELECT c.*, p.name AS parent_name
+     FROM categories c LEFT JOIN categories p ON p.id = c.parent_id
+     WHERE c.id = ? AND (c.ledger_id IS NULL OR c.ledger_id = ?)`,
+    id,
+    ledgerId,
+  );
+  if (!cat) return undefined;
+  return { ...cat, path: cat.parent_name ? `${cat.parent_name}/${cat.name}` : cat.name };
+}
+
 openapiRoutes.get('/categories', async (c) => {
   const oa = c.get('openAuth')!;
   const kind = c.req.query('kind');
@@ -551,9 +810,265 @@ openapiRoutes.get('/categories', async (c) => {
   return c.json({ ok: true, categories });
 });
 
+openapiRoutes.get('/categories/:id', async (c) => {
+  const oa = c.get('openAuth')!;
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '分类不存在' }, 404);
+  const category = await getCategoryWithPath(dbOf(c), id, oa.ledgerId);
+  if (!category) return c.json({ ok: false, error: '分类不存在' }, 404);
+  return c.json({ ok: true, category });
+});
+
+openapiRoutes.post('/categories', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  try {
+    const body = await readJsonObject(c);
+    const name = String(body.name || '').trim().slice(0, 20);
+    if (!name) return c.json({ ok: false, error: '请填写分类名称' }, 400);
+
+    let parentId = parseOptionalRefId(body.parent_id, null, '父分类 ID');
+    let kind: 'expense' | 'income' = 'expense';
+    let color = body.color ? String(body.color).trim().slice(0, 20) || '#8c8c8c' : '#8c8c8c';
+
+    if (parentId !== null) {
+      const parent = await db.get<CategoryRow>(
+        'SELECT * FROM categories WHERE id = ? AND (ledger_id IS NULL OR ledger_id = ?)',
+        parentId,
+        oa.ledgerId,
+      );
+      if (!parent) return c.json({ ok: false, error: '所属一级分类不存在' }, 400);
+      if (parent.parent_id != null) {
+        return c.json({ ok: false, error: '仅支持二级分类，不能在二级分类下继续新建子分类' }, 400);
+      }
+      kind = parent.kind;
+      if (body.kind !== undefined && String(body.kind) !== parent.kind) {
+        return c.json({ ok: false, error: '二级分类类型必须与一级分类一致' }, 400);
+      }
+      if (!body.color) color = parent.color || color;
+      parentId = Number(parent.id);
+    } else {
+      if (body.kind !== undefined && body.kind !== 'expense' && body.kind !== 'income') {
+        return c.json({ ok: false, error: '分类类型仅支持 expense 或 income' }, 400);
+      }
+      kind = body.kind === 'income' ? 'income' : 'expense';
+    }
+
+    const icon = String(body.icon || '🏷️').trim().slice(0, 8) || '🏷️';
+    const sortOrder =
+      body.sort_order !== undefined && String(body.sort_order).trim() !== ''
+        ? Math.round(Number(body.sort_order) || 0)
+        : 0;
+
+    const ins = await db.run(
+      'INSERT INTO categories (ledger_id, parent_id, kind, name, icon, color, is_system, is_archived, sort_order) VALUES (?,?,?,?,?,?,0,0,?)',
+      oa.ledgerId,
+      parentId,
+      kind,
+      name,
+      icon,
+      color,
+      sortOrder,
+    );
+    const id = Number(ins.lastInsertRowid);
+    const category = await getCategoryWithPath(db, id, oa.ledgerId);
+    return c.json({ ok: true, id, category }, 201);
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+});
+
+async function handleCategoryUpdate(c: Context<HonoEnv>) {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '分类不存在' }, 404);
+  const existing = await db.get<CategoryRow>(
+    'SELECT * FROM categories WHERE id = ? AND (ledger_id IS NULL OR ledger_id = ?)',
+    id,
+    oa.ledgerId,
+  );
+  if (!existing) return c.json({ ok: false, error: '分类不存在' }, 404);
+  if (existing.is_system || Number(existing.ledger_id) !== oa.ledgerId) {
+    return c.json({ ok: false, error: '内置系统分类不可修改' }, 400);
+  }
+  try {
+    const body = await readJsonObject(c);
+    if (body.kind !== undefined && String(body.kind) !== existing.kind) {
+      return c.json({ ok: false, error: '分类创建后不允许修改收支类型（kind）' }, 400);
+    }
+    if (body.parent_id !== undefined) {
+      const reqParentId = parseOptionalRefId(body.parent_id, null, '父分类 ID');
+      const curParentId = existing.parent_id != null ? Number(existing.parent_id) : null;
+      if ((reqParentId ?? null) !== curParentId) {
+        return c.json({ ok: false, error: '分类创建后不允许调整父级关系（parent_id）' }, 400);
+      }
+    }
+    const name = (body.name !== undefined ? String(body.name || '').trim() : existing.name).slice(0, 20);
+    if (!name) return c.json({ ok: false, error: '分类名称不能为空' }, 400);
+    const icon = body.icon !== undefined ? String(body.icon || '').trim().slice(0, 8) || '🏷️' : existing.icon;
+    const color =
+      body.color !== undefined ? String(body.color || '').trim().slice(0, 20) || existing.color : existing.color;
+    const sortOrder =
+      body.sort_order !== undefined && String(body.sort_order).trim() !== ''
+        ? Math.round(Number(body.sort_order) || 0)
+        : Number(existing.sort_order);
+    const isArchived = parseBoolFlag(body.is_archived, Number(existing.is_archived));
+
+    await db.run(
+      'UPDATE categories SET name = ?, icon = ?, color = ?, sort_order = ?, is_archived = ? WHERE id = ? AND ledger_id = ? AND is_system = 0',
+      name,
+      icon,
+      color,
+      sortOrder,
+      isArchived,
+      id,
+      oa.ledgerId,
+    );
+    const category = await getCategoryWithPath(db, id, oa.ledgerId);
+    return c.json({ ok: true, id, category });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+}
+
+openapiRoutes.put('/categories/:id', handleCategoryUpdate);
+openapiRoutes.patch('/categories/:id', handleCategoryUpdate);
+
+openapiRoutes.delete('/categories/:id', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '分类不存在' }, 404);
+  const existing = await db.get<CategoryRow>(
+    'SELECT * FROM categories WHERE id = ? AND (ledger_id IS NULL OR ledger_id = ?)',
+    id,
+    oa.ledgerId,
+  );
+  if (!existing) return c.json({ ok: false, error: '分类不存在' }, 404);
+  if (existing.is_system || Number(existing.ledger_id) !== oa.ledgerId) {
+    return c.json({ ok: false, error: '仅可删除当前账本的自定义分类' }, 400);
+  }
+  const childCnt = Number(
+    (await db.get<{ c: number }>('SELECT COUNT(*) AS c FROM categories WHERE parent_id = ? AND ledger_id = ?', id, oa.ledgerId))
+      ?.c || 0,
+  );
+  if (childCnt > 0) {
+    return c.json({ ok: false, error: `该分类下还有 ${childCnt} 个子分类，请先删除子分类` }, 400);
+  }
+  const used = Number(
+    (
+      await db.get<{ c: number }>(
+        'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND category_id = ? AND deleted_at IS NULL',
+        oa.ledgerId,
+        id,
+      )
+    )?.c || 0,
+  );
+  if (used > 0) {
+    return c.json({ ok: false, error: `该分类下还有 ${used} 笔记账，无法删除` }, 400);
+  }
+  await db.run('DELETE FROM categories WHERE id = ? AND ledger_id = ? AND is_system = 0', id, oa.ledgerId);
+  return c.json({ ok: true });
+});
+
+const TAG_SELECT =
+  'SELECT t.*, (SELECT COUNT(*) FROM transaction_tags tt WHERE tt.tag_id = t.id) AS cnt FROM tags t WHERE t.id = ? AND t.ledger_id = ?';
+
 openapiRoutes.get('/tags', async (c) => {
   const oa = c.get('openAuth')!;
   return c.json({ ok: true, tags: await fd.tags(dbOf(c), oa.ledgerId) });
+});
+
+openapiRoutes.get('/tags/:id', async (c) => {
+  const oa = c.get('openAuth')!;
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '标签不存在' }, 404);
+  const tag = await dbOf(c).get<fd.TagWithCount>(TAG_SELECT, id, oa.ledgerId);
+  if (!tag) return c.json({ ok: false, error: '标签不存在' }, 404);
+  return c.json({ ok: true, tag });
+});
+
+openapiRoutes.post('/tags', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  try {
+    const body = await readJsonObject(c);
+    const name = String(body.name || '').trim().slice(0, 20);
+    if (!name) return c.json({ ok: false, error: '请填写标签名称' }, 400);
+    const dup = await db.get<{ id: number }>('SELECT id FROM tags WHERE ledger_id = ? AND name = ?', oa.ledgerId, name);
+    if (dup) return c.json({ ok: false, error: '标签名称已存在' }, 409);
+    const color = body.color ? String(body.color).trim().slice(0, 20) || '#0F766E' : '#0F766E';
+    const ins = await db.run('INSERT INTO tags (ledger_id, name, color) VALUES (?,?,?)', oa.ledgerId, name, color);
+    const id = Number(ins.lastInsertRowid);
+    const tag = await db.get<fd.TagWithCount>(TAG_SELECT, id, oa.ledgerId);
+    return c.json({ ok: true, id, tag }, 201);
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+});
+
+async function handleTagUpdate(c: Context<HonoEnv>) {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '标签不存在' }, 404);
+  const existing = await db.get<{ id: number; ledger_id: number; name: string; color: string }>(
+    'SELECT * FROM tags WHERE id = ? AND ledger_id = ?',
+    id,
+    oa.ledgerId,
+  );
+  if (!existing) return c.json({ ok: false, error: '标签不存在' }, 404);
+  try {
+    const body = await readJsonObject(c);
+    const name = (body.name !== undefined ? String(body.name || '').trim() : existing.name).slice(0, 20);
+    if (!name) return c.json({ ok: false, error: '标签名称不能为空' }, 400);
+    if (name !== existing.name) {
+      const dup = await db.get<{ id: number }>(
+        'SELECT id FROM tags WHERE ledger_id = ? AND name = ? AND id != ?',
+        oa.ledgerId,
+        name,
+        id,
+      );
+      if (dup) return c.json({ ok: false, error: '标签名称已存在' }, 409);
+    }
+    const color =
+      body.color !== undefined ? String(body.color || '').trim().slice(0, 20) || existing.color : existing.color;
+    await db.run('UPDATE tags SET name = ?, color = ? WHERE id = ? AND ledger_id = ?', name, color, id, oa.ledgerId);
+    const tag = await db.get<fd.TagWithCount>(TAG_SELECT, id, oa.ledgerId);
+    return c.json({ ok: true, id, tag });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
+}
+
+openapiRoutes.put('/tags/:id', handleTagUpdate);
+openapiRoutes.patch('/tags/:id', handleTagUpdate);
+
+openapiRoutes.delete('/tags/:id', async (c) => {
+  const w = requireWriteApi(c);
+  if (w) return w;
+  const oa = c.get('openAuth')!;
+  const db = dbOf(c);
+  const id = parsePositiveIntId(c.req.param('id'));
+  if (!id) return c.json({ ok: false, error: '标签不存在' }, 404);
+  const existing = await db.get<{ id: number }>('SELECT id FROM tags WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+  if (!existing) return c.json({ ok: false, error: '标签不存在' }, 404);
+  await db.batch([
+    ['DELETE FROM transaction_tags WHERE tag_id = ?', [id]],
+    ['DELETE FROM tags WHERE id = ? AND ledger_id = ?', [id, oa.ledgerId]],
+  ]);
+  return c.json({ ok: true });
 });
 
 openapiRoutes.get('/summary', async (c) => {
@@ -615,51 +1130,7 @@ openapiRoutes.get('/reports', async (c) => {
   return c.json({ ok: true, month, summary, expense_categories, income_categories, trend, members, net_worth });
 });
 
-openapiRoutes.get('/budgets', async (c) => {
-  const oa = c.get('openAuth')!;
-  const db = dbOf(c);
-  const ref = tzRefDate();
-  const rows = await db.all<BudgetRow>('SELECT * FROM budgets WHERE ledger_id = ? AND is_active = 1 ORDER BY id', oa.ledgerId);
-  const budgets = await Promise.all(
-    rows.map(async (b) => {
-      const range = budgetPeriodRange(b, ref);
-      const used = await budgetUsedInRange(db, b, range.start, range.end);
-      const eff = await effectiveBudget(db, b, ref);
-      return { ...b, range, used_cents: used, effective_cents: eff.amount, rollover_cents: eff.rollover };
-    }),
-  );
-  return c.json({ ok: true, budgets });
-});
-
-openapiRoutes.get('/subscriptions', async (c) => {
-  const oa = c.get('openAuth')!;
-  const rows = await dbOf(c).all<SubscriptionRow>(
-    'SELECT * FROM subscriptions WHERE ledger_id = ? ORDER BY id DESC',
-    oa.ledgerId,
-  );
-  return c.json({ ok: true, subscriptions: rows.map((s) => decorateSub(s)) });
-});
-
-openapiRoutes.get('/recurring', async (c) => {
-  const oa = c.get('openAuth')!;
-  const rules = await dbOf(c).all('SELECT * FROM recurring_rules WHERE ledger_id = ? ORDER BY id DESC', oa.ledgerId);
-  return c.json({ ok: true, recurring: rules });
-});
-
-async function listDebts(c: Context<HonoEnv>) {
-  const oa = c.get('openAuth')!;
-  const debts = await dbOf(c).all('SELECT * FROM debts WHERE ledger_id = ? ORDER BY status, id DESC', oa.ledgerId);
-  return c.json({ ok: true, debts });
-}
-
-openapiRoutes.get('/debts', listDebts);
-openapiRoutes.get('/loans', listDebts);
-
-openapiRoutes.get('/goals', async (c) => {
-  const oa = c.get('openAuth')!;
-  const goals = await dbOf(c).all('SELECT * FROM goals WHERE ledger_id = ? ORDER BY id DESC', oa.ledgerId);
-  return c.json({ ok: true, goals });
-});
+registerPlanningOpenApi(openapiRoutes);
 
 openapiRoutes.get('/export', async (c) => {
   const oa = c.get('openAuth')!;

@@ -130,7 +130,7 @@ Authorization: Bearer hl_xxxxxxxxxxxxxxxx
 
 支持在请求头 `x-ledger-id` 或查询参数 `ledger_id` 中指定有权限的目标账本（默认使用令牌绑定账本）。
 
-常用端点：
+常用端点（写操作兼容 `*_cents` 整数分与元单位金额，编辑同时支持 `PUT` 与 `PATCH`）：
 
 - `GET /api/open/ping`：校验令牌连通性与当前绑定账本信息
 - `GET /api/open/overview` / `GET /api/open/summary` / `GET /api/open/reports`：月度汇总、资产负债概览与报表聚合
@@ -138,6 +138,13 @@ Authorization: Bearer hl_xxxxxxxxxxxxxxxx
 - `POST /api/open/transactions` / `PUT|PATCH /api/open/transactions/:id` / `DELETE /api/open/transactions/:id`：写入、编辑或软删流水（同步更新账户余额与 R2 附件）
 - `POST /api/open/ai/bill`：上传文本或 base64 账单截图，自动识别并按 `auto_save` 入库并存档原图
 - `GET /api/open/attachments/:id`：读取 R2 存档的账单截图
-- `GET|POST /api/open/accounts`、`PUT|PATCH /api/open/accounts/:id`：查询三层账户与信用指标、新建或编辑账户元数据
-- `GET|POST /api/open/session-cards`、`GET /api/open/session-cards/:id`、`POST /api/open/session-cards/:id/use`、`POST /api/open/session-cards/:id/topup`、`POST /api/open/session-cards/:id/logs/:logId/undo`：次卡台账查询、开卡、核销、续费与撤销
-- `GET /api/open/categories`、`GET /api/open/tags`、`GET /api/open/budgets`、`GET /api/open/subscriptions`、`GET /api/open/recurring`、`GET /api/open/debts`（别名 `/api/open/loans`）、`GET /api/open/goals`、`GET /api/open/export`
+- `GET|POST /api/open/accounts`、`GET|PUT|PATCH|DELETE /api/open/accounts/:id`、`POST /api/open/accounts/:id/archive`、`POST /api/open/accounts/:id/adjust`：账户分层查询（支持 `?include_archived=1`）、新建、编辑、归档切换、余额校准与删除
+- `GET|POST /api/open/session-cards`、`GET|PUT|PATCH|DELETE /api/open/session-cards/:id`、`POST /api/open/session-cards/:id/archive`、`POST /api/open/session-cards/:id/use`、`POST /api/open/session-cards/:id/topup`、`POST /api/open/session-cards/:id/logs/:logId/undo`：次卡台账查询、开卡、编辑、归档、删除、核销、续费与撤销
+- `GET|POST /api/open/categories`、`GET|PUT|PATCH|DELETE /api/open/categories/:id`：分类查询与当前账本自定义一/二级分类增删改
+- `GET|POST /api/open/tags`、`GET|PUT|PATCH|DELETE /api/open/tags/:id`：标签查询与增删改
+- `GET|POST /api/open/budgets`、`GET|PUT|PATCH|DELETE /api/open/budgets/:id`：预算管理与周期进度查询（默认返回启用项，支持 `?include_inactive=1`）
+- `GET|POST /api/open/recurring`、`GET|PUT|PATCH|DELETE /api/open/recurring/:id`、`POST /api/open/recurring/:id/run`：周期账单增删改与立即执行
+- `GET|POST /api/open/subscriptions`、`GET|PUT|PATCH|DELETE /api/open/subscriptions/:id`、`POST /api/open/subscriptions/:id/charge`、`POST /api/open/subscriptions/:id/skip`：订阅管理、扣费历史查询、手动扣费与跳过本期
+- `GET|POST /api/open/debts`、`GET|PUT|PATCH|DELETE /api/open/debts/:id`、`POST /api/open/debts/:id/settle`（全量提供 `/api/open/loans*` 别名）：借贷台账增删改与收/还款结清
+- `GET|POST /api/open/goals`、`GET|PUT|PATCH|DELETE /api/open/goals/:id`、`POST /api/open/goals/:id/deposit`：储蓄目标增删改与存入/取出
+- `GET /api/open/export`：全量流水 JSON 导出

@@ -1766,3 +1766,531 @@ test('未配置 SESSION_SECRET 时返回 503 友好配置引导页且阻止半�
     assert.equal(healthBody.ok, true);
   }
 });
+
+test('OpenAPI 全资源 CRUD、业务动作与权限/跨账本隔离回归', async () => {
+  const { sqlite, env } = setupEnv();
+  const req = (p: string, init: RequestInit = {}) =>
+    app.fetch(new Request(`http://localhost${p}`, init), env);
+  const api = (p: string, token: string, method = 'GET', body?: unknown) =>
+    req(`/api/open${p}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+  // 1. 初始化管理员 alice（账本 1）并创建令牌
+  const setupRes = await req('/setup', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({
+      username: 'alice',
+      display_name: 'Alice',
+      password: 'password123',
+      password2: 'password123',
+      site_name: 'OpenAPI 回归',
+    }),
+  });
+  assert.equal(setupRes.status, 302);
+  const aliceCookie = extractSidCookie(setupRes);
+  const aliceCsrf = extractCsrf(await (await req('/', { headers: { Cookie: aliceCookie } })).text());
+
+  const aliceTokRes = await req('/settings/api-tokens', {
+    method: 'POST',
+    headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'AliceL1' }),
+  });
+  const { token: aliceToken } = (await aliceTokRes.json()) as { token: string };
+
+  // 2. 邀请 bob 作为账本 1 的只读成员（viewer），再让 bob 自建账本 2（alice 无权访问）
+  await req('/members/invite', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: aliceCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: aliceCsrf, role: 'viewer', days: '7' }),
+  });
+  const invRow = sqlite.prepare('SELECT code FROM ledger_invites ORDER BY id DESC LIMIT 1').get() as { code: string };
+  const bobJoinRes = await req(`/join/${invRow.code}/register`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+    body: new URLSearchParams({
+      username: 'bob',
+      display_name: 'Bob',
+      password: 'bobpassword',
+      password2: 'bobpassword',
+    }),
+  });
+  const bobL1Cookie = extractSidCookie(bobJoinRes);
+  const bobL1Csrf = extractCsrf(await (await req('/', { headers: { Cookie: bobL1Cookie } })).text());
+  const viewerTokRes = await req('/settings/api-tokens', {
+    method: 'POST',
+    headers: { Cookie: bobL1Cookie, 'x-csrf-token': bobL1Csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'BobViewerL1' }),
+  });
+  const { token: viewerToken } = (await viewerTokRes.json()) as { token: string };
+
+  const bobNewLedger = await req('/ledgers', {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { Cookie: bobL1Cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: bobL1Csrf, name: 'Bob私账', kind: 'personal', currency: 'CNY' }),
+  });
+  const bobL2Cookie = extractSidCookie(bobNewLedger);
+  const bobL2Csrf = extractCsrf(await (await req('/', { headers: { Cookie: bobL2Cookie } })).text());
+  const bobL2TokRes = await req('/settings/api-tokens', {
+    method: 'POST',
+    headers: { Cookie: bobL2Cookie, 'x-csrf-token': bobL2Csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'BobOwnerL2' }),
+  });
+  const { token: bobL2Token } = (await bobL2TokRes.json()) as { token: string };
+
+  // 3. 只读角色（viewer）读 200、全写 403
+  for (const getPath of [
+    '/accounts',
+    '/accounts/1',
+    '/session-cards',
+    '/categories',
+    '/categories/1',
+    '/tags',
+    '/budgets',
+    '/recurring',
+    '/subscriptions',
+    '/debts',
+    '/loans',
+    '/goals',
+  ]) {
+    assert.equal((await api(getPath, viewerToken, 'GET')).status, 200, `viewer GET ${getPath} 应返回 200`);
+  }
+  for (const [m, p] of [
+    ['POST', '/accounts'],
+    ['PATCH', '/accounts/1'],
+    ['POST', '/accounts/1/archive'],
+    ['POST', '/accounts/1/adjust'],
+    ['DELETE', '/accounts/1'],
+    ['POST', '/session-cards'],
+    ['PATCH', '/session-cards/1'],
+    ['POST', '/session-cards/1/archive'],
+    ['DELETE', '/session-cards/1'],
+    ['POST', '/categories'],
+    ['PATCH', '/categories/1'],
+    ['DELETE', '/categories/1'],
+    ['POST', '/tags'],
+    ['PATCH', '/tags/1'],
+    ['DELETE', '/tags/1'],
+    ['POST', '/budgets'],
+    ['PATCH', '/budgets/1'],
+    ['DELETE', '/budgets/1'],
+    ['POST', '/recurring'],
+    ['PATCH', '/recurring/1'],
+    ['POST', '/recurring/1/run'],
+    ['DELETE', '/recurring/1'],
+    ['POST', '/subscriptions'],
+    ['PATCH', '/subscriptions/1'],
+    ['POST', '/subscriptions/1/charge'],
+    ['POST', '/subscriptions/1/skip'],
+    ['DELETE', '/subscriptions/1'],
+    ['POST', '/debts'],
+    ['PATCH', '/debts/1'],
+    ['POST', '/debts/1/settle'],
+    ['DELETE', '/debts/1'],
+    ['POST', '/loans'],
+    ['PATCH', '/loans/1'],
+    ['POST', '/loans/1/settle'],
+    ['DELETE', '/loans/1'],
+    ['POST', '/goals'],
+    ['PATCH', '/goals/1'],
+    ['POST', '/goals/1/deposit'],
+    ['DELETE', '/goals/1'],
+  ] as const) {
+    assert.equal((await api(p, viewerToken, m, {})).status, 403, `viewer ${m} ${p} 应返回 403`);
+  }
+
+  // 4. Accounts CRUD + 归档 + 余额校准 + 删除校验
+  const acc1Get = await api('/accounts/1', aliceToken);
+  assert.equal(acc1Get.status, 200);
+  assert.equal(((await acc1Get.json()) as { account: { group: string } }).account.group, 'funds');
+
+  const accCreate = await api('/accounts', aliceToken, 'POST', { name: '招商储蓄卡', type: 'debit', balance: '100.00' });
+  assert.equal(accCreate.status, 201);
+  const accId = ((await accCreate.json()) as { id: number }).id;
+
+  const adjZero = (await (await api(`/accounts/${accId}/adjust`, aliceToken, 'POST', { actual_balance_cents: 10000 })).json()) as {
+    ok: boolean;
+    adjusted: boolean;
+    diff_cents: number;
+    transaction: unknown;
+  };
+  assert.equal(adjZero.adjusted, false);
+  assert.equal(adjZero.diff_cents, 0);
+  assert.equal(adjZero.transaction, null);
+
+  const adjUp = (await (await api(`/accounts/${accId}/adjust`, aliceToken, 'POST', { actual_balance: '150.50' })).json()) as {
+    ok: boolean;
+    adjusted: boolean;
+    diff_cents: number;
+    account: { balance_cents: number };
+    transaction: { id: number; type: string };
+  };
+  assert.equal(adjUp.adjusted, true);
+  assert.equal(adjUp.diff_cents, 5050);
+  assert.equal(adjUp.account.balance_cents, 15050);
+  assert.equal(adjUp.transaction.type, 'adjust');
+
+  const accPatchArch = (await (await api(`/accounts/${accId}`, aliceToken, 'PATCH', { is_archived: true })).json()) as {
+    account: { is_archived: number };
+  };
+  assert.equal(accPatchArch.account.is_archived, 1);
+  const accActiveList = (await (await api('/accounts', aliceToken)).json()) as { accounts: Array<{ id: number }> };
+  assert.equal(accActiveList.accounts.some((a) => a.id === accId), false);
+  const accAllList = (await (await api('/accounts?include_archived=1', aliceToken)).json()) as { accounts: Array<{ id: number }> };
+  assert.equal(accAllList.accounts.some((a) => a.id === accId), true);
+
+  assert.equal((await api(`/accounts/${accId}/adjust`, aliceToken, 'POST', { actual_balance: '200' })).status, 400);
+  const accUnarch = (await (await api(`/accounts/${accId}/archive`, aliceToken, 'POST')).json()) as {
+    account: { is_archived: number };
+  };
+  assert.equal(accUnarch.account.is_archived, 0);
+
+  assert.equal((await api(`/accounts/${accId}`, aliceToken, 'DELETE')).status, 400, '有流水账户禁删');
+  assert.equal((await api(`/transactions/${adjUp.transaction.id}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/accounts/${accId}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/accounts/${accId}`, aliceToken)).status, 404);
+
+  // 5. Session Cards PATCH / archive / DELETE（保留购卡流水）
+  const scRes = await api('/session-cards', aliceToken, 'POST', {
+    name: '理发次卡',
+    total_sessions: 5,
+    total_cost: '250.00',
+    record_expense: true,
+    account_id: 1,
+  });
+  assert.equal(scRes.status, 201);
+  const scJson = (await scRes.json()) as { id: number; card: { purchase_txn_id: number } };
+  const scPatch = (await (
+    await api(`/session-cards/${scJson.id}`, aliceToken, 'PATCH', {
+      name: '理发VIP卡',
+      note: '周末可用',
+      total_cost_cents: 30000,
+      is_archived: true,
+    })
+  ).json()) as { card: { name: string; total_cost_cents: number; is_archived: number } };
+  assert.equal(scPatch.card.name, '理发VIP卡');
+  assert.equal(scPatch.card.total_cost_cents, 30000);
+  assert.equal(scPatch.card.is_archived, 1);
+
+  const scArchToggle = (await (await api(`/session-cards/${scJson.id}/archive`, aliceToken, 'POST')).json()) as {
+    card: { is_archived: number };
+  };
+  assert.equal(scArchToggle.card.is_archived, 0);
+  assert.equal((await api(`/session-cards/${scJson.id}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/transactions/${scJson.card.purchase_txn_id}`, aliceToken)).status, 200, '删卡保留购卡流水');
+
+  // 6. Categories CRUD
+  const catRootRes = await api('/categories', aliceToken, 'POST', { name: '养宠', kind: 'expense', icon: '🐾' });
+  assert.equal(catRootRes.status, 201);
+  const catRootId = ((await catRootRes.json()) as { id: number }).id;
+
+  const catSubRes = await api('/categories', aliceToken, 'POST', { name: '猫粮', parent_id: catRootId });
+  assert.equal(catSubRes.status, 201);
+  const catSubJson = (await catSubRes.json()) as { id: number; category: { kind: string; path: string } };
+  assert.equal(catSubJson.category.kind, 'expense');
+  assert.equal(catSubJson.category.path, '养宠/猫粮');
+
+  assert.equal((await api('/categories', aliceToken, 'POST', { name: '三级', parent_id: catSubJson.id })).status, 400);
+  assert.equal((await api(`/categories/${catSubJson.id}`, aliceToken)).status, 200);
+  const catPatch = (await (
+    await api(`/categories/${catSubJson.id}`, aliceToken, 'PATCH', { name: '主食猫粮', icon: '🐟' })
+  ).json()) as { category: { path: string; icon: string } };
+  assert.equal(catPatch.category.path, '养宠/主食猫粮');
+  assert.equal((await api('/categories/1', aliceToken, 'PATCH', { name: '改系统' })).status, 400);
+  assert.equal((await api(`/categories/${catRootId}`, aliceToken, 'DELETE')).status, 400);
+
+  const catTxn = (await (
+    await api('/transactions', aliceToken, 'POST', { type: 'expense', amount: '50', account_id: 1, category_id: catSubJson.id })
+  ).json()) as { id: number };
+  assert.equal((await api(`/categories/${catSubJson.id}`, aliceToken, 'DELETE')).status, 400);
+  assert.equal((await api(`/transactions/${catTxn.id}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/categories/${catSubJson.id}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/categories/${catRootId}`, aliceToken, 'DELETE')).status, 200);
+
+  // 7. Tags CRUD
+  const tag1Res = await api('/tags', aliceToken, 'POST', { name: '出差', color: '#2563EB' });
+  assert.equal(tag1Res.status, 201);
+  const tag1Id = ((await tag1Res.json()) as { id: number }).id;
+  assert.equal((await api('/tags', aliceToken, 'POST', { name: '出差' })).status, 409);
+
+  await api('/tags', aliceToken, 'POST', { name: '日常' });
+  assert.equal((await api(`/tags/${tag1Id}`, aliceToken, 'PATCH', { name: '日常' })).status, 409);
+  const tagPatch = (await (
+    await api(`/tags/${tag1Id}`, aliceToken, 'PATCH', { name: '商旅', color: '#0F766E' })
+  ).json()) as { tag: { name: string; color: string } };
+  assert.equal(tagPatch.tag.name, '商旅');
+
+  await api('/transactions', aliceToken, 'POST', { type: 'expense', amount: '20', account_id: 1, tags: '商旅' });
+  const tagGet = (await (await api(`/tags/${tag1Id}`, aliceToken)).json()) as { tag: { cnt: number } };
+  assert.equal(tagGet.tag.cnt, 1);
+  assert.equal((await api(`/tags/${tag1Id}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal(
+    (sqlite.prepare('SELECT COUNT(*) AS c FROM transaction_tags WHERE tag_id = ?').get(tag1Id) as { c: number }).c,
+    0,
+  );
+
+  // 8. Budgets CRUD
+  const expCat = sqlite.prepare("SELECT id FROM categories WHERE kind = 'expense' LIMIT 1").get() as { id: number };
+  assert.equal(
+    (await api('/budgets', aliceToken, 'POST', { name: '坏自定义', period: 'custom', amount: '100' })).status,
+    400,
+  );
+  const budCreate = await api('/budgets', aliceToken, 'POST', {
+    name: '月度餐饮预算',
+    scope: 'category',
+    category_id: expCat.id,
+    period: 'monthly',
+    amount: '1500.00',
+    rollover: true,
+    alert_pct: 85,
+  });
+  assert.equal(budCreate.status, 201);
+  const budId = ((await budCreate.json()) as { id: number }).id;
+  assert.equal((await api(`/budgets/${budId}`, aliceToken)).status, 200);
+  const budPatch = (await (
+    await api(`/budgets/${budId}`, aliceToken, 'PATCH', { amount_cents: 200000, is_active: false })
+  ).json()) as { budget: { amount_cents: number; is_active: number } };
+  assert.equal(budPatch.budget.amount_cents, 200000);
+  assert.equal(budPatch.budget.is_active, 0);
+
+  const budDefList = (await (await api('/budgets', aliceToken)).json()) as { budgets: Array<{ id: number }> };
+  assert.equal(budDefList.budgets.some((b) => b.id === budId), false);
+  const budAllList = (await (await api('/budgets?include_inactive=1', aliceToken)).json()) as { budgets: Array<{ id: number }> };
+  assert.equal(budAllList.budgets.some((b) => b.id === budId), true);
+  assert.equal((await api(`/budgets/${budId}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/budgets/${budId}`, aliceToken)).status, 404);
+
+  // 9. Recurring CRUD + /run + 409 防重
+  const recCreate = await api('/recurring', aliceToken, 'POST', {
+    name: '房租物业',
+    frequency: 'monthly',
+    interval_n: 1,
+    next_run_at: todayStr(),
+    items: [
+      { type: 'expense', amount: '2500.00', account_id: 1, note: '房租' },
+      { type: 'expense', amount_cents: 15000, account_id: 1, note: '物业' },
+    ],
+  });
+  assert.equal(recCreate.status, 201);
+  const recJson = (await recCreate.json()) as { id: number; recurring: { next_run_at: string; items: unknown[] } };
+  assert.equal(recJson.recurring.items.length, 2);
+
+  const recGet = (await (await api(`/recurring/${recJson.id}`, aliceToken)).json()) as {
+    recurring: { payload: string; items: unknown[] };
+  };
+  assert.ok(typeof recGet.recurring.payload === 'string' && recGet.recurring.items.length === 2);
+  assert.equal((await api(`/recurring/${recJson.id}`, aliceToken, 'PATCH', { name: '新房租物业' })).status, 200);
+
+  const recPeriod = recJson.recurring.next_run_at;
+  const recRun = (await (await api(`/recurring/${recJson.id}/run`, aliceToken, 'POST', {})).json()) as {
+    ok: boolean;
+    created: number;
+    next_run_at: string;
+  };
+  assert.equal(recRun.created, 2);
+  assert.notEqual(recRun.next_run_at, recPeriod);
+  assert.equal((await api(`/recurring/${recJson.id}/run`, aliceToken, 'POST', { next_run_at: recPeriod })).status, 409);
+  assert.equal((await api(`/recurring/${recJson.id}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/recurring/${recJson.id}`, aliceToken)).status, 404);
+
+  // 10. Subscriptions CRUD + /charge + /skip + DELETE 留流水
+  assert.equal(
+    (await api('/subscriptions', aliceToken, 'POST', { name: '缺结束日试用', status: 'trial', amount: '30' })).status,
+    400,
+  );
+  const subCreate = await api('/subscriptions', aliceToken, 'POST', {
+    name: 'Notion Plus',
+    amount: '68.00',
+    cycle: 'monthly',
+    account_id: 1,
+    next_charge_at: todayStr(),
+    status: 'active',
+  });
+  assert.equal(subCreate.status, 201);
+  const subId = ((await subCreate.json()) as { id: number }).id;
+
+  const subCancel = (await (await api(`/subscriptions/${subId}`, aliceToken, 'PATCH', { status: 'canceled' })).json()) as {
+    subscription: { status: string; canceled_at: string | null };
+  };
+  assert.equal(subCancel.subscription.status, 'canceled');
+  assert.ok(subCancel.subscription.canceled_at);
+  assert.equal((await api(`/subscriptions/${subId}/charge`, aliceToken, 'POST', {})).status, 400);
+
+  const subReactivate = (await (
+    await api(`/subscriptions/${subId}`, aliceToken, 'PATCH', { status: 'active', next_charge_at: todayStr() })
+  ).json()) as { subscription: { status: string; canceled_at: string | null; next_charge_at: string } };
+  assert.equal(subReactivate.subscription.status, 'active');
+  assert.equal(subReactivate.subscription.canceled_at, null);
+
+  const subPeriod = subReactivate.subscription.next_charge_at;
+  const subCharge = (await (await api(`/subscriptions/${subId}/charge`, aliceToken, 'POST', {})).json()) as {
+    transaction_id: number;
+    next_charge_at: string;
+  };
+  assert.ok(subCharge.transaction_id > 0);
+  assert.equal((await api(`/subscriptions/${subId}/charge`, aliceToken, 'POST', { next_charge_at: subPeriod })).status, 409);
+
+  const subSkip = (await (await api(`/subscriptions/${subId}/skip`, aliceToken, 'POST', {})).json()) as {
+    skipped_date: string;
+    next_charge_at: string;
+  };
+  assert.equal(subSkip.skipped_date, subCharge.next_charge_at);
+  assert.notEqual(subSkip.next_charge_at, subCharge.next_charge_at);
+
+  const subDetail = (await (await api(`/subscriptions/${subId}`, aliceToken)).json()) as { charges: unknown[] };
+  assert.equal(subDetail.charges.length, 1);
+  assert.equal((await api(`/subscriptions/${subId}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/transactions/${subCharge.transaction_id}`, aliceToken)).status, 200, '删订阅保留历史扣费流水');
+
+  // 11. Debts & /loans CRUD + /settle + 自动汇总保护
+  const debtCreate = await api('/debts', aliceToken, 'POST', {
+    direction: 'receivable',
+    counterparty: '王五',
+    principal: '500.00',
+    account_id: 1,
+    due_date: '2026-12-31',
+  });
+  assert.equal(debtCreate.status, 201);
+  const debtId = ((await debtCreate.json()) as { id: number }).id;
+  assert.equal((await api(`/loans/${debtId}`, aliceToken)).status, 200);
+  assert.equal((await api(`/loans/${debtId}`, aliceToken, 'PATCH', { note: '朋友借款', balance_cents: 40000 })).status, 200);
+
+  const settle1 = (await (
+    await api(`/debts/${debtId}/settle`, aliceToken, 'POST', { amount: '150.00', account_id: 1 })
+  ).json()) as { debt: { balance_cents: number; status: string } };
+  assert.equal(settle1.debt.balance_cents, 25000);
+  assert.equal(settle1.debt.status, 'open');
+
+  const settle2 = (await (await api(`/loans/${debtId}/settle`, aliceToken, 'POST', { account_id: 1 })).json()) as {
+    debt: { balance_cents: number; status: string };
+  };
+  assert.equal(settle2.debt.balance_cents, 0);
+  assert.equal(settle2.debt.status, 'closed');
+  assert.equal((await api(`/debts/${debtId}`, aliceToken, 'DELETE')).status, 200);
+
+  const autoDebtCreate = await api('/loans', aliceToken, 'POST', {
+    direction: 'payable',
+    counterparty: '赵六',
+    amount: '800.00',
+    account_id: 1,
+    create_txn: true,
+    due_date: '2026-12-20',
+  });
+  assert.equal(autoDebtCreate.status, 201);
+  const autoDebt = ((await autoDebtCreate.json()) as { id: number; debt: { note: string; due_date: string } }).debt;
+  const autoDebtId = (autoDebt as unknown as { id: number }).id;
+  assert.equal(autoDebt.note, '系统自动汇总');
+  assert.equal(autoDebt.due_date, '2026-12-20');
+
+  assert.equal((await api(`/debts/${autoDebtId}`, aliceToken, 'PATCH', { principal: '100' })).status, 400);
+  const autoPatchDue = (await (
+    await api(`/debts/${autoDebtId}`, aliceToken, 'PATCH', { due_date: '2026-12-25' })
+  ).json()) as { debt: { due_date: string } };
+  assert.equal(autoPatchDue.debt.due_date, '2026-12-25');
+  assert.equal((await api(`/debts/${autoDebtId}`, aliceToken, 'DELETE')).status, 400);
+
+  const autoSettle = (await (await api(`/loans/${autoDebtId}/settle`, aliceToken, 'POST', { account_id: 1 })).json()) as {
+    ok: boolean;
+    debt: { balance_cents: number; status: string; note: string };
+  };
+  assert.equal(autoSettle.ok, true);
+  assert.equal(autoSettle.debt.balance_cents, 0);
+  assert.equal(autoSettle.debt.status, 'closed');
+  assert.equal(autoSettle.debt.note, '系统自动汇总');
+
+  // 12. Goals CRUD + /deposit（存取与达标通知）
+  const goalCreate = await api('/goals', aliceToken, 'POST', {
+    name: '购车基金',
+    target: '1000.00',
+    saved_amount: '200.00',
+    account_id: 1,
+  });
+  assert.equal(goalCreate.status, 201);
+  const goalId = ((await goalCreate.json()) as { id: number }).id;
+  assert.equal((await api(`/goals/${goalId}`, aliceToken)).status, 200);
+  assert.equal((await api(`/goals/${goalId}`, aliceToken, 'PATCH', { name: '新能源购车基金', target_cents: 100000 })).status, 200);
+
+  const gWithdraw = (await (await api(`/goals/${goalId}/deposit`, aliceToken, 'POST', { amount: '-50.00' })).json()) as {
+    goal: { saved_cents: number };
+    transaction_id: number | null;
+  };
+  assert.equal(gWithdraw.goal.saved_cents, 15000);
+  assert.equal(gWithdraw.transaction_id, null);
+
+  const gComplete = (await (
+    await api(`/goals/${goalId}/deposit`, aliceToken, 'POST', { amount: '850.00', create_txn: true })
+  ).json()) as {
+    goal: { saved_cents: number; status: string };
+    transaction_id: number;
+  };
+  assert.equal(gComplete.goal.saved_cents, 100000);
+  assert.equal(gComplete.goal.status, 'completed');
+  assert.ok(gComplete.transaction_id > 0);
+  assert.ok(
+    sqlite.prepare('SELECT id FROM notifications WHERE dedupe_key = ?').get(`goal-done:${goalId}`),
+    '储蓄目标达标应推送通知',
+  );
+  assert.equal((await api(`/goals/${goalId}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/goals/${goalId}`, aliceToken)).status, 404);
+
+  // 13. 跨账本隔离（账本 1 令牌读写/删除/引用账本 2 资源均被拦截）
+  const l2AccId = ((await (await api('/accounts', bobL2Token, 'POST', { name: 'L2账户', type: 'cash' })).json()) as { id: number }).id;
+  const l2ScId = ((await (await api('/session-cards', bobL2Token, 'POST', { name: 'L2卡', total_sessions: 3 })).json()) as { id: number }).id;
+  const l2CatId = ((await (await api('/categories', bobL2Token, 'POST', { name: 'L2分类', kind: 'expense' })).json()) as { id: number }).id;
+  const l2TagId = ((await (await api('/tags', bobL2Token, 'POST', { name: 'L2标签' })).json()) as { id: number }).id;
+  const l2BudId = ((await (await api('/budgets', bobL2Token, 'POST', { name: 'L2预算', amount: '100' })).json()) as { id: number }).id;
+  const l2RecId = (
+    (await (
+      await api('/recurring', bobL2Token, 'POST', {
+        name: 'L2周期',
+        items: [{ type: 'expense', amount: '10', account_id: l2AccId }],
+      })
+    ).json()) as { id: number }
+  ).id;
+  const l2SubId = ((await (await api('/subscriptions', bobL2Token, 'POST', { name: 'L2订阅', amount: '10', account_id: l2AccId })).json()) as { id: number }).id;
+  const l2DebtId = ((await (await api('/debts', bobL2Token, 'POST', { counterparty: 'L2某人', principal: '50' })).json()) as { id: number }).id;
+  const l2GoalId = ((await (await api('/goals', bobL2Token, 'POST', { name: 'L2目标', target: '100' })).json()) as { id: number }).id;
+
+  for (const path of [
+    `/accounts/${l2AccId}`,
+    `/session-cards/${l2ScId}`,
+    `/categories/${l2CatId}`,
+    `/tags/${l2TagId}`,
+    `/budgets/${l2BudId}`,
+    `/recurring/${l2RecId}`,
+    `/subscriptions/${l2SubId}`,
+    `/debts/${l2DebtId}`,
+    `/loans/${l2DebtId}`,
+    `/goals/${l2GoalId}`,
+  ]) {
+    assert.equal((await api(path, aliceToken, 'GET')).status, 404, `跨账本 GET ${path} 应 404`);
+    assert.equal((await api(path, aliceToken, 'PATCH', { name: '越权' })).status, 404, `跨账本 PATCH ${path} 应 404`);
+    assert.equal((await api(path, aliceToken, 'DELETE')).status, 404, `跨账本 DELETE ${path} 应 404`);
+  }
+  assert.equal(
+    (await api('/budgets', aliceToken, 'POST', { name: '越权账户', scope: 'account', account_id: l2AccId, amount: '100' })).status,
+    400,
+  );
+  assert.equal(
+    (await api('/budgets', aliceToken, 'POST', { name: '越权分类', scope: 'category', category_id: l2CatId, amount: '100' })).status,
+    400,
+  );
+  assert.equal(
+    (await api('/subscriptions', aliceToken, 'POST', { name: '越权订阅', amount: '10', account_id: l2AccId })).status,
+    400,
+  );
+  assert.equal(
+    (await api('/goals', aliceToken, 'POST', { name: '越权目标', target: '100', account_id: l2AccId })).status,
+    400,
+  );
+});
