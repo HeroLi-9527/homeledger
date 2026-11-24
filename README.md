@@ -2,6 +2,8 @@
 
 基于 **Cloudflare Workers + TypeScript + Hono 4 + D1 + R2 + Cron Triggers** 构建的自托管家庭记账系统，零构建前端、全离线服务端 SVG 图表、AI 截图/文本双引擎记账与开放 API 一体化部署。
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/lizhengbo9527/homeledger)
+
 ---
 
 ## 核心特性
@@ -78,7 +80,16 @@ npm run dev
 | `SITE_NAME` | Var | 否 | 默认站点标题（可在网页系统设置中动态覆盖），默认 `家账簿` |
 | `COOKIE_SECURE` | Var / Secret | 否 | 默认开启 `Secure` Cookie；仅纯 HTTP 本地调试时在 `.dev.vars` 设为 `false` |
 
-### 首次部署步骤
+### 一键部署（推荐）
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/lizhengbo9527/homeledger)
+
+1. **前置条件**：确保 Cloudflare 账号已开通 **R2**（提供每月 10GB 免费额度，首次启用需在控制台开通）。
+2. 点击上方 **Deploy to Cloudflare** 按钮并授权 GitHub，Cloudflare 会自动克隆仓库、创建 D1 数据库与 R2 存储桶，并在部署阶段通过 `npm run deploy` 自动执行 `migrations/0001–0003` 完成建表与初始化数据写入。
+3. 在部署向导或部署后的 Worker 面板 **Settings → Variables and Secrets** 中新增 **Secret** 类型变量 `SESSION_SECRET`（**至少 16 位**，建议 32 位以上随机字符串）。若未配置，访问应用时会展示 503 配置引导页并阻止不安全的半初始化。
+4. 访问部署域名，按引导在 `/setup` 创建首个站点管理员账户与默认账本。
+
+### 手动 CLI 部署步骤
 
 ```bash
 # 1. 登录 Cloudflare（如尚未登录）
@@ -94,7 +105,7 @@ npx wrangler r2 bucket create homeledger-attachments
 openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET
 
 # 5. 应用全部远程迁移（0001_init、0002_seed、0003_session_cards）并发布 Worker
-npm run db:migrate
+# （npm run deploy 已内置执行 `wrangler d1 migrations apply DB --remote && wrangler deploy`）
 npm run deploy
 ```
 
@@ -103,10 +114,10 @@ npm run deploy
 1. 打开部署域名，按引导在 `/setup` 创建首个站点管理员（密码至少 8 位）。
 2. 进入「系统设置」按需配置站点名称、是否开放注册、本位币汇率，以及 AI 模型 `Base URL / API Key / 模型名`（点击「测试连接」验证）。
 3. 建议在 Cloudflare 域名面板开启代理并配置基础 **WAF / Rate Limiting** 规则，重点保护 `/login`、`/setup`、`/register`、`/join/*` 与 `/api/open/*`。
-4. 后续版本更新时，先拉取代码并执行远程迁移与重新发布：
+4. 后续版本更新时，先拉取代码并执行部署（`npm run deploy` 会自动先应用远程 D1 迁移再发布；也可单独执行 `npm run db:migrate`）：
 
 ```bash
-npm run db:migrate && npm run deploy
+npm run deploy
 ```
 
 ---

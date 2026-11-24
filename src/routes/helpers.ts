@@ -13,12 +13,15 @@ export function envOf(c: AppCtx): Env {
   return c.env;
 }
 
+export function hasValidSessionSecret(env: Env): boolean {
+  return String(env.SESSION_SECRET || '').length >= 16;
+}
+
 export function getSessionSecret(env: Env): string {
-  const s = String(env.SESSION_SECRET || '');
-  if (!s || s.length < 16) {
+  if (!hasValidSessionSecret(env)) {
     throw new Error('SESSION_SECRET 未配置或长度不足 16 位');
   }
-  return s;
+  return String(env.SESSION_SECRET);
 }
 
 export async function bodyOf(c: AppCtx): Promise<Record<string, unknown>> {

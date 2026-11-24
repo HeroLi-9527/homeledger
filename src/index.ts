@@ -8,7 +8,17 @@ import { adminRoutes } from './routes/admin.js';
 import { aiRoutes } from './routes/ai.js';
 import { authRoutes } from './routes/auth.js';
 import { dashboardRoutes } from './routes/dashboard.js';
-import { bodyOf, checkCsrf, cookie, csrfFail, getSessionSecret, requireLogin, toPublicError, wantsJson } from './routes/helpers.js';
+import {
+  bodyOf,
+  checkCsrf,
+  cookie,
+  csrfFail,
+  getSessionSecret,
+  hasValidSessionSecret,
+  requireLogin,
+  toPublicError,
+  wantsJson,
+} from './routes/helpers.js';
 import { openapiRoutes } from './routes/openapi.js';
 import { planningRoutes } from './routes/planning.js';
 import { reportsRoutes } from './routes/reports.js';
@@ -78,6 +88,28 @@ app.use('*', async (c, next) => {
   if (c.req.path.startsWith('/api/open')) {
     await next();
     return;
+  }
+  if (!hasValidSessionSecret(c.env)) {
+    if (wantsJson(c) || c.req.path.startsWith('/api/')) {
+      return c.json({ ok: false, error: 'SESSION_SECRET 未配置或长度不足 16 位' }, 503);
+    }
+    return c.html(
+      blank({
+        title: '缺少必要配置',
+        siteName: c.env.SITE_NAME || '家账簿',
+        cspNonce: c.get('cspNonce') || '',
+        body: `
+          <h1 style="font-size:18px;margin-bottom:6px">缺少必要配置：SESSION_SECRET</h1>
+          <p class="muted small mb16"><code>SESSION_SECRET</code> 未配置或长度不足 16 位（建议 32 位以上随机字符串），系统已暂停初始化与登录以保障会话安全。</p>
+          <div class="flash warn" style="margin-bottom:14px">
+            <span><strong>Cloudflare 控制台配置步骤</strong>：进入 <strong>Workers &amp; Pages</strong> → 当前 Worker → <strong>Settings</strong> → <strong>Variables and Secrets</strong> → <strong>Add</strong> → 类型选择 <strong>Secret</strong> → 名称填 <code>SESSION_SECRET</code>，值填入 ≥ 16 位随机串 → 保存并部署。</span>
+          </div>
+          <p class="small muted"><strong>CLI / 本地开发</strong>：运行 <code>openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET</code>（本地开发请在 <code>.dev.vars</code> 中配置）。</p>
+          <a class="btn btn-primary btn-block mt12" href="/">已配置，刷新重试</a>
+        `,
+      }),
+      503,
+    );
   }
   const db = c.get('db');
   const rawSid = cookie(c, 'hl.sid');

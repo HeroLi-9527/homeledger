@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import test from 'node:test';
-import { makeDb } from '../src/db.js';
+import { makeDb, todayStr } from '../src/db.js';
 import { app } from '../src/index.js';
 import { getAiConfig } from '../src/lib/ai.js';
 import { checkCreditAccounts, checkSessionCards, runScheduled } from '../src/lib/scheduler.js';
@@ -1512,6 +1512,7 @@ test('Phase 2（P1 部署前必做）：附件闭环、分页筛选与通知跳�
   assert.equal(goalAfter.status, 'completed');
 
   // 4.5 订阅删除按钮、历史扣费记录与删订阅留流水
+  const subToday = todayStr();
   await req('/subscriptions', {
     method: 'POST',
     redirect: 'manual',
@@ -1522,7 +1523,7 @@ test('Phase 2（P1 部署前必做）：附件闭环、分页筛选与通知跳�
       amount: '21.00',
       cycle: 'monthly',
       account_id: '1',
-      next_charge_at: '2026-11-23',
+      next_charge_at: subToday,
       status: 'active',
     }),
   });
@@ -1531,7 +1532,7 @@ test('Phase 2（P1 部署前必做）：附件闭环、分页筛选与通知跳�
     method: 'POST',
     redirect: 'manual',
     headers: { Cookie: cookieHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ _csrf: csrf, next_charge_at: '2026-11-23' }),
+    body: new URLSearchParams({ _csrf: csrf, next_charge_at: subToday }),
   });
   const subTxn = sqlite
     .prepare('SELECT id FROM transactions WHERE subscription_id = ? AND deleted_at IS NULL')
@@ -1720,4 +1721,48 @@ test('Phase 2（P1 部署前必做）：附件闭环、分页筛选与通知跳�
   const zeroLedgerHome = await req('/', { headers: { Cookie: lastCookie } });
   assert.equal(zeroLedgerHome.status, 200);
   assert.ok((await zeroLedgerHome.text()).includes('还没有账本'));
+});
+
+test('未配置 SESSION_SECRET 时返回 503 友好配置引导页且阻止半初始化', async () => {
+  for (const badSecret of ['', 'short-secret']) {
+    const { sqlite, env } = setupEnv();
+    env.SESSION_SECRET = badSecret;
+    const req = (p: string, init: RequestInit = {}) =>
+      app.fetch(new Request(`http://localhost${p}`, init), env);
+
+    const homeRes = await req('/');
+    assert.equal(homeRes.status, 503);
+    const homeHtml = await homeRes.text();
+    assert.ok(homeHtml.includes('SESSION_SECRET'));
+    assert.ok(homeHtml.includes('Variables and Secrets'));
+
+    const setupGetRes = await req('/setup');
+    assert.equal(setupGetRes.status, 503);
+    assert.ok((await setupGetRes.text()).includes('SESSION_SECRET'));
+
+    const setupPostRes = await req('/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'http://localhost' },
+      body: new URLSearchParams({
+        username: 'alice',
+        display_name: 'Alice',
+        password: 'password123',
+        password2: 'password123',
+        site_name: '测试账簿',
+      }),
+    });
+    assert.equal(setupPostRes.status, 503);
+    assert.equal((sqlite.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c, 0);
+
+    const jsonRes = await req('/', { headers: { Accept: 'application/json' } });
+    assert.equal(jsonRes.status, 503);
+    const jsonBody = (await jsonRes.json()) as { ok: boolean; error: string };
+    assert.equal(jsonBody.ok, false);
+    assert.ok(jsonBody.error.includes('SESSION_SECRET'));
+
+    const healthRes = await req('/healthz');
+    assert.equal(healthRes.status, 200);
+    const healthBody = (await healthRes.json()) as { ok: boolean };
+    assert.equal(healthBody.ok, true);
+  }
 });
