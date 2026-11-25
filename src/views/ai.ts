@@ -63,12 +63,14 @@ export function aiPage({
 }
 
 export function attachmentsPage({
+  writable,
   rows,
   page,
   total,
   totalPages,
   csrf,
 }: {
+  writable: boolean;
   rows: Array<AttachmentRow & { linked_txn_id?: number | null; txn_date?: string | null; merchant?: string | null; amount_cents?: number | null }>;
   page: number;
   total: number;
@@ -79,7 +81,7 @@ export function attachmentsPage({
     rows
       .map((a) => {
         const imgUrl = webUrl(a.rel_path);
-        const txnLabel = a.linked_txn_id
+        const txnLabel = a.linked_txn_id && writable
           ? `<a href="/transactions/${a.linked_txn_id}/edit">${esc(a.merchant || `流水 #${a.linked_txn_id}`)}${a.amount_cents != null ? ` · ¥${(Number(a.amount_cents) / 100).toFixed(2)}` : ''}${a.txn_date ? ` (${esc(a.txn_date)})` : ''}</a>`
           : '—';
         return `<tr>
@@ -92,7 +94,7 @@ export function attachmentsPage({
   <td>${txnLabel}</td>
   <td><span class="chip">${esc(a.ai_status)}</span></td>
   <td class="tiny muted">${esc(a.created_at)}</td>
-  <td><form method="post" action="/attachments/${a.id}/delete" style="display:inline" data-confirm="确认删除该附件？将同步从 R2 存储移除。"><input type="hidden" name="_csrf" value="${esc(csrf)}"><button class="btn btn-sm btn-danger" type="submit">删除</button></form></td>
+  <td>${writable ? `<form method="post" action="/attachments/${a.id}/delete" style="display:inline" data-confirm="确认删除该附件？将同步从 R2 存储移除。"><input type="hidden" name="_csrf" value="${esc(csrf)}"><button class="btn btn-sm btn-danger" type="submit">删除</button></form>` : ''}</td>
 </tr>`;
       })
       .join('') || '<tr><td colspan="5">暂无附件</td></tr>';

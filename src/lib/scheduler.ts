@@ -1,4 +1,4 @@
-import { balanceDeltaStmts, nowStr, todayStr } from '../db.js';
+import { accountAmounts, balanceDeltaStmts, nowStr, todayStr } from '../db.js';
 import type { AccountRow, BatchStatement, Db, Env, SessionCardRow } from '../types.js';
 import { nextMonthlyDay } from './accounts.js';
 import { deleteKeysFromR2 } from './attachments.js';
@@ -90,17 +90,18 @@ export async function recurringPostStmts(db: Db, rule: RecurringRuleRow, dateStr
     const currency = p.currency || 'CNY';
     const rate = await resolveRate(db, currency);
     const base = toBase(amount, rate);
-    const pTxn = {
+    const effect = {
       type: p.type || 'expense',
       amount_base_cents: base,
       account_id: p.account_id || null,
       to_account_id: p.to_account_id || null,
     };
+    const pTxn = { ...effect, ...await accountAmounts(db, rule.ledger_id, { ...effect, currency, amount_cents: amount }) };
     stmts.push([
       `INSERT INTO transactions
        (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
-        user_id, txn_date, note, merchant, status, source, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        user_id, txn_date, note, merchant, status, source, created_at, updated_at, account_amount_cents, to_account_amount_cents)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         rule.ledger_id,
         p.type || 'expense',
@@ -119,6 +120,8 @@ export async function recurringPostStmts(db: Db, rule: RecurringRuleRow, dateStr
         'recurring',
         now,
         now,
+        pTxn.account_amount_cents,
+        pTxn.to_account_amount_cents,
       ],
     ]);
     stmts.push(...balanceDeltaStmts([[pTxn, 1]]));

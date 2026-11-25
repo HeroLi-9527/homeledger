@@ -145,6 +145,14 @@ export function txnFormPage({
         </select>
       </div>
       <div class="field">
+        <label>账户原币金额</label>
+        <input name="account_amount" inputmode="decimal" value="${error && t.account_amount_cents != null ? (Number(t.account_amount_cents) / 100).toFixed(2) : ''}" placeholder="${t.account_amount_cents == null ? '留空按汇率换算' : `已记 ${(Number(t.account_amount_cents) / 100).toFixed(2)}`}">
+      </div>
+      <div class="field" data-for-type="transfer,invest_buy,invest_sell">
+        <label>转入 / 投资账户原币金额</label>
+        <input name="to_account_amount" inputmode="decimal" value="${error && t.to_account_amount_cents != null ? (Number(t.to_account_amount_cents) / 100).toFixed(2) : ''}" placeholder="${t.to_account_amount_cents == null ? '留空按汇率换算' : `已记 ${(Number(t.to_account_amount_cents) / 100).toFixed(2)}`}">
+      </div>
+      <div class="field">
         <label>日期</label>
         <input type="date" name="txn_date" value="${esc(t.txn_date || '')}" required>
       </div>

@@ -24,7 +24,7 @@ Status: implemented
 - 209 个内置分类（176 支出 + 33 收入）、10 条默认汇率与 10 条默认设置由 `migrations/0002_seed.sql` 一次性写入，运行时零 `ensureSeeded` 与 `bootstrapAdmin` 查询；首次启动无用户时由 `/setup` 引导创建管理员。
 - 通知幂等去重通过 `notifications(user_id, dedupe_key)` 部分唯一索引 `idx_notif_dedupe` 配合 `INSERT OR IGNORE` 在单条语句内完成。
 - OpenAPI 路由组（`src/routes/openapi.ts`）挂载在全局 CSRF 与 Cookie 中间件之前，Bearer Token SHA-256 鉴权仅执行只读联合查询，不更新 `last_used_at`。
-- 日常记账、编辑、软删除及周期/订阅自动入账通过 `balanceDeltaStmts` 计算余额增量并与交易语句合并于同一 `db.batch()` 提交；`recalcBalances` 仅在 CSV 批量导入与全库 JSON 备份恢复后调用。
+- 日常记账、编辑、软删除、CSV 导入及周期或订阅入账通过 `balanceDeltaStmts` 将账户原币增量与流水合并提交。全库恢复在同一 D1 批次内重算余额，详见[账户币种与恢复边界](../bug-fix/2026-11-25-ledger-integrity-and-recovery.md)。
 - 密码哈希统一使用 WebCrypto PBKDF2-SHA256（10 万次迭代），不含 `scrypt-js` 与旧版 SQLite 兼容包袱；全库 JSON 恢复（`/backup/restore`）不自动向 R2 写入 `pre-restore` 冗余备份。
 
 ### 2. 无状态会话与安全边界
@@ -34,7 +34,7 @@ Status: implemented
 
 ### 3. 每 4 小时 Cron 与 R2 生命周期
 - `wrangler.toml` 定时触发器设为 `0 */4 * * *`（每天 6 次），驱动 `runScheduled`（`src/lib/scheduler.ts`）执行周期账单、订阅扣费、预算/借贷/目标提醒与轻量 DB 过期行清理（过期邀请码、90 天前已读通知、7 天前未关联的 `pending` AI 附件及对应已知 key）。
-- 定时任务不执行 R2 `list()` 全前缀扫描；删除交易或附件时同步删除已知 R2 key，孤儿清理仅保留管理员手动入口 `POST /admin/cleanup-r2`（调用 `cleanupOrphanR2`）。
+- 定时任务不执行 R2 `list()` 扫描。软删流水隐藏其凭证，永久删除流水和单独删除附件时同步清理已知键。孤儿清理仍由管理员在 `POST /admin/cleanup-r2` 手动执行。
 
 ### 4. Technical Ledger 视觉重设计与离线渲染
 - 基于 Google Stitch 完成新版「Technical Ledger」界面设计，落实到 `public/css/app.css`（#F8FAFC 表面色调、#0F766E 翡翠主色、#BE123C 支出警示、`tabular-nums` 等宽账务数字、248px 固定侧栏 + 移动端抽屉与浅/深主题变量）与 `src/views/*.ts` 模块化视图。

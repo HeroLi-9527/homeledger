@@ -16,7 +16,7 @@
   - 独立**次卡台账**（洗车卡、理发卡、健身卡等）：支持购卡联动支出或存量老卡补录、防超扣原子核销、撤销回补、同卡续费加次以及到期/余次不足提醒。
 - **AI 截图与文本双引擎记账 + 凭证闭环**：
   - 支持拖放或 `Ctrl+V` 粘贴最多 6 张账单截图（单张 ≤ 8MB，PNG/JPG/WebP/GIF/BMP 等）与自然语言描述；配置 OpenAI 兼容多模态模型时自动识图解析，未配置或调用异常时自动降级为纯离线中文关键词规则引擎。
-  - 原图存档至 Cloudflare R2 并绑定流水；交易编辑页支持查看原图、补传多图与单删，侧栏提供 `/attachments` 附件统一存档与流水跳转；删流水时同步清理关联 R2 对象。
+  - 原图存档至 Cloudflare R2 并绑定流水。流水移入回收站后，标签、AA 分账和凭证随流水保留，附件从存档页隐藏。永久删除流水或单独删除附件时同步清理对应 R2 对象。
 - **家庭多账本与权限安全**：
   - 支持多账本隔离、账本改名/归档，以及账本所有者输入账本名称二次确认后的**全子表与 R2 级联永久删除**（同步吊销绑定该账本的 API 令牌）。
   - 支持 `owner` / `admin` / `member` / `viewer` 四档成员角色；在关闭全站自助注册时仍可通过一次性邀请链接 `/join/:code` 定向注册加入，或由站点管理员在 `/admin` 直接建号与执行 `Cache-Control: no-store` 一次性密码重置。
@@ -25,7 +25,7 @@
   - 通知中心自动标记已读，点击通知支持跨账本安全校验与静默切换直达目标页面。
 - **全离线报表与导入导出备份**：
   - 收支柱状图、近 12 个月净资产折线、分类构成环形图（支持一级/二级分类下钻及穿透流水）与消费日历热力图全部由 Workers 服务端输出内联 SVG。
-  - 支持支付宝 / 微信 CSV 自动识别 UTF-8 / GBK 编码与订单号去重导入、UTF-8 BOM CSV 导出，以及站点管理员全库 JSON 备份导出与前置校验原子恢复（恢复后全端强制重登）。
+  - 支持支付宝、微信及 HomeLedger 导出的 CSV 导入。单账本全量 JSON 可导入为新账本。网页全库 JSON 保存 D1 数据，整站归档命令同时保存 R2 凭证和头像原图。
 
 ---
 
@@ -34,10 +34,10 @@
 系统面向个人与家庭在 Cloudflare 免费套餐下的长期稳定运行而设计，尽量压缩不必要的边缘读写开销：
 
 1. **无状态 HMAC-SHA256 会话鉴权**：浏览器会话通过 `SESSION_SECRET` 签名的 `hl.sid` Cookie 携带 `{ uid, lid, tv, csrf, exp }` 载荷，正常页面浏览无需读写会话表；配合 `users.token_version`，在修改密码、管理员重置密码/停用账号或全库恢复时即可即时令全端旧会话与 API 令牌同时失效。
-2. **迁移一次性初始化**：数据库结构、209 个系统分类、10 条默认汇率与站点默认配置由 `migrations/0001_init.sql`–`0004_txn_subscription_idx.sql` 一次性落库，运行期免除初始化探测查询；首次访问 `/setup` 创建首个站点管理员。
+2. **迁移一次性初始化**：版本迁移初始化数据库结构、209 个系统分类、10 条默认汇率与站点默认配置；首次访问 `/setup` 创建首个站点管理员。
 3. **单表通知幂等去重**：`notifications(user_id, dedupe_key)` 使用部分唯一索引配合 `INSERT OR IGNORE`，单条 SQL 完成周期、订阅、预算、借贷、目标、信用账期与次卡提醒去重。
 4. **只读 OpenAPI 鉴权**：`/api/open/*` 使用 SHA-256 摘要存储的 Bearer Token 鉴权，鉴权阶段仅执行只读联合查询。
-5. **每 4 小时 Cron 与精准 R2 回收**：`wrangler.toml` 定时触发器配置为 `0 */4 * * *`（每天 6 次）；删除流水或单个附件时按已知 key 精准同步删除 R2 对象，不在定时任务中扫描整桶，仅保留管理员在 `/admin` 按需手动触发的孤儿文件清理入口。
+5. **每 4 小时 Cron 与精准 R2 回收**：`wrangler.toml` 定时触发器配置为 `0 */4 * * *`（每天 6 次）。永久删除流水、删除附件或删除账本时按已知 key 清理 R2。孤儿文件扫描由管理员在 `/admin` 按需手动触发。
 6. **纵深安全边界**：全站启用每请求随机 `cspNonce` 严格 CSP、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`；Web 写入受同步提交 CSRF 令牌保护；`/uploads/*` 对非头像附件校验所属账本成员权限并附加 `Content-Security-Policy: sandbox`；令牌生成、JSON 导出与重置密码结果页均附带 `Cache-Control: no-store`。
 
 ---
@@ -49,7 +49,7 @@
 npm install
 cp .dev.vars.example .dev.vars
 
-# 2. 初始化本地 D1（应用 migrations/0001–0004）
+# 2. 初始化本地 D1（应用全部 migrations）
 npm run db:migrate:local
 
 # 3. 静态类型检查与全量单元测试 / 端到端测试
@@ -103,7 +103,7 @@ cp wrangler.toml.example wrangler.local.toml   # 已加入 .gitignore；使用�
 openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET
 # （如使用 wrangler.local.toml：openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET -c wrangler.local.toml）
 
-# 6. 应用全部远程迁移（0001_init、0002_seed、0003_session_cards、0004_txn_subscription_idx）并发布 Worker
+# 6. 应用全部远程迁移并发布 Worker
 # （npm run deploy 作用于默认的 wrangler.toml；若使用 wrangler.local.toml，请分两条命令执行：）
 #   npx wrangler d1 migrations apply DB --remote -c wrangler.local.toml
 #   npx wrangler deploy -c wrangler.local.toml
@@ -138,6 +138,22 @@ npm run deploy
 npm run deploy
 ```
 
+### 外币账户与数据恢复
+
+- 应用 `0005_account_amounts_and_trash.sql` 前先备份。余额、期初金额、校准值及信用额度使用账户原币，净资产和账户小计使用站点本位币。历史净资产曲线统一用当前汇率估值。迁移用流水原币或已保存的本位币金额回填，第三种币种的历史侧金额需要在账户详情逐笔核对。曾更改站点本位币的旧库还应核对历史折算金额。已有流水时，站点本位币和相关账户的币种保持固定。
+- HomeLedger CSV 导入按账户名和分类路径匹配，预览会指出首个无法映射的行。新版 CSV 同时带上站点本位币、汇率和账户侧金额。同一份 CSV 可以重试，导入记录不会重复记账。
+- 在「导出备份」下载未筛选的全量账本 JSON，再从「多账本管理」导入为新账本。导入者成为新账本所有者，导入后重新核对并开启自动记账规则。单账本 JSON 不含凭证文件和站点用户。
+- 推荐在暂停记账、修改头像和运行定时任务的维护窗口创建或恢复整站归档。归档目录含数据库快照、R2 原图与 SHA-256 清单，应按敏感账本数据保管。目标站点应先部署当前版本并可用管理员登录。恢复会覆盖目标 D1，并吊销旧会话和开放 API 令牌。已替换或因失败留下的 R2 对象可从管理员后台手动清理。
+
+```bash
+# 从管理员已登录会话取得 hl.sid 的值，通过本地环境变量 HOMELEDGER_ARCHIVE_SESSION 传给命令
+npm run ops:backup -- create ./homeledger-backup --url https://账本站点 --bucket homeledger-attachments --remote
+npm run ops:backup -- verify ./homeledger-backup
+npm run ops:backup -- restore ./homeledger-backup --url https://目标站点 --bucket 目标存储桶 --remote --confirm-overwrite
+```
+
+恢复前使用目标站点的管理员会话更新 `HOMELEDGER_ARCHIVE_SESSION`。本地测试可用 `--local`，并传入与本地 Worker 相同的 `--config` 和 `--persist-to`。整站恢复使用网页恢复的 20MB JSON 上限，原图单独搬运。
+
 ---
 
 ## 开放 API（`/api/open/*`）
@@ -155,7 +171,7 @@ Authorization: Bearer hl_xxxxxxxxxxxxxxxx
 - `GET /api/open/ping`：校验令牌连通性与当前绑定账本信息
 - `GET /api/open/overview` / `GET /api/open/summary` / `GET /api/open/reports`：月度汇总、资产负债概览与报表聚合
 - `GET /api/open/transactions` / `GET /api/open/transactions/recent` / `GET /api/open/transactions/:id`：查询流水明细
-- `POST /api/open/transactions` / `PUT|PATCH /api/open/transactions/:id` / `DELETE /api/open/transactions/:id`：写入、编辑或软删流水（同步更新账户余额与 R2 附件）
+- `POST /api/open/transactions` / `PUT|PATCH /api/open/transactions/:id` / `DELETE /api/open/transactions/:id`：写入、编辑或软删流水。转账可传 `account_amount_cents` 和 `to_account_amount_cents` 指定两端实际原币金额。软删保留凭证，永久删除在网页回收站操作。
 - `POST /api/open/ai/bill`：上传文本或 base64 账单截图，自动识别并按 `auto_save` 入库并存档原图
 - `GET /api/open/attachments/:id`：读取 R2 存档的账单截图
 - `GET|POST /api/open/accounts`、`GET|PUT|PATCH|DELETE /api/open/accounts/:id`、`POST /api/open/accounts/:id/archive`、`POST /api/open/accounts/:id/adjust`：账户分层查询（支持 `?include_archived=1`）、新建、编辑、归档切换、余额校准与删除

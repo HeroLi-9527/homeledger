@@ -1,4 +1,6 @@
 import {
+  accountAmounts,
+  baseExchangeRates,
   balanceDeltaStmts,
   getSetting,
   nowStr,
@@ -26,8 +28,8 @@ export const TXN_SELECT = `
 SELECT t.*,
   c.name AS category_name, c.icon AS category_icon, c.color AS category_color,
   pc.name AS category_parent,
-  a.name AS account_name, a.icon AS account_icon, a.type AS account_type,
-  ta.name AS to_account_name, ta.icon AS to_account_icon,
+  a.name AS account_name, a.icon AS account_icon, a.type AS account_type, a.currency AS account_currency,
+  ta.name AS to_account_name, ta.icon AS to_account_icon, ta.currency AS to_account_currency,
   u.display_name AS member_name, u.avatar_color AS member_color,
   (SELECT GROUP_CONCAT(tg.name, ' ') FROM transaction_tags tt JOIN tags tg ON tg.id = tt.tag_id WHERE tt.transaction_id = t.id) AS tag_names
 FROM transactions t
@@ -102,7 +104,9 @@ function buildWhere(ledgerId: number, f: TxnFilter = {}) {
     where.push('t.user_id = ?');
     params.push(f.memberId);
   }
-  if (f.source) {
+  if (f.source === 'import') {
+    where.push("t.source IN ('import', 'homeledger_csv', 'alipay', 'wechat')");
+  } else if (f.source) {
     where.push('t.source = ?');
     params.push(f.source);
   }
@@ -263,9 +267,10 @@ const ACCOUNT_REQUIRED_TYPES = [
   'fee',
   'interest',
   'reimburse',
+  'adjust',
 ];
 
-function validateAccounts(type: string, accountId: number | null, toAccountId: number | null): void {
+export function validateAccounts(type: string, accountId: number | null, toAccountId: number | null): void {
   if (ACCOUNT_REQUIRED_TYPES.includes(type) && !accountId) throw new Error('请选择账户');
   if (type === 'transfer' && (!accountId || !toAccountId)) throw new Error('转账需要选择转出与转入账户');
   if (type === 'transfer' && accountId === toAccountId) throw new Error('转出与转入账户不能相同');
@@ -277,7 +282,7 @@ function validateAccounts(type: string, accountId: number | null, toAccountId: n
   }
 }
 
-function kindOfType(type: string): 'income' | 'expense' | null {
+export function kindOfType(type: string): 'income' | 'expense' | null {
   if ((INCOME_TYPES as readonly string[]).includes(type)) return 'income';
   if ((EXPENSE_TYPES as readonly string[]).includes(type)) return 'expense';
   return null;
@@ -335,7 +340,9 @@ export interface TxnWriteInput {
   ai_json?: string | null;
   tags?: string;
   splits?: SplitInput[];
-  skipBalanceDelta?: boolean;
+  account_amount_cents?: number | null;
+  to_account_amount_cents?: number | null;
+  expectedBalanceCents?: number;
   updated_at?: string;
 }
 
@@ -343,7 +350,7 @@ export async function createTransaction(db: Db, ledgerId: number, userId: number
   const type = d.type && TXN_TYPE_MAP[d.type] ? d.type : 'expense';
   const amount = type === 'adjust' ? Math.round(Number(d.amount_cents) || 0) : Math.abs(Math.round(Number(d.amount_cents) || 0));
   if (!amount) throw new Error('金额必须大于 0');
-  const currency = d.currency || 'CNY';
+  const currency = String(d.currency || 'CNY').trim().toUpperCase();
   const rate = await resolveRate(db, currency, d.rate);
   const accountId = await pickAccount(db, ledgerId, d.account_id);
   const toAccountId = await pickAccount(db, ledgerId, d.to_account_id);
@@ -353,14 +360,19 @@ export async function createTransaction(db: Db, ledgerId: number, userId: number
 
   const txnDate = /^\d{4}-\d{2}-\d{2}$/.test(String(d.txn_date || '')) ? String(d.txn_date) : todayStr();
   const baseCents = toBase(amount, rate);
-  const newTxn = { type, amount_base_cents: baseCents, account_id: accountId, to_account_id: toAccountId };
+  const effect = { type, amount_base_cents: baseCents, account_id: accountId, to_account_id: toAccountId };
+  const amounts = await accountAmounts(db, ledgerId, { ...d, ...effect, currency, amount_cents: amount });
+  const newTxn = { ...effect, ...amounts };
   const stamp = nowStr();
+  const expected = d.expectedBalanceCents;
+  const balanceArgs = [accountId, ledgerId, expected];
   const stmts: BatchStatement[] = [
     [
       `INSERT INTO transactions
        (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
-        user_id, txn_date, note, merchant, status, is_reimbursable, group_id, source, ai_json, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        user_id, txn_date, note, merchant, status, is_reimbursable, group_id, source, ai_json, created_at, updated_at, account_amount_cents, to_account_amount_cents)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+       ${expected === undefined ? '' : 'WHERE EXISTS (SELECT 1 FROM accounts WHERE id = ? AND ledger_id = ? AND balance_cents = ? AND is_archived = 0)'}`,
       [
         ledgerId,
         type,
@@ -382,11 +394,19 @@ export async function createTransaction(db: Db, ledgerId: number, userId: number
         d.ai_json || null,
         stamp,
         stamp,
+        amounts.account_amount_cents,
+        amounts.to_account_amount_cents,
+        ...(expected === undefined ? [] : balanceArgs),
       ],
     ],
   ];
-  if (!d.skipBalanceDelta) stmts.push(...balanceDeltaStmts([[newTxn, 1]]));
+  for (const [sql, args = []] of balanceDeltaStmts([[newTxn, 1]])) {
+    stmts.push(expected === undefined ? [sql, args] : [
+      `${sql} AND ledger_id = ? AND balance_cents = ? AND is_archived = 0`, [...args, ledgerId, expected],
+    ]);
+  }
   const results = await db.batch(stmts);
+  if (expected !== undefined && Number(results[0]?.meta?.changes || 0) !== 1) throw new Error('账户余额已变动，请重试');
   const id = Number(results[0]?.meta?.last_row_id || 0);
   if (!id) throw new Error('记账失败，未能获取交易 ID');
   try {
@@ -425,13 +445,32 @@ export async function updateTransaction(
   const type = d.type && TXN_TYPE_MAP[d.type] ? d.type : old.type;
   const amount = type === 'adjust' ? Math.round(Number(d.amount_cents) || 0) : Math.abs(Math.round(Number(d.amount_cents) || 0));
   if (!amount) throw new Error('金额必须大于 0');
-  const currency = d.currency || old.currency;
-  const rate = await resolveRate(db, currency, d.rate);
+  const currency = String(d.currency || old.currency).trim().toUpperCase();
+  const rate = d.rate == null && currency === old.currency ? Number(old.rate) : await resolveRate(db, currency, d.rate);
   const accountId = await pickAccount(db, ledgerId, d.account_id, old.account_id);
   const toAccountId = await pickAccount(db, ledgerId, d.to_account_id, old.to_account_id);
   const categoryId = await pickCategory(db, ledgerId, d.category_id, kindOfType(type));
   validateAccounts(type, accountId, toAccountId);
   if (d.splits && d.splits.length) checkSplitsTotal(d.splits, amount);
+
+  const valuationChanged = amount !== Number(old.amount_cents) || currency !== old.currency || rate !== Number(old.rate);
+  const baseCents = valuationChanged ? toBase(amount, rate) : Number(old.amount_base_cents);
+  const accountChanged = valuationChanged || type !== old.type || accountId !== old.account_id;
+  const toAccountChanged = valuationChanged || type !== old.type || toAccountId !== old.to_account_id;
+  const effect = { type, amount_base_cents: baseCents, account_id: accountId, to_account_id: toAccountId };
+  const accountAmountChanged = d.account_amount_cents != null && d.account_amount_cents !== old.account_amount_cents;
+  const toAccountAmountChanged = d.to_account_amount_cents != null && d.to_account_amount_cents !== old.to_account_amount_cents;
+  if ((old.reimbursed_at || old.type === 'reimburse') && (accountAmountChanged || toAccountAmountChanged)) {
+    throw new Error('报销关联流水不能修改账户原币金额');
+  }
+  const amounts = accountChanged || toAccountChanged || accountAmountChanged || toAccountAmountChanged
+    ? await accountAmounts(db, ledgerId, {
+      ...effect, currency, amount_cents: amount,
+      account_amount_cents: d.account_amount_cents ?? (accountChanged ? undefined : old.account_amount_cents),
+      to_account_amount_cents: d.to_account_amount_cents ?? (toAccountChanged ? undefined : old.to_account_amount_cents),
+    })
+    : { account_amount_cents: old.account_amount_cents, to_account_amount_cents: old.to_account_amount_cents };
+  const newTxn = { ...effect, ...amounts };
 
   if (old.reimbursed_at) {
     const moneyChanged =
@@ -459,14 +498,13 @@ export async function updateTransaction(
       ? String(d.updated_at)
       : old.updated_at;
   const stamp = stampMs();
-  const baseCents = toBase(amount, rate);
-  const upd = await db.run(
-    `UPDATE transactions SET type=?, amount_cents=?, currency=?, rate=?, amount_base_cents=?, account_id=?,
+  const delta = balanceDeltaStmts([[old, -1], [newTxn, 1]]);
+  const [upd] = await db.batch([
+    [`UPDATE transactions SET type=?, amount_cents=?, currency=?, rate=?, amount_base_cents=?, account_id=?,
        to_account_id=?, category_id=?, txn_date=?, note=?, merchant=?, status=?, is_reimbursable=?,
-       updated_at=? WHERE id=? AND ledger_id=? AND deleted_at IS NULL AND updated_at=?
-       AND type=? AND amount_cents=? AND currency=? AND rate=? AND IFNULL(account_id, -1) = IFNULL(?, -1)
-       AND IFNULL(to_account_id, -1) = IFNULL(?, -1)`,
-    type,
+       account_amount_cents=?, to_account_amount_cents=?, updated_at=?
+       WHERE id=? AND ledger_id=? AND deleted_at IS NULL AND updated_at=?`,
+    [type,
     amount,
     currency,
     rate,
@@ -479,27 +517,20 @@ export async function updateTransaction(
     d.merchant ? String(d.merchant).slice(0, 60) : null,
     d.status === 'pending' ? 'pending' : 'cleared',
     d.is_reimbursable ? 1 : 0,
+    amounts.account_amount_cents,
+    amounts.to_account_amount_cents,
     stamp,
     id,
     ledgerId,
-    expectedToken,
-    old.type,
-    old.amount_cents,
-    old.currency,
-    old.rate,
-    old.account_id,
-    old.to_account_id,
-  );
-  if (upd.changes !== 1) throw new Error('记录已被他人修改，请刷新后重试');
-
-  const newTxn = { type, amount_base_cents: baseCents, account_id: accountId, to_account_id: toAccountId };
-  const delta = balanceDeltaStmts([
-    [old, -1],
-    [newTxn, 1],
+    expectedToken]],
+    ...delta.map(([sql, params = []]): BatchStatement => [
+      `${sql} AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND ledger_id = ? AND updated_at = ?)`,
+      [...params, id, ledgerId, stamp],
+    ]),
   ]);
-  if (delta.length) await db.batch(delta);
+  if (Number(upd?.meta?.changes || 0) !== 1) throw new Error('记录已被他人修改，请刷新后重试');
   try {
-    await applyTags(db, id, ledgerId, d.tags, true);
+    if (d.tags !== undefined) await applyTags(db, id, ledgerId, d.tags, true);
   } catch (e) {
     console.error('applyTags failed for txn', id, e);
   }
@@ -522,7 +553,7 @@ export async function softDelete(
   db: Db,
   id: number,
   ledgerId: number,
-  opts: { skipSync?: boolean; env?: Pick<Env, 'ATTACHMENTS'> } = {},
+  opts: { skipSync?: boolean } = {},
 ): Promise<boolean> {
   const pre = await db.get<TxnRow>(
     'SELECT * FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at IS NULL',
@@ -531,9 +562,6 @@ export async function softDelete(
   );
   if (!pre) return false;
   if (pre.reimbursed_at) throw new Error('该笔已报销，请先删除报销入账记录后再删除');
-  const attRows = opts.env?.ATTACHMENTS
-    ? await db.all<{ rel_path: string }>('SELECT rel_path FROM attachments WHERE txn_id = ? AND ledger_id = ?', id, ledgerId)
-    : [];
   const stamp = stampMs();
   const delGuardSql = ' AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at = ? AND updated_at = ?)';
   const delGuardParams = [id, ledgerId, stamp, stamp];
@@ -543,10 +571,7 @@ export async function softDelete(
       [stamp, stamp, id, ledgerId, pre.updated_at],
     ],
     ...balanceDeltaStmts([[pre, -1]]).map(([sql, params = []]): BatchStatement => [`${sql}${delGuardSql}`, [...params, ...delGuardParams]]),
-    [`DELETE FROM transaction_tags WHERE transaction_id = ?${delGuardSql}`, [id, ...delGuardParams]],
-    [`DELETE FROM attachments WHERE txn_id = ? AND ledger_id = ?${delGuardSql}`, [id, ledgerId, ...delGuardParams]],
   ];
-  if (pre.group_id) stmts.push([`DELETE FROM splits WHERE group_id = ?${delGuardSql}`, [pre.group_id, ...delGuardParams]]);
   if (pre.type === 'reimburse') {
     stmts.push([
       `UPDATE transactions SET reimbursed_at = NULL, related_id = NULL WHERE related_id = ? AND ledger_id = ?${delGuardSql}`,
@@ -563,9 +588,6 @@ export async function softDelete(
     if (!cur || cur.deleted_at) return false;
     throw new Error('记录已被他人修改，请刷新后重试');
   }
-  if (attRows.length && opts.env?.ATTACHMENTS) {
-    await attach.deleteKeysFromR2(opts.env, attRows.map((a) => a.rel_path));
-  }
   if (!opts.skipSync) {
     try {
       await syncDebts(db, ledgerId);
@@ -580,13 +602,12 @@ export async function bulkDelete(
   db: Db,
   ids: number[],
   ledgerId: number,
-  opts: { env?: Pick<Env, 'ATTACHMENTS'> } = {},
 ) {
   let n = 0;
   const skipped: Array<{ id: number; reason: string }> = [];
   for (const id of ids) {
     try {
-      if (await softDelete(db, Number(id), ledgerId, { skipSync: true, env: opts.env })) n++;
+      if (await softDelete(db, Number(id), ledgerId, { skipSync: true })) n++;
       else skipped.push({ id: Number(id), reason: '记录不存在或已删除' });
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
@@ -603,7 +624,7 @@ export async function bulkDelete(
 
 export async function restoreTransaction(db: Db, id: number, ledgerId: number): Promise<boolean> {
   const t = await db.get<TxnRow>(
-    'SELECT * FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at IS NOT NULL',
+    'SELECT * FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at IS NOT NULL AND purge_started = 0',
     id,
     ledgerId,
   );
@@ -626,7 +647,7 @@ export async function restoreTransaction(db: Db, id: number, ledgerId: number): 
     [...params, id, ledgerId, stamp],
   ]);
   const results = await db.batch([
-    ['UPDATE transactions SET deleted_at = NULL, updated_at = ? WHERE id = ? AND ledger_id = ? AND deleted_at IS NOT NULL', [stamp, id, ledgerId]],
+    ['UPDATE transactions SET deleted_at = NULL, updated_at = ? WHERE id = ? AND ledger_id = ? AND deleted_at IS NOT NULL AND purge_started = 0', [stamp, id, ledgerId]],
     ...balStmts,
   ]);
   if (Number(results[0]?.meta?.changes || 0) !== 1) throw new Error('记录已被恢复或删除，请刷新后重试');
@@ -636,6 +657,28 @@ export async function restoreTransaction(db: Db, id: number, ledgerId: number): 
     console.error('syncDebts failed after restore txn', id, e);
   }
   return true;
+}
+
+export async function purgeTransaction(db: Db, env: Pick<Env, 'ATTACHMENTS'>, id: number, ledgerId: number): Promise<void> {
+  const claim = await db.run(
+    'UPDATE transactions SET purge_started = 1 WHERE id = ? AND ledger_id = ? AND deleted_at IS NOT NULL',
+    id, ledgerId,
+  );
+  if (!claim.changes) throw new Error('回收站中找不到该流水');
+  const rows = await db.all<{ rel_path: string }>(
+    'SELECT rel_path FROM attachments WHERE txn_id = ? AND ledger_id = ?', id, ledgerId,
+  );
+  if (rows.length && !env.ATTACHMENTS) throw new Error('附件存储未配置，无法永久删除');
+  await attach.deleteKeysFromR2(env, rows.map((row) => row.rel_path), { throwOnError: true });
+  await db.batch([
+    ['DELETE FROM transaction_tags WHERE transaction_id = ?', [id]],
+    ['DELETE FROM splits WHERE transaction_id = ? AND ledger_id = ?', [id, ledgerId]],
+    ['DELETE FROM attachments WHERE txn_id = ? AND ledger_id = ?', [id, ledgerId]],
+    ['UPDATE transactions SET related_id = NULL WHERE related_id = ? AND ledger_id = ?', [id, ledgerId]],
+    ['UPDATE session_card_logs SET txn_id = NULL WHERE txn_id = ? AND ledger_id = ?', [id, ledgerId]],
+    ['UPDATE session_cards SET purchase_txn_id = NULL WHERE purchase_txn_id = ? AND ledger_id = ?', [id, ledgerId]],
+    ['DELETE FROM transactions WHERE id = ? AND ledger_id = ? AND purge_started = 1', [id, ledgerId]],
+  ]);
 }
 
 export async function bulkRestore(db: Db, ids: number[], ledgerId: number) {
@@ -842,20 +885,22 @@ export async function markReimbursed(
   }
   const stamp = nowStr();
   const note = `报销 ${rows.length} 笔，合计 ${(total / 100).toFixed(2)}`;
-  const reimburseTxn = { type: 'reimburse', amount_base_cents: total, account_id: Number(accountId), to_account_id: null };
+  const currency = String(await getSetting(db, 'site.currency', 'CNY'));
+  const effect = { type: 'reimburse', amount_base_cents: total, account_id: Number(accountId), to_account_id: null };
+  const reimburseTxn = { ...effect, ...await accountAmounts(db, ledgerId, { ...effect, currency, amount_cents: total }) };
   const inList = rows.map(() => '?').join(',');
   const rowIds = rows.map((r) => r.id);
   const results = await db.batch([
     [
       `INSERT INTO transactions
        (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
-        user_id, txn_date, note, merchant, status, is_reimbursable, group_id, source, ai_json, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        user_id, txn_date, note, merchant, status, is_reimbursable, group_id, source, ai_json, created_at, updated_at, account_amount_cents)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         ledgerId,
         'reimburse',
         total,
-        'CNY',
+        currency,
         1,
         total,
         Number(accountId),
@@ -872,6 +917,7 @@ export async function markReimbursed(
         null,
         nowStr(),
         nowStr(),
+        reimburseTxn.account_amount_cents,
       ],
     ],
     [
@@ -1205,50 +1251,63 @@ export async function accountOverview(db: Db, ledgerId: number) {
     'SELECT * FROM accounts WHERE ledger_id = ? AND is_archived = 0 ORDER BY sort_order, id',
     ledgerId,
   );
+  const { code, rates } = await baseExchangeRates(db);
   let assets = 0;
   let liabilities = 0;
   for (const a of accounts.filter((x) => x.include_in_net)) {
-    const b = Number(a.balance_cents);
+    const rate = rates.get(a.currency.toUpperCase());
+    if (rate === undefined) continue;
+    const b = toBase(Number(a.balance_cents), rate);
     if (b >= 0) assets += b;
     else liabilities += Math.abs(b);
   }
-  const net = accounts.filter((a) => a.include_in_net).reduce((s, a) => s + Number(a.balance_cents), 0);
-  return { accounts, assets, liabilities, net };
+  const missingCurrencies = [...new Set(accounts.filter((a) => !rates.has(a.currency.toUpperCase())).map((a) => a.currency))];
+  return { accounts, assets, liabilities, net: assets - liabilities, baseCurrency: code, rates, missingCurrencies };
 }
 
 export async function netWorthTrend(db: Db, ledgerId: number, months = 6) {
   const list = lastMonths(months, todayStr());
-  const [allTxns, accounts] = await Promise.all([
-    db.all<{ txn_date: string; type: string; amount_base_cents: number; account_id: number | null; to_account_id: number | null }>(
-      `SELECT txn_date, type, amount_base_cents, account_id, to_account_id FROM transactions
+  const [allTxns, accounts, { rates }] = await Promise.all([
+    db.all<Pick<TxnRow, 'txn_date' | 'type' | 'amount_base_cents' | 'account_id' | 'to_account_id' | 'account_amount_cents' | 'to_account_amount_cents'>>(
+      `SELECT txn_date, type, amount_base_cents, account_id, to_account_id, account_amount_cents, to_account_amount_cents FROM transactions
        WHERE ledger_id = ? AND deleted_at IS NULL ORDER BY txn_date`,
       ledgerId,
     ),
-    db.all<Pick<AccountRow, 'id' | 'initial_cents' | 'include_in_net' | 'created_at' | 'balance_cents'>>(
-      'SELECT id, initial_cents, include_in_net, created_at, balance_cents FROM accounts WHERE ledger_id = ? AND is_archived = 0',
+    db.all<Pick<AccountRow, 'id' | 'initial_cents' | 'include_in_net' | 'created_at' | 'balance_cents' | 'currency'>>(
+      'SELECT id, initial_cents, include_in_net, created_at, balance_cents, currency FROM accounts WHERE ledger_id = ? AND is_archived = 0',
       ledgerId,
     ),
+    baseExchangeRates(db),
   ]);
   const included = new Map(accounts.filter((a) => a.include_in_net).map((a) => [Number(a.id), a]));
   const sortedAccts = [...included.values()].sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
   const out: Array<{ month: string; value: number }> = [];
   let cum = 0;
+  const running = new Map<number, number>();
+  const addNative = (id: number, delta: number) => {
+    const rate = rates.get(included.get(id)!.currency.toUpperCase()) ?? 0;
+    const prior = running.get(id) ?? 0;
+    const next = prior + delta;
+    cum += Math.round(next * rate) - Math.round(prior * rate);
+    running.set(id, next);
+  };
   let idx = 0;
   let aidx = 0;
   for (const m of list) {
     const end = monthEnd(m);
     while (aidx < sortedAccts.length && String(sortedAccts[aidx].created_at).slice(0, 10) <= end) {
-      cum += Number(sortedAccts[aidx].initial_cents);
+      const account = sortedAccts[aidx];
+      addNative(Number(account.id), Number(account.initial_cents));
       aidx++;
     }
     while (idx < allTxns.length && allTxns[idx].txn_date <= end) {
-      for (const e of txnEffects(allTxns[idx])) if (included.has(e.accountId)) cum += e.delta;
+      for (const e of txnEffects(allTxns[idx])) if (included.has(e.accountId)) addNative(e.accountId, e.delta);
       idx++;
     }
     out.push({ month: m, value: cum });
   }
   if (out.length) {
-    out[out.length - 1].value = [...included.values()].reduce((s, a) => s + Number(a.balance_cents), 0);
+    out[out.length - 1].value = [...included.values()].reduce((s, a) => s + Math.round(Number(a.balance_cents) * (rates.get(a.currency.toUpperCase()) ?? 0)), 0);
   }
   return out;
 }

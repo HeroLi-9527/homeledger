@@ -384,6 +384,8 @@ openapiRoutes.post('/transactions', async (c) => {
         rate: (body.rate as string | number | null) ?? null,
         account_id: accountId,
         to_account_id: toAccountId,
+        account_amount_cents: body.account_amount_cents == null ? undefined : Number(body.account_amount_cents),
+        to_account_amount_cents: body.to_account_amount_cents == null ? undefined : Number(body.to_account_amount_cents),
         category_id: categoryId,
         txn_date: txnDate,
         note: body.note != null ? String(body.note) : null,
@@ -447,12 +449,15 @@ async function handleApiTxnUpdate(c: Context<HonoEnv>) {
       account_id: body.account_id !== undefined ? (body.account_id as string | number | null) : existing.account_id,
       to_account_id:
         body.to_account_id !== undefined ? (body.to_account_id as string | number | null) : existing.to_account_id,
+      account_amount_cents: body.account_amount_cents == null ? undefined : Number(body.account_amount_cents),
+      to_account_amount_cents: body.to_account_amount_cents == null ? undefined : Number(body.to_account_amount_cents),
       category_id:
         body.category_id !== undefined ? (body.category_id as string | number | null) : existing.category_id,
       txn_date: body.txn_date !== undefined ? String(body.txn_date) : existing.txn_date,
       note: body.note !== undefined ? (body.note == null ? null : String(body.note)) : existing.note,
       merchant: body.merchant !== undefined ? (body.merchant == null ? null : String(body.merchant)) : existing.merchant,
       status: body.status !== undefined ? String(body.status) : existing.status,
+      tags: body.tags === undefined ? undefined : String(body.tags || ''),
       is_reimbursable:
         body.is_reimbursable !== undefined ? (body.is_reimbursable ? 1 : 0) : existing.is_reimbursable,
       updated_at: body.updated_at ? String(body.updated_at) : existing.updated_at,
@@ -472,7 +477,7 @@ openapiRoutes.delete('/transactions/:id', async (c) => {
   if (w) return w;
   const oa = c.get('openAuth')!;
   try {
-    const ok = await txn.softDelete(dbOf(c), Number(c.req.param('id')), oa.ledgerId, { env: envOf(c) });
+    const ok = await txn.softDelete(dbOf(c), Number(c.req.param('id')), oa.ledgerId);
     if (!ok) return c.json({ ok: false, error: '记录不存在' }, 404);
     return c.json({ ok: true });
   } catch (e) {
@@ -679,6 +684,7 @@ openapiRoutes.get('/attachments/:id', async (c) => {
   headers.set('Content-Type', found.row.mime || 'application/octet-stream');
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.set('Content-Security-Policy', 'sandbox');
+  headers.set('Cache-Control', 'no-store');
   return new Response(found.obj.body, { headers });
 });
 
@@ -700,13 +706,15 @@ openapiRoutes.get('/accounts', async (c) => {
       : fd.accounts(db, oa.ledgerId),
     txn.accountOverview(db, oa.ledgerId),
   ]);
-  const summary = groupAccountsSummary(accounts);
+  const summary = groupAccountsSummary(accounts, ov.rates);
   return c.json({
     ok: true,
     accounts: accounts.map(enrichAccount),
     assets: ov.assets,
     liabilities: ov.liabilities,
     net: ov.net,
+    base_currency: ov.baseCurrency,
+    missing_exchange_rates: ov.missingCurrencies,
     groups: {
       funds_total_cents: summary.fundsTotalCents,
       prepaid_total_cents: summary.prepaidTotalCents,
@@ -867,45 +875,19 @@ openapiRoutes.post('/accounts/:id/adjust', async (c) => {
     if (diff === 0) {
       return c.json({ ok: true, adjusted: false, diff_cents: 0, account: enrichAccount(acc), transaction: null });
     }
-    const claim = await db.run(
-      'UPDATE accounts SET balance_cents = ? WHERE id = ? AND ledger_id = ? AND balance_cents = ?',
-      target,
-      id,
-      oa.ledgerId,
-      Number(acc.balance_cents),
-    );
-    if (claim.changes !== 1) {
-      return c.json({ ok: false, error: '账户余额已变动，请重试' }, 409);
-    }
-    let txnId: number;
-    try {
-      const note =
-        body.note != null && String(body.note).trim()
-          ? String(body.note).trim().slice(0, 300)
-          : `余额校准：${u.fmtAmount(acc.balance_cents)} → ${u.fmtAmount(target)}`;
-      txnId = await txn.createTransaction(db, oa.ledgerId, oa.userId, {
-        type: 'adjust',
-        amount_cents: diff,
-        currency: acc.currency || 'CNY',
-        rate: 1,
-        account_id: id,
-        txn_date: adjustDate,
-        note,
-        source: 'openapi',
-        skipBalanceDelta: true,
-      });
-    } catch (e) {
-      await db
-        .run(
-          'UPDATE accounts SET balance_cents = ? WHERE id = ? AND ledger_id = ? AND balance_cents = ?',
-          Number(acc.balance_cents),
-          id,
-          oa.ledgerId,
-          target,
-        )
-        .catch(() => {});
-      throw e;
-    }
+    const note = body.note != null && String(body.note).trim()
+      ? String(body.note).trim().slice(0, 300)
+      : `余额校准：${u.fmtAmount(acc.balance_cents)} → ${u.fmtAmount(target)}`;
+    const txnId = await txn.createTransaction(db, oa.ledgerId, oa.userId, {
+      type: 'adjust',
+      amount_cents: diff,
+      currency: acc.currency,
+      account_id: id,
+      txn_date: adjustDate,
+      note,
+      source: 'openapi',
+      expectedBalanceCents: Number(acc.balance_cents),
+    });
     const [updated, createdTxn] = await Promise.all([
       db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId),
       txn.getTransaction(db, txnId, oa.ledgerId),
@@ -1320,7 +1302,7 @@ openapiRoutes.delete('/categories/:id', async (c) => {
   const used = Number(
     (
       await db.get<{ c: number }>(
-        'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND category_id = ? AND deleted_at IS NULL',
+        'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND category_id = ?',
         oa.ledgerId,
         id,
       )

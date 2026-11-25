@@ -1,4 +1,4 @@
-import { balanceDeltaStmts, nowStr, todayStr } from '../db.js';
+import { accountAmounts, balanceDeltaStmts, nowStr, todayStr } from '../db.js';
 import type { Db } from '../types.js';
 import { ledgerWriterIds, notify } from './auth.js';
 import { resolveRate } from './txn.js';
@@ -283,6 +283,8 @@ export async function charge(
   const currency = sub.currency || 'CNY';
   const rate = await resolveRate(db, currency);
   const baseCents = toBase(amount, rate);
+  const effect = { type: 'expense', amount_base_cents: baseCents, account_id: sub.account_id || null, to_account_id: null };
+  const chargeTxn = { ...effect, ...await accountAmounts(db, sub.ledger_id, { ...effect, currency, amount_cents: amount }) };
   const expectedNext = expectedNextChargeAt || advance(date, sub);
   const progress = await db.run(
     'UPDATE subscriptions SET last_charge_at = ?, charge_count = charge_count + 1 WHERE id = ? AND next_charge_at = ?',
@@ -293,12 +295,6 @@ export async function charge(
   if (Number(progress.changes || 0) !== 1) {
     throw new Error('该期已被另一路扣费抢占，请勿重复提交');
   }
-  const chargeTxn = {
-    type: 'expense',
-    amount_base_cents: baseCents,
-    account_id: sub.account_id || null,
-    to_account_id: null,
-  };
   const stamp = nowStr();
   let results: D1Result[];
   try {
@@ -306,8 +302,8 @@ export async function charge(
       [
         `INSERT INTO transactions
          (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
-          user_id, txn_date, note, merchant, status, source, subscription_id, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?)`,
+          user_id, txn_date, note, merchant, status, source, subscription_id, created_at, updated_at, account_amount_cents)
+         VALUES (?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           Number(sub.ledger_id),
           'expense',
@@ -326,6 +322,7 @@ export async function charge(
           Number(sub.id),
           stamp,
           stamp,
+          chargeTxn.account_amount_cents,
         ],
       ],
       ...balanceDeltaStmts([[chargeTxn, 1]]),

@@ -1,3 +1,4 @@
+import { canWrite } from '../lib/auth.js';
 import { Hono } from 'hono';
 import * as fd from '../lib/formdata.js';
 import * as sc from '../lib/session-cards.js';
@@ -91,7 +92,7 @@ sessionCardsRoutes.get('/session-cards/:id', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: sessionCardDetailPage({ card, logs, accounts, expenseCats, csrf: c.get('csrf') || '' }),
+      body: sessionCardDetailPage({ writable: canWrite(ctx.ledger?.role), card, logs, accounts, expenseCats, csrf: c.get('csrf') || '' }),
     }),
   );
 });

@@ -39,6 +39,8 @@ Status: implemented
 - **`/admin` 重置密码**：用户行提供重置密码表单（支持留空随机 12 位或自定义 ≥6 位），更新密码后自增 `token_version` 并吊销全部 `api_tokens`，页面请求直接返回 `Cache-Control: no-store` 的一次性结果页展示明文新密码，不再通过 `hl.flash` Cookie 传递。
 - **全库 JSON 恢复加固**：抽离 `src/lib/backup.ts`，`POST /backup/restore` 先执行 20MB 体积上限检查、JSON 解析、`app === 'homeledger'` 与 `version ∈ {1, 2}` 检查、活跃站点管理员存在性检查、非空分类检查、全行键并集与 `PRAGMA table_info` 必填列校验及内存主键/唯一键冲突预检，任意失败立即返回 400（零写库）；通过后按单句 ≤95 绑定参数拼装多行 `INSERT`，连同倒序清表与全局 `UPDATE users SET token_version = COALESCE(token_version, 1) + 1` 在**单次 `db.batch()` 事务**内原子提交，随后重算各账本余额并清除响应会话 Cookie 强制全端重新登录。
 
+凭证回收站、单账本恢复和整站归档见[账户币种与恢复边界](../bug-fix/2026-11-25-ledger-integrity-and-recovery.md)。
+
 ## Alternatives considered
 
 - **将「系统自动汇总」借贷设为完全不可编辑**：可避免任何直接修改 `debts` 表的代码，但用户从记账生成的借出/借入默认无 `due_date`，完全禁编会导致无法补充到期提醒日期。因此保留金额/方向只读不变量，仅开放 `due_date` 编辑并在 `syncDebts` 中保留。

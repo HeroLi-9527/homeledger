@@ -28,6 +28,8 @@ Status: implemented
 - 关于页按 `HOMELEDGER_GITHUB_REPO` 与 `UPSTREAM_GITHUB_REPO` 分离渲染自身链接与 `sucraft-hub/homeledger` 原址链接，并补充用户级 4 项统计卡片。
 - 新增 `.github/workflows/ci.yml` 在 `push` / `pull_request` 执行类型检查、全量测试与笔记校验；新增 `wrangler.toml.example`（含完整 `HOMELEDGER_GITHUB_REPO` URL 示例与两段式部署指引）、`scripts/reset-password.ts` 与 `scripts/seed-demo.ts`（统一使用 `ACCOUNT_TYPES` 枚举 `'debit'`/`'virtual'`，远程模式强制传入 `--confirm-remote` 与非默认强密码）。
 
+角色只读范围、CSV 往返和余额口径见[账户币种与恢复边界](../bug-fix/2026-11-25-ledger-integrity-and-recovery.md)。
+
 ## Alternatives considered
 
 - **直接覆盖已有的 `0001_init.sql` 追加索引或将新接口直接替换掉现有 OpenAPI 返回字段**：直接改写早期迁移会导致已通过 Wrangler 记录迁移历史的远程 D1 库跳过索引创建；而移除既有 `items` / `created_accounts` 字段虽能精简载荷，但会破坏既有 OpenAPI 客户端契约。因此选择追加独立 `0004` 迁移文件并在 OpenAPI 采用双字段并行输出，仅在确有新建账户时保留 `created_accounts`。

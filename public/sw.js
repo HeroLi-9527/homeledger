@@ -1,4 +1,4 @@
-const CACHE = 'homeledger-static-v2';
+const CACHE = 'homeledger-static-v3';
 const PRECACHE = [
   '/css/app.css',
   '/js/app.js',

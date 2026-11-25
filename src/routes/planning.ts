@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { getSetting, nowStr, todayStr } from '../db.js';
 import { accountOptionsHtml } from '../lib/accounts.js';
-import { ledgerWriterIds, notify } from '../lib/auth.js';
+import { canWrite, ledgerWriterIds, notify } from '../lib/auth.js';
 import { progressBar } from '../lib/charts.js';
 import * as fd from '../lib/formdata.js';
 import {
@@ -101,6 +101,7 @@ planningRoutes.get('/budgets', async (c) => {
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
       body: budgetsPage({
+        writable: canWrite(ctx.ledger?.role),
         items,
         cats,
         accounts,
@@ -372,6 +373,7 @@ planningRoutes.get('/recurring', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
+  const writable = canWrite(ctx.ledger?.role);
   const [rows, accounts, cats] = await Promise.all([
     db.all<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE ledger_id = ? ORDER BY next_run_at', lid),
     fd.accounts(db, lid),
@@ -388,10 +390,10 @@ planningRoutes.get('/recurring', async (c) => {
             : '';
         return `<tr><td><b>${esc(x.name)}</b></td><td class="num amount">${fmtAmount(total)}</td><td>${esc(x.frequency)}</td><td>${esc(x.next_run_at)}${anchorHint}</td><td><span class="chip">${x.is_active ? '启用' : '停用'}</span></td>
 <td><div class="row wrap">
-  <a class="btn btn-sm" href="/recurring/${x.id}/edit">编辑</a>
+${writable ? `  <a class="btn btn-sm" href="/recurring/${x.id}/edit">编辑</a>
   <form method="post" action="/recurring/${x.id}/run" style="display:inline">${csrfInput(c)}<input type="hidden" name="next_run_at" value="${esc(x.next_run_at)}"><button class="btn btn-sm" type="submit">立即执行</button></form>
   <form method="post" action="/recurring/${x.id}/toggle" style="display:inline">${csrfInput(c)}<button class="btn btn-sm" type="submit">${x.is_active ? '停用' : '启用'}</button></form>
-  <form method="post" action="/recurring/${x.id}/delete" style="display:inline" data-confirm="确认删除该周期账单？">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
+  <form method="post" action="/recurring/${x.id}/delete" style="display:inline" data-confirm="确认删除该周期账单？">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>` : ''}
 </div></td></tr>`;
       })
       .join('') || '<tr><td colspan="6">暂无周期账单</td></tr>';
@@ -407,7 +409,7 @@ planningRoutes.get('/recurring', async (c) => {
       flash: takeFlash(c),
       body:
         simpleTable('周期账单', ['名称', '金额', '频率', '下次执行', '状态', '操作'], bodyRows) +
-        `<div class="card mt16"><div class="card-head"><b>新建周期账单</b></div>
+        (writable ? `<div class="card mt16"><div class="card-head"><b>新建周期账单</b></div>
 <form method="post" action="/recurring" data-recurring-form>${csrfInput(c)}
   <div class="grid grid-3">
     <input name="name" placeholder="名称，如：房租" required>
@@ -425,7 +427,7 @@ planningRoutes.get('/recurring', async (c) => {
     <span class="spacer"></span>
     <button class="btn btn-primary" type="submit">创建</button>
   </div>
-</form></div>`,
+</form></div>` : ''),
     }),
   );
 });
@@ -691,6 +693,7 @@ planningRoutes.get('/debts', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
+  const writable = canWrite(ctx.ledger?.role);
   const [rows, accounts] = await Promise.all([
     db.all<DebtRow>('SELECT * FROM debts WHERE ledger_id = ? ORDER BY status, id DESC', lid),
     fd.accounts(db, lid),
@@ -708,15 +711,15 @@ planningRoutes.get('/debts', async (c) => {
   <td>${d.status === 'open' ? '进行中' : '已结清'}</td>
   <td><div class="row wrap">
     ${
-      d.status === 'open'
+      writable && d.status === 'open'
         ? `<form method="post" action="/debts/${d.id}/settle" class="row" style="display:inline-flex">${csrfInput(c)}<input name="amount" placeholder="金额" inputmode="decimal" style="width:90px"><select name="account_id" style="width:auto">${accounts.map((a) => `<option value="${a.id}" ${Number(d.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn btn-sm btn-primary" type="submit">结清</button></form>`
         : ''
     }
-    <a class="btn btn-sm" href="/debts/${d.id}/edit">${isAuto ? '设到期日' : '编辑'}</a>
+${writable ? `    <a class="btn btn-sm" href="/debts/${d.id}/edit">${isAuto ? '设到期日' : '编辑'}</a>` : ''}
     ${
       isAuto
         ? `<a class="btn btn-sm btn-ghost" href="/transactions?q=${encodeURIComponent(d.counterparty)}">关联流水</a>`
-        : `<form method="post" action="/debts/${d.id}/delete" style="display:inline" data-confirm="确认删除该借贷台账？">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>`
+        : writable ? `<form method="post" action="/debts/${d.id}/delete" style="display:inline" data-confirm="确认删除该借贷台账？">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>` : ''
     }
   </div></td>
 </tr>`;
@@ -734,7 +737,7 @@ planningRoutes.get('/debts', async (c) => {
       flash: takeFlash(c),
       body:
         simpleTable('借贷台账', ['对方', '方向', '本金', '待还/待收', '到期日', '状态', '操作'], bodyRows) +
-        `<div class="card mt16"><div class="card-head"><b>新建借贷</b></div>
+        (writable ? `<div class="card mt16"><div class="card-head"><b>新建借贷</b></div>
 <form method="post" action="/debts">${csrfInput(c)}
   <div class="grid grid-3">
     <select name="direction"><option value="receivable">借出（应收）</option><option value="payable">借入（应付）</option></select>
@@ -745,7 +748,7 @@ planningRoutes.get('/debts', async (c) => {
     <input name="note" placeholder="备注">
   </div>
   <div class="row mt12"><label class="check"><input type="checkbox" name="create_txn" value="1" checked> 同时生成账户流水</label><button class="btn btn-primary" type="submit">创建</button></div>
-</form></div>`,
+</form></div>` : ''),
     }),
   );
 });
@@ -995,6 +998,7 @@ planningRoutes.get('/goals', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
+  const writable = canWrite(ctx.ledger?.role);
   const [rows, accounts] = await Promise.all([
     db.all<GoalRow>(
       'SELECT g.*, a.name AS account_name FROM goals g LEFT JOIN accounts a ON a.id = g.account_id WHERE g.ledger_id = ? ORDER BY g.status, g.id DESC',
@@ -1030,9 +1034,9 @@ planningRoutes.get('/goals', async (c) => {
   <td>${esc(g.target_date || '—')}${dateExtra}</td>
   <td><span class="chip ${g.status === 'completed' ? 'income' : ''}">${g.status === 'completed' ? '已完成' : '进行中'}</span></td>
   <td><div class="row wrap">
-    <form method="post" action="/goals/${g.id}/deposit" class="row" style="display:inline-flex">${csrfInput(c)}<input name="amount" placeholder="存入（元）" inputmode="decimal" style="width:90px"><select name="account_id" style="width:auto"><option value="">账户</option>${accounts.map((a) => `<option value="${a.id}" ${Number(g.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><label class="check tiny"><input type="checkbox" name="create_txn" value="1" checked>记流水</label><button class="btn btn-sm btn-primary" type="submit">存入</button></form>
+${writable ? `    <form method="post" action="/goals/${g.id}/deposit" class="row" style="display:inline-flex">${csrfInput(c)}<input name="amount" placeholder="存入（元）" inputmode="decimal" style="width:90px"><select name="account_id" style="width:auto"><option value="">账户</option>${accounts.map((a) => `<option value="${a.id}" ${Number(g.account_id) === Number(a.id) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><label class="check tiny"><input type="checkbox" name="create_txn" value="1" checked>记流水</label><button class="btn btn-sm btn-primary" type="submit">存入</button></form>
     <a class="btn btn-sm" href="/goals/${g.id}/edit">编辑</a>
-    <form method="post" action="/goals/${g.id}/delete" style="display:inline" data-confirm="确认删除该储蓄目标？">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
+    <form method="post" action="/goals/${g.id}/delete" style="display:inline" data-confirm="确认删除该储蓄目标？">${csrfInput(c)}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>` : ''}
   </div></td>
 </tr>`;
       })
@@ -1049,7 +1053,7 @@ planningRoutes.get('/goals', async (c) => {
       flash: takeFlash(c),
       body:
         simpleTable('储蓄目标', ['目标', '目标金额', '已存', '进度', '目标日期', '状态', '操作'], bodyRows) +
-        `<div class="card mt16"><div class="card-head"><b>新建储蓄目标</b></div>
+        (writable ? `<div class="card mt16"><div class="card-head"><b>新建储蓄目标</b></div>
 <form method="post" action="/goals">${csrfInput(c)}
   <div class="grid grid-3">
     <input name="name" placeholder="目标名称，如：家庭应急基金" required>
@@ -1060,7 +1064,7 @@ planningRoutes.get('/goals', async (c) => {
     <input name="note" placeholder="备注">
   </div>
   <div class="row mt12"><button class="btn btn-primary" type="submit">创建目标</button></div>
-</form></div>`,
+</form></div>` : ''),
     }),
   );
 });

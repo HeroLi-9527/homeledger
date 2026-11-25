@@ -1,6 +1,6 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { nowStr, todayStr } from '../db.js';
-import { ledgerWriterIds, notify } from '../lib/auth.js';
+import { canWrite, ledgerWriterIds, notify } from '../lib/auth.js';
 import * as fd from '../lib/formdata.js';
 import * as subs from '../lib/subscriptions.js';
 import * as u from '../lib/util.js';
@@ -89,13 +89,14 @@ subscriptionsRoutes.get('/subscriptions', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: subscriptionsPage({ ov, accounts, cats, today: todayStr(), csrf: c.get('csrf') || '' }),
+      body: subscriptionsPage({ writable: canWrite(ctx.ledger?.role), ov, accounts, cats, today: todayStr(), csrf: c.get('csrf') || '' }),
     }),
   );
 });
 
-subscriptionsRoutes.get('/subscriptions/:id/edit', async (c) => {
-  const r = requireWrite(c);
+async function subscriptionDetails(c: Context<HonoEnv, '/subscriptions/:id' | '/subscriptions/:id/edit'>) {
+  const editing = c.req.path.endsWith('/edit');
+  const r = editing ? requireWrite(c) : requireLedger(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
@@ -105,8 +106,8 @@ subscriptionsRoutes.get('/subscriptions/:id/edit', async (c) => {
   const s = await db.get<subs.SubscriptionRow>('SELECT * FROM subscriptions WHERE id = ? AND ledger_id = ?', id, lid);
   if (!s) return c.redirect('/subscriptions');
   const [accounts, cats, charges, statRow] = await Promise.all([
-    fd.accounts(db, lid),
-    fd.flatCategories(db, lid, 'expense'),
+    editing ? fd.accounts(db, lid) : [],
+    editing ? fd.flatCategories(db, lid, 'expense') : [],
     subs.chargesOf(db, lid, s.id, 50),
     db.get<{ cnt: number; total: number }>(
       'SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_base_cents),0) AS total FROM transactions WHERE ledger_id = ? AND subscription_id = ? AND deleted_at IS NULL',
@@ -124,21 +125,21 @@ subscriptionsRoutes.get('/subscriptions/:id/edit', async (c) => {
   <td class="num amount">-${u.fmtAmount(ch.amount_base_cents)}</td>
   <td><span class="chip ${ch.status === 'pending' ? 'warn' : 'income'}">${ch.status === 'pending' ? '待确认' : '已入账'}</span></td>
   <td>${esc(ch.note || '—')}</td>
-  <td><a class="btn btn-sm" href="/transactions/${ch.id}/edit">查看流水 →</a></td>
+  <td>${canWrite(ctx.ledger?.role) ? `<a class="btn btn-sm" href="/transactions/${ch.id}/edit">查看流水 →</a>` : esc(ch.id)}</td>
 </tr>`,
       )
       .join('') || '<tr><td colspan="5">暂无历史扣费流水</td></tr>';
 
   return c.html(
     layout({
-      title: '编辑订阅',
+      title: editing ? '编辑订阅' : '订阅扣费历史',
       activeNav: 'subscriptions',
       ctx,
       siteName: meta.siteName,
       csrf,
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: `<div class="card mb16"><div class="card-head"><b>编辑订阅：${esc(s.name)}</b><form method="post" action="/subscriptions/${s.id}/delete" style="display:inline" data-confirm="确认永久删除该订阅？（不会删除已生成的历史扣费流水）">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除订阅</button></form></div>
+      body: `${editing ? `<div class="card mb16"><div class="card-head"><b>编辑订阅：${esc(s.name)}</b><form method="post" action="/subscriptions/${s.id}/delete" style="display:inline" data-confirm="确认永久删除该订阅？（不会删除已生成的历史扣费流水）">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除订阅</button></form></div>
 <form method="post" action="/subscriptions/${s.id}" data-require-trial-end>${csrfInput}
 <div class="grid grid-2">
   <div class="field"><label>名称</label><input name="name" value="${esc(s.name)}" required></div>
@@ -160,11 +161,14 @@ subscriptionsRoutes.get('/subscriptions/:id/edit', async (c) => {
   <div class="field"><label>备注</label><input name="note" value="${esc(s.note || '')}"></div>
   <div class="field" style="justify-content:flex-end"><label class="check"><input type="checkbox" name="auto_renew" ${s.auto_renew ? 'checked' : ''}> 到期自动扣费记账</label></div>
 </div>
-<div class="row mt12"><button class="btn btn-primary" type="submit">保存</button><a class="btn" href="/subscriptions">取消</a></div></form></div>
+<div class="row mt12"><button class="btn btn-primary" type="submit">保存</button><a class="btn" href="/subscriptions">取消</a></div></form></div>` : `<div class="between mb16"><h2>${esc(s.name)}</h2><a href="/subscriptions">返回订阅</a></div>`}
 ${simpleTable('历史扣费记录', ['扣费日期', '本位币金额', '状态', '备注', '操作'], chargeRows, `<span class="muted small amount">累计 ${Number(statRow?.cnt || 0)} 期 · 合计 ${u.fmtAmount(Number(statRow?.total || 0))}</span>`)}`,
     }),
   );
-});
+}
+
+subscriptionsRoutes.get('/subscriptions/:id', subscriptionDetails);
+subscriptionsRoutes.get('/subscriptions/:id/edit', subscriptionDetails);
 
 subscriptionsRoutes.post('/subscriptions', async (c) => {
   const r = requireWrite(c);

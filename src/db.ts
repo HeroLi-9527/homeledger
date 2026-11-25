@@ -154,11 +154,65 @@ export async function createDefaultLedger(db: Db, userId: number, displayName: s
   return id;
 }
 
+export async function baseExchangeRates(db: Db) {
+  const code = String(await getSetting(db, 'site.currency', 'CNY')).toUpperCase();
+  const rows = await db.all<{ base: string; rate: number }>(
+    'SELECT base, rate FROM exchange_rates WHERE quote = ? AND rate > 0', code,
+  );
+  return { code, rates: new Map([...rows.map((r) => [r.base, Number(r.rate)] as const), [code, 1]]) };
+}
+
 export interface TxnEffectInput {
   type: string;
   amount_base_cents: number;
   account_id: number | null;
   to_account_id?: number | null;
+  account_amount_cents?: number | null;
+  to_account_amount_cents?: number | null;
+}
+
+export function accountCentsFromBase(cents: number, currency: string, base: string, rate: number | undefined): number {
+  if (currency === base) return cents;
+  if (rate === undefined || !(rate > 0)) throw new Error(`缺少 ${currency} 兑 ${base} 汇率，请填写账户原币金额`);
+  const original = Math.round(cents / rate);
+  if (!original) throw new Error('折算后的账户原币金额小于最小单位，请填写实际金额');
+  return original;
+}
+
+export async function accountAmounts(
+  db: Db,
+  ledgerId: number,
+  t: TxnEffectInput & { amount_cents: number; currency: string },
+): Promise<{ account_amount_cents: number | null; to_account_amount_cents: number | null }> {
+  const twoSided = ['transfer', 'invest_buy', 'invest_sell'].includes(t.type);
+  const ids = [t.account_id, twoSided ? t.to_account_id : null].filter((id): id is number => id != null);
+  if (!ids.length) return { account_amount_cents: null, to_account_amount_cents: null };
+  const accounts = await db.all<{ id: number; currency: string }>(
+    `SELECT id, currency FROM accounts WHERE ledger_id = ? AND id IN (${ids.map(() => '?').join(',')})`, ledgerId, ...ids,
+  );
+  let basePromise: Promise<string | null> | undefined;
+  const amountFor = async (id: number | null | undefined, actual: number | null | undefined) => {
+    if (!id || actual === null) return null;
+    const account = accounts.find((a) => Number(a.id) === id);
+    if (!account) throw new Error('账户不属于当前账本或已删除');
+    if (actual != null) {
+      if (!Number.isSafeInteger(actual) || (t.type === 'adjust' ? Math.sign(actual) !== Math.sign(t.amount_cents) : actual <= 0)) {
+        throw new Error('账户原币金额无效');
+      }
+      return actual;
+    }
+    const code = account.currency.toUpperCase();
+    if (code === t.currency.toUpperCase()) return t.amount_cents;
+    const base = String(await (basePromise ??= getSetting(db, 'site.currency', 'CNY'))).toUpperCase();
+    if (code === base) return t.amount_base_cents;
+    const row = await db.get<{ rate: number }>('SELECT rate FROM exchange_rates WHERE base = ? AND quote = ?', code, base);
+    return accountCentsFromBase(t.amount_base_cents, code, base, row?.rate);
+  };
+  const [account_amount_cents, to_account_amount_cents] = await Promise.all([
+    amountFor(t.account_id, t.account_amount_cents),
+    amountFor(twoSided ? t.to_account_id : null, t.to_account_amount_cents),
+  ]);
+  return { account_amount_cents, to_account_amount_cents };
 }
 
 export interface BalanceEffect {
@@ -167,7 +221,8 @@ export interface BalanceEffect {
 }
 
 export function txnEffects(t: TxnEffectInput): BalanceEffect[] {
-  const a = Number(t.amount_base_cents) || 0;
+  const a = Number(t.account_amount_cents === undefined ? t.amount_base_cents : t.account_amount_cents) || 0;
+  const b = Number(t.to_account_amount_cents === undefined ? t.amount_base_cents : t.to_account_amount_cents) || 0;
   const out: BalanceEffect[] = [];
   const push = (id: number | null | undefined, d: number) => {
     if (id) out.push({ accountId: Number(id), delta: d });
@@ -190,10 +245,11 @@ export function txnEffects(t: TxnEffectInput): BalanceEffect[] {
     case 'transfer':
     case 'invest_buy':
       push(t.account_id, -a);
-      push(t.to_account_id, a);
+      push(t.to_account_id, b);
       break;
     case 'invest_sell':
-      push(t.to_account_id || t.account_id, -a);
+      if (t.to_account_id) push(t.to_account_id, -b);
+      else push(t.account_id, -a);
       push(t.account_id, a);
       break;
     case 'adjust':
@@ -217,23 +273,31 @@ export function balanceDeltaStmts(signed: Array<[TxnEffectInput, number]>): Batc
     .map(([accountId, d]) => ['UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?', [d, accountId]]);
 }
 
-export async function recalcBalances(db: Db, ledgerId: number): Promise<void> {
-  const [accounts, rows] = await Promise.all([
-    db.all<{ id: number; initial_cents: number }>('SELECT id, initial_cents FROM accounts WHERE ledger_id = ?', ledgerId),
-    db.all<TxnEffectInput>(
-      'SELECT type, amount_base_cents, account_id, to_account_id FROM transactions WHERE ledger_id = ? AND deleted_at IS NULL',
-      ledgerId,
+export const backfillLegacyAccountAmounts: BatchStatement = [`WITH base AS (SELECT UPPER(COALESCE((SELECT value FROM settings WHERE key = 'site.currency'), 'CNY')) AS code)
+UPDATE transactions AS t
+SET account_amount_cents = (
+      SELECT CASE
+        WHEN UPPER(a.currency) = UPPER(t.currency) THEN t.amount_cents
+        WHEN UPPER(a.currency) = base.code THEN t.amount_base_cents
+      END
+      FROM accounts a, base WHERE a.id = t.account_id AND a.ledger_id = t.ledger_id
     ),
-  ]);
-  const delta = new Map<number, number>();
-  for (const t of rows) {
-    for (const e of txnEffects(t)) {
-      delta.set(e.accountId, (delta.get(e.accountId) || 0) + e.delta);
-    }
-  }
-  const stmts: BatchStatement[] = accounts.map((acc) => {
-    const v = Number(acc.initial_cents) + (delta.get(Number(acc.id)) || 0);
-    return ['UPDATE accounts SET balance_cents = ? WHERE id = ?', [v, acc.id]];
-  });
-  if (stmts.length) await db.batch(stmts);
-}
+    to_account_amount_cents = (
+      SELECT CASE
+        WHEN UPPER(a.currency) = UPPER(t.currency) THEN t.amount_cents
+        WHEN UPPER(a.currency) = base.code THEN t.amount_base_cents
+      END
+      FROM accounts a, base WHERE a.id = t.to_account_id AND a.ledger_id = t.ledger_id
+    )`];
+
+export const recomputeAccountBalances: BatchStatement = [`WITH sides AS (
+  SELECT account_id AS id, CASE
+    WHEN type = 'invest_sell' AND to_account_id IS NULL THEN 0
+    WHEN type IN ('income','borrow','repay_receive','reimburse','refund','interest','invest_sell','adjust')
+      THEN account_amount_cents ELSE -account_amount_cents END AS delta
+  FROM transactions WHERE deleted_at IS NULL AND account_id IS NOT NULL
+  UNION ALL
+  SELECT to_account_id, CASE WHEN type = 'invest_sell' THEN -to_account_amount_cents ELSE to_account_amount_cents END
+  FROM transactions WHERE deleted_at IS NULL AND to_account_id IS NOT NULL AND type IN ('transfer','invest_buy','invest_sell')
+), totals AS (SELECT id, SUM(delta) AS delta FROM sides GROUP BY id)
+UPDATE accounts SET balance_cents = initial_cents + COALESCE((SELECT delta FROM totals WHERE id = accounts.id), 0)`];

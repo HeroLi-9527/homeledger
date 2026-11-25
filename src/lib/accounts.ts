@@ -78,7 +78,9 @@ export function creditMetrics(
   };
 }
 
-export function groupAccountsSummary(accounts: AccountRow[]): GroupedAccountsSummary {
+export function groupAccountsSummary(accounts: AccountRow[], rates?: ReadonlyMap<string, number>): GroupedAccountsSummary {
+  const baseValue = (a: AccountRow, cents: number) =>
+    Math.round(cents * (rates ? rates.get(a.currency.toUpperCase()) ?? 0 : 1));
   const active = accounts.filter((a) => !a.is_archived);
   const archived = accounts.filter((a) => Boolean(a.is_archived));
   const groups: Record<AccountGroupKey, AccountRow[]> = {
@@ -89,14 +91,14 @@ export function groupAccountsSummary(accounts: AccountRow[]): GroupedAccountsSum
   for (const a of active) {
     groups[accountGroupOf(a.type)].push(a);
   }
-  const fundsTotalCents = groups.funds.reduce((s, a) => s + Number(a.balance_cents || 0), 0);
-  const prepaidTotalCents = groups.prepaid.reduce((s, a) => s + Number(a.balance_cents || 0), 0);
-  const creditDebtCents = groups.credit.reduce((s, a) => s + Math.max(0, -Number(a.balance_cents || 0)), 0);
+  const fundsTotalCents = groups.funds.reduce((s, a) => s + baseValue(a, Number(a.balance_cents || 0)), 0);
+  const prepaidTotalCents = groups.prepaid.reduce((s, a) => s + baseValue(a, Number(a.balance_cents || 0)), 0);
+  const creditDebtCents = groups.credit.reduce((s, a) => s + baseValue(a, Math.max(0, -Number(a.balance_cents || 0))), 0);
   const creditLimitCents = groups.credit.reduce(
-    (s, a) => s + (a.credit_limit != null && Number(a.credit_limit) > 0 ? Number(a.credit_limit) : 0),
+    (s, a) => s + (a.credit_limit != null && Number(a.credit_limit) > 0 ? baseValue(a, Number(a.credit_limit)) : 0),
     0,
   );
-  const creditAvailableCents = groups.credit.reduce((s, a) => s + (creditMetrics(a).availableCents ?? 0), 0);
+  const creditAvailableCents = groups.credit.reduce((s, a) => s + baseValue(a, creditMetrics(a).availableCents ?? 0), 0);
   return {
     active,
     archived,
@@ -137,8 +139,8 @@ export function accountOptionsHtml(
         const b = Number(a.balance_cents || 0);
         const balStr = opts.showBalance
           ? isCreditGroupType(a.type) && b < 0
-            ? `（待还 ¥${fmtAmount(Math.abs(b))}）`
-            : `（¥${fmtAmount(b)}）`
+            ? `（待还 ${esc(a.currency)} ${fmtAmount(Math.abs(b))}）`
+            : `（${esc(a.currency)} ${fmtAmount(b)}）`
           : '';
         return `<option value="${a.id}" ${sel === Number(a.id) ? 'selected' : ''}>${esc(a.icon || '💳')} ${esc(a.name)}${balStr}</option>`;
       })
@@ -239,6 +241,9 @@ export function normalizeAccountWrite(
 
   const curRaw = body.currency !== undefined ? String(body.currency || '').trim().toUpperCase() : ex?.currency || 'CNY';
   const currency = (curRaw || 'CNY').slice(0, 8);
+  if (ex && currency !== ex.currency && (ex.initial_cents || ex.balance_cents || ex.credit_limit)) {
+    throw new Error('已有余额或额度的账户不能更换币种');
+  }
 
   let includeInNet: number;
   if (body.include_in_net !== undefined) {
@@ -326,7 +331,7 @@ export async function findAccountReferences(
   const lid = Number(ledgerId);
   const [txnRow, subRow, recRows, budRow, goalRow, debtRow] = await Promise.all([
     db.get<{ c: number }>(
-      'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND (account_id = ? OR to_account_id = ?) AND deleted_at IS NULL',
+      'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND (account_id = ? OR to_account_id = ?)',
       lid,
       aid,
       aid,
@@ -407,7 +412,7 @@ export async function deleteAccountIfUnreferenced(
   const res = await db.run(
     `DELETE FROM accounts
      WHERE id = ? AND ledger_id = ?
-       AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.ledger_id = accounts.ledger_id AND (t.account_id = accounts.id OR t.to_account_id = accounts.id) AND t.deleted_at IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.ledger_id = accounts.ledger_id AND (t.account_id = accounts.id OR t.to_account_id = accounts.id))
        AND NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.ledger_id = accounts.ledger_id AND s.account_id = accounts.id)
        AND NOT EXISTS (SELECT 1 FROM budgets b WHERE b.ledger_id = accounts.ledger_id AND b.account_id = accounts.id)
        AND NOT EXISTS (SELECT 1 FROM goals g WHERE g.ledger_id = accounts.ledger_id AND g.account_id = accounts.id)

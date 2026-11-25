@@ -39,6 +39,8 @@ Status: implemented
 ### 4. OpenAPI 同步扩展
 - `src/routes/openapi.ts` 扩展 `GET /api/open/accounts`（附加 `group`、`credit` 与 `groups` 汇总，保留原字段兼容）、扩展 `POST /api/open/accounts`（支持信用字段与 `debt` / `debt_cents`，兼容原 `initial_cents` / `balance`）、新增 `PATCH/PUT /api/open/accounts/:id`，并新增 `/api/open/session-cards` 查询、开卡、核销、续费与撤销端点，维持 Bearer 鉴权纯只读红线。
 
+账户原币、余额校准与重算按[账户币种与恢复边界](../bug-fix/2026-11-25-ledger-integrity-and-recovery.md)执行。
+
 ## Alternatives considered
 
 - **在 `accounts` 表直接新增次卡字段并按次核销摊销生成 `expense` 流水**：共用 `accounts` 表可复用现有账户列表与权限逻辑，但把「按次计数」塞进人民币 `balance_cents` 与净资产汇总，且核销摊销必须在购卡时先做 `transfer` 资产转移并处理末次分位尾差、报销与预算双重口径冲突。经访谈对齐后，选择独立 `session_cards` + `session_card_logs` 两张表并将财务口径定为「购卡即支出、核销仅作次数台账」，彻底解耦净资产与余次管理。

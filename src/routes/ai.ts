@@ -1,3 +1,4 @@
+import { canWrite } from '../lib/auth.js';
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { nowStr, todayStr } from '../db.js';
@@ -181,7 +182,7 @@ export async function findDuplicateAiTxn(
 }
 
 aiRoutes.get('/ai', async (c) => {
-  const r = requireLogin(c);
+  const r = requireWrite(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
@@ -195,7 +196,7 @@ aiRoutes.get('/ai', async (c) => {
       `SELECT a.*, t.amount_base_cents AS amount_cents, t.txn_date, t.merchant
        FROM attachments a
        LEFT JOIN transactions t ON t.id = a.txn_id AND t.deleted_at IS NULL
-       WHERE a.ledger_id = ?
+       WHERE a.ledger_id = ? AND ${attach.visibleAttachment}
        ORDER BY a.id DESC LIMIT 12`,
       ledgerId,
     ),
@@ -548,7 +549,7 @@ aiRoutes.get('/attachments', async (c) => {
   const pageSize = 30;
   const page = Math.max(1, Number(c.req.query('page') || 1));
   const total = Number(
-    (await db.get<{ c: number }>('SELECT COUNT(*) AS c FROM attachments WHERE ledger_id = ?', ledgerId))?.c || 0,
+    (await db.get<{ c: number }>(`SELECT COUNT(*) AS c FROM attachments a WHERE a.ledger_id = ? AND ${attach.visibleAttachment}`, ledgerId))?.c || 0,
   );
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const curPage = Math.min(page, totalPages);
@@ -558,7 +559,7 @@ aiRoutes.get('/attachments', async (c) => {
     `SELECT a.*, t.id AS linked_txn_id, t.txn_date, t.merchant, t.amount_base_cents AS amount_cents
      FROM attachments a
      LEFT JOIN transactions t ON t.id = a.txn_id AND t.deleted_at IS NULL
-     WHERE a.ledger_id = ?
+     WHERE a.ledger_id = ? AND ${attach.visibleAttachment}
      ORDER BY a.id DESC LIMIT ? OFFSET ?`,
     ledgerId,
     pageSize,
@@ -574,7 +575,7 @@ aiRoutes.get('/attachments', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: attachmentsPage({ rows, page: curPage, total, totalPages, csrf: c.get('csrf') || '' }),
+      body: attachmentsPage({ writable: canWrite(ctx.ledger.role), rows, page: curPage, total, totalPages, csrf: c.get('csrf') || '' }),
     }),
   );
 });

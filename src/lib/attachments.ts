@@ -138,7 +138,9 @@ export async function saveBufferImage(
   try {
     info = await db.run(
       `INSERT INTO attachments (ledger_id, txn_id, user_id, kind, file_name, rel_path, mime, size, ai_status, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+       SELECT ?,?,?,?,?,?,?,?,?,?
+       WHERE EXISTS (SELECT 1 FROM ledgers WHERE id = ? AND is_archived = 0)
+         AND (? IS NULL OR EXISTS (SELECT 1 FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at IS NULL))`,
       Number(ledgerId),
       txnId != null ? Number(txnId) : null,
       Number(userId),
@@ -149,7 +151,12 @@ export async function saveBufferImage(
       buf.length,
       aiStatus,
       nowStr(),
+      ledgerId,
+      txnId,
+      txnId,
+      ledgerId,
     );
+    if (info.changes !== 1) throw new Error('账本或关联流水已归档或进入回收站');
   } catch (e) {
     await env.ATTACHMENTS.delete(key).catch(() => {});
     throw e;
@@ -206,10 +213,13 @@ export async function linkImagesToTxns(
   for (let i = 0; i < ids.length; i++) {
     const target = txns.length === ids.length ? txns[i] : txns[0];
     const res = await db.run(
-      'UPDATE attachments SET txn_id = ?, ai_status = ? WHERE id = ? AND ledger_id = ? AND txn_id IS NULL',
+      `UPDATE attachments SET txn_id = ?, ai_status = ? WHERE id = ? AND ledger_id = ? AND txn_id IS NULL
+       AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at IS NULL)`,
       target,
       aiStatus,
       ids[i],
+      Number(ledgerId),
+      target,
       Number(ledgerId),
     );
     if (res.changes === 1) pairs.push({ image_id: ids[i], txn_id: target });
@@ -270,9 +280,13 @@ export async function attachCounts<T extends { id?: number; attachment_count?: n
   return items;
 }
 
+export const visibleAttachment = `(a.txn_id IS NULL OR EXISTS (
+  SELECT 1 FROM transactions t WHERE t.id = a.txn_id AND t.ledger_id = a.ledger_id AND t.deleted_at IS NULL
+))`;
+
 export async function getById(db: Db, ledgerId: number, id: number): Promise<AttachmentRow | null> {
   const row = await db.get<AttachmentRow>(
-    'SELECT * FROM attachments WHERE id = ? AND ledger_id = ?',
+    `SELECT a.* FROM attachments a WHERE a.id = ? AND a.ledger_id = ? AND ${visibleAttachment}`,
     Number(id),
     Number(ledgerId),
   );
@@ -316,12 +330,13 @@ export async function removeById(
   id: number,
 ): Promise<boolean> {
   const row = await db.get<AttachmentRow>(
-    'SELECT * FROM attachments WHERE id = ? AND ledger_id = ?',
+    `SELECT a.* FROM attachments a WHERE a.id = ? AND a.ledger_id = ? AND ${visibleAttachment}`,
     Number(id),
     Number(ledgerId),
   );
   if (!row) return false;
-  await deleteKeysFromR2(env, [String(row.rel_path)]);
+  if (!env.ATTACHMENTS) throw new Error('附件存储未配置');
+  await deleteKeysFromR2(env, [String(row.rel_path)], { throwOnError: true });
   await db.run('DELETE FROM attachments WHERE id = ?', row.id);
   return true;
 }

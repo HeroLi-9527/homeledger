@@ -20,7 +20,7 @@ export interface ReportsViewProps {
   weekdayExpense: Array<{ wd: number; label: string; expense: number; cnt: number }>;
   members: Array<{ id: number; name: string; color: string; expense: number; income: number; cnt: number }>;
   netWorth: Array<{ month: string; value: number }>;
-  overview: { accounts: AccountRow[]; net: number; assets: number; liabilities: number };
+  overview: { accounts: AccountRow[]; net: number; assets: number; liabilities: number; baseCurrency: string; missingCurrencies: string[] };
   expenseCount: { c: number; avg: number };
   heatmapMonth: string;
   linkWith: (overrides: Record<string, string>, opts?: { keepPeriod?: boolean }) => string;
@@ -183,7 +183,7 @@ export function reportsPage(p: ReportsViewProps): string {
 </div>
 
 <div class="card mb16">
-  <div class="card-head"><b>家庭净资产曲线（近 12 个月）</b><span class="muted small">服务端离线 SVG 渲染</span></div>
+  <div class="card-head"><b>家庭净资产曲线（近 12 个月）</b><span class="muted small">按当前汇率估值 · ${esc(p.overview.baseCurrency)}</span></div>
   <div class="chart-box">${netWorthSvg}</div>
 </div>
 
@@ -258,6 +258,7 @@ export function reportsPage(p: ReportsViewProps): string {
 <div class="card mb16">
   <div class="card-head">
     <b>账户余额一览表</b>
+    ${p.overview.missingCurrencies.length ? `<p class="muted">汇总未计入缺少汇率的币种 ${esc(p.overview.missingCurrencies.join('、'))}</p>` : ''}
     <span class="muted small">总资产 ${fmtAmount(p.overview.assets)} · 总负债 ${fmtAmount(p.overview.liabilities)} · 净资产 ${fmtAmount(p.overview.net)}</span>
   </div>
   <div class="scroll-x">

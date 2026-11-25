@@ -9,7 +9,7 @@
   - 禁止引入 `sessions`、`rate_limits`、`login_attempts`、`audit_logs`、`notification_dedup` 表；网页鉴权使用无状态 HMAC-SHA256 签名 Cookie + `users.token_version`。
   - 禁止每请求执行 `ensureSeeded` / `bootstrapAdmin` 查库；内置 209 个分类、默认汇率与默认设置由 SQL Migration 一次性写入，首次部署通过 `/setup` 创建管理员。
   - OpenAPI Bearer 鉴权保持零 D1 写入（不更新 `last_used_at`）。
-  - Cron 固定为每 4 小时 1 次（`0 */4 * * *`），禁止在定时任务里对 R2 执行全量 `list()` 扫描；删除流水/取消附件时同步删除对应 R2 对象。
+  - Cron 固定为每 4 小时 1 次（`0 */4 * * *`），禁止在定时任务里对 R2 执行全量 `list()` 扫描。软删流水保留凭证并隐藏正常附件访问，永久删除流水、永久删除账本或单独删除附件时同步清理已知 R2 对象。
   - 保留 `scrypt-js` 零依赖原则，统一使用 WebCrypto PBKDF2-SHA256，不背负旧版 `homeledger.db` 历史兼容包袱。
 
 ## 核心工作流：从对齐到落笔

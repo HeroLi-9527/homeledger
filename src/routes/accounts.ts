@@ -35,7 +35,7 @@ accountsRoutes.get('/accounts', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: accountsPage({ accounts: rows, ov, sessionCards, expenseCats, csrf: c.get('csrf') || '' }),
+      body: accountsPage({ writable: auth.canWrite(ctx.ledger?.role), accounts: rows, ov, sessionCards, expenseCats, csrf: c.get('csrf') || '' }),
     }),
   );
 });
@@ -125,41 +125,23 @@ accountsRoutes.post('/accounts/:id/adjust', async (c) => {
   }
   const diff = target - Number(acc.balance_cents);
   if (diff !== 0) {
-    const claim = await db.run(
-      'UPDATE accounts SET balance_cents = ? WHERE id = ? AND ledger_id = ? AND balance_cents = ?',
-      target,
-      id,
-      ledgerId,
-      Number(acc.balance_cents),
-    );
-    if (claim.changes !== 1) {
-      setFlash(c, 'error', '余额已被修改，请刷新后重试');
-      return c.redirect('/accounts');
-    }
     try {
       await txn.createTransaction(db, ledgerId, ctx.user!.id, {
         type: 'adjust',
         amount_cents: diff,
-        currency: acc.currency || 'CNY',
-        rate: 1,
+        currency: acc.currency,
         account_id: id,
         txn_date: String(body.adjust_date || todayStr()),
         note: `余额校准：${u.fmtAmount(acc.balance_cents)} → ${u.fmtAmount(target)}`,
         source: 'manual',
-        skipBalanceDelta: true,
+        expectedBalanceCents: Number(acc.balance_cents),
       });
     } catch (e) {
-      await db.run(
-        'UPDATE accounts SET balance_cents = ? WHERE id = ? AND ledger_id = ? AND balance_cents = ?',
-        Number(acc.balance_cents),
-        id,
-        ledgerId,
-        target,
-      );
-      throw e;
+      setFlash(c, 'error', toPublicError(e));
+      return c.redirect(`/accounts/${id}`);
     }
   }
-  setFlash(c, 'success', diff === 0 ? '余额一致，无需调整' : `已调整 ${u.signedMoney(diff)}，余额已对齐`);
+  setFlash(c, 'success', diff === 0 ? '余额一致，无需调整' : `已调整 ${u.signedMoney(diff, acc.currency)}，余额已对齐`);
   return c.redirect(`/accounts/${id}`);
 });
 
@@ -201,7 +183,16 @@ accountsRoutes.get('/accounts/:id', async (c) => {
     page,
     pageSize: 30,
   });
-  const groups = await txn.groupByDate(result.rows, db);
+  const [groups, unresolved] = await Promise.all([
+    txn.groupByDate(result.rows, db),
+    db.all<{ id: number; txn_date: string }>(
+      `SELECT id, txn_date FROM transactions WHERE ledger_id = ? AND deleted_at IS NULL
+       AND ((account_id = ? AND account_amount_cents IS NULL)
+            OR (to_account_id = ? AND to_account_amount_cents IS NULL AND type IN ('transfer','invest_buy','invest_sell')))
+       ORDER BY txn_date DESC, id DESC LIMIT 30`,
+      Number(ctx.ledger!.id), id, id,
+    ),
+  ]);
   return c.html(
     layout({
       title: acc.name,
@@ -214,6 +205,7 @@ accountsRoutes.get('/accounts/:id', async (c) => {
       body: accountDetailPage({
         acc,
         groups,
+        unresolved,
         result,
         from,
         to,
@@ -225,7 +217,7 @@ accountsRoutes.get('/accounts/:id', async (c) => {
 });
 
 accountsRoutes.get('/accounts/:id/edit', async (c) => {
-  const r = requireLedger(c);
+  const r = requireWrite(c);
   if (r) return r;
   return c.redirect(`/accounts/${Number(c.req.param('id'))}#edit`);
 });
@@ -324,7 +316,7 @@ accountsRoutes.get('/categories', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: categoriesPage({ tree, csrf: c.get('csrf') || '' }),
+      body: categoriesPage({ writable: auth.canWrite(ctx.ledger?.role), tree, csrf: c.get('csrf') || '' }),
     }),
   );
 });
@@ -441,7 +433,7 @@ accountsRoutes.post('/categories/:id/delete', async (c) => {
   const used = Number(
     (
       await db.get<{ c: number }>(
-        'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND category_id = ? AND deleted_at IS NULL',
+        'SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ? AND category_id = ?',
         ledgerId,
         id,
       )
@@ -483,7 +475,7 @@ accountsRoutes.get('/tags', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: tagsPage({ tags: rows, csrf: c.get('csrf') || '' }),
+      body: tagsPage({ writable: auth.canWrite(ctx.ledger?.role), tags: rows, csrf: c.get('csrf') || '' }),
     }),
   );
 });

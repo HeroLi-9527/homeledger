@@ -4,8 +4,10 @@ import {
   allSettings,
   createDefaultAccounts,
   createDefaultLedger,
+  getSetting,
   nowStr,
-  recalcBalances,
+  backfillLegacyAccountAmounts,
+  recomputeAccountBalances,
   setSetting,
   todayStr,
   TXN_TYPE_MAP,
@@ -25,11 +27,13 @@ import * as auth from '../lib/auth.js';
 import * as fd from '../lib/formdata.js';
 import {
   BACKUP_TABLES,
+  backupObjectReferences,
   MAX_BACKUP_BYTES,
   validateAndBuildRestorePlan,
   type TableColumnInfo,
 } from '../lib/backup.js';
-import { csvLine, EXPORT_HEADER, exportRows, importRecords, parseBill, type ParsedBillRecord } from '../lib/importers.js';
+import { csvLine, NATIVE_EXPORT_HEADER, exportRows, importNativeRecords, importRecords, mapNativeRecords, parseBill, type ParsedBillRecord } from '../lib/importers.js';
+import { importLedger } from '../lib/ledger-import.js';
 import { cleanupOrphanR2, runScheduled } from '../lib/scheduler.js';
 import * as txn from '../lib/txn.js';
 import * as u from '../lib/util.js';
@@ -80,6 +84,7 @@ const previewCache = new Map<
     records: ParsedBillRecord[];
     neutralRecords: ParsedBillRecord[];
     created_at: number;
+    fileHash?: string;
   }
 >();
 
@@ -312,8 +317,14 @@ adminRoutes.post('/settings/site', async (c) => {
   if (r) return r;
   const db = dbOf(c);
   const body = await bodyOf(c);
+  const currency = String(body.currency || 'CNY').trim().toUpperCase().slice(0, 8) || 'CNY';
+  const currentCurrency = await getSetting(db, 'site.currency', 'CNY');
+  if (currency !== currentCurrency && await db.get('SELECT 1 FROM transactions LIMIT 1')) {
+    setFlash(c, 'error', '已有流水，无法直接更改站点本位币');
+    return c.redirect('/settings?tab=site');
+  }
+  await setSetting(db, 'site.currency', currency);
   await setSetting(db, 'site.name', String(body.site_name || '家账簿').trim().slice(0, 40) || '家账簿');
-  await setSetting(db, 'site.currency', String(body.currency || 'CNY').trim().toUpperCase().slice(0, 8) || 'CNY');
   await setSetting(db, 'site.allow_register', body.allow_register ? 'true' : 'false');
   setFlash(c, 'success', '站点设置已更新');
   return c.redirect('/settings');
@@ -503,10 +514,31 @@ adminRoutes.get('/ledgers', async (c) => {
       <label class="check mb12"><input type="checkbox" name="skip_default_accounts" value="1"> 跳过初始化默认账户（稍后自行添加）</label>
       <button class="btn btn-primary btn-block" type="submit">创建账本</button>
     </form>
+    <form class="mt16" id="ledger-import-form">
+      <label for="ledger-import-file">从单账本 JSON 新建账本</label>
+      <p class="muted small">使用未筛选的全量 JSON。附件原图通过整站备份恢复。复制的周期账单和订阅在重新启用自动入账前只提供提醒。</p>
+      <input id="ledger-import-file" type="file" accept=".json,application/json" required>
+      <button class="btn mt8" type="submit">导入为新账本</button>
+    </form>
   </div>
 </div>`,
     }),
   );
+});
+
+adminRoutes.post('/ledgers/import', async (c) => {
+  const r = requireLogin(c);
+  if (r) return r;
+  const body = await bodyOf(c);
+  try {
+    const bytes = parseBase64Payload(String(body.dataUrl || ''));
+    if (!bytes.length || bytes.length > MAX_BACKUP_BYTES) throw new Error('请选择 20MB 以内的账本 JSON 文件');
+    const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    const ledger = await importLedger(dbOf(c), Number(c.get('ctx').user!.id), value, String(body.name || '').trim().slice(0, 40));
+    return c.json({ ok: true, ledger });
+  } catch (e) {
+    return c.json({ ok: false, error: toPublicError(e) }, 400);
+  }
 });
 
 adminRoutes.post('/ledgers', async (c) => {
@@ -741,8 +773,14 @@ adminRoutes.post('/ledgers/:id/delete', async (c) => {
   ];
   await db.batch(stmts);
 
+  let storageError = false;
   if (r2Keys.length) {
-    await attach.deleteKeysFromR2(env, r2Keys);
+    try {
+      if (!env.ATTACHMENTS) throw new Error('附件存储未配置');
+      await attach.deleteKeysFromR2(env, r2Keys, { throwOnError: true });
+    } catch {
+      storageError = true;
+    }
   }
 
   if (Number(ctx.ledger?.id) === id) {
@@ -761,8 +799,14 @@ adminRoutes.post('/ledgers/:id/delete', async (c) => {
     }
   }
 
-  if (isJson) return c.json({ ok: true });
-  setFlash(c, 'success', `账本「${ledger.name}」及相关数据已永久删除`);
+  if (storageError) {
+    const message = '账本已删除，R2 对象清理失败。可从管理后台重新执行孤儿文件清理。';
+    if (isJson) return c.json({ ok: true, warning: message });
+    setFlash(c, 'warn', message);
+  } else {
+    if (isJson) return c.json({ ok: true });
+    setFlash(c, 'success', `账本「${ledger.name}」及相关数据已永久删除`);
+  }
   return c.redirect('/ledgers');
 });
 
@@ -925,7 +969,7 @@ adminRoutes.post('/members/:id/remove', async (c) => {
 /* ============================ 账单导入 ============================ */
 
 adminRoutes.get('/import', async (c) => {
-  const r = requireLogin(c);
+  const r = requireWrite(c);
   if (r) return r;
   const db = dbOf(c);
   const ctx = c.get('ctx');
@@ -1011,12 +1055,16 @@ adminRoutes.post('/api/import/preview', async (c) => {
       return c.json({ ok: false, error: parsed.error }, 400);
     }
 
+    const native = parsed.source === 'homeledger';
+    if (native) await mapNativeRecords(dbOf(c), Number(ctx.ledger!.id), parsed.records);
+    const fileHash = native ? await auth.sha256Hex(JSON.stringify(parsed.records)) : undefined;
     const token = u.uid(16);
     const payload = {
       userId: ctx.user!.id,
       ledgerId: Number(ctx.ledger!.id),
       source: parsed.source,
       fileName,
+      fileHash,
       records: parsed.records,
       neutralRecords: parsed.neutralRecords,
       created_at: Date.now(),
@@ -1036,9 +1084,11 @@ adminRoutes.post('/api/import/preview', async (c) => {
     let minDate = '';
     let maxDate = '';
     for (const rec of parsed.records) {
-      if (rec.type === 'expense') expense += rec.amount_cents;
-      else if (rec.type === 'income') income += rec.amount_cents;
-      else transfer += rec.amount_cents;
+      const amount = rec.native?.baseCents ?? rec.amount_cents;
+      const flow = TXN_TYPE_MAP[rec.type]?.flow;
+      if (flow === 'out') expense += amount;
+      else if (flow === 'in') income += amount;
+      else if (flow === 'move') transfer += amount;
       if (rec.txn_date) {
         if (!minDate || rec.txn_date < minDate) minDate = rec.txn_date;
         if (!maxDate || rec.txn_date > maxDate) maxDate = rec.txn_date;
@@ -1047,7 +1097,7 @@ adminRoutes.post('/api/import/preview', async (c) => {
 
     const decorateSample = (rec: ParsedBillRecord) => ({
       ...rec,
-      type_label: rec.type === 'income' ? '收入' : rec.type === 'transfer' ? '转账' : '支出',
+      type_label: TXN_TYPE_MAP[rec.type]?.label || rec.type,
       guess_category:
         rec.category_hint ||
         classifyByKeywords(rec.text)?.category ||
@@ -1056,7 +1106,7 @@ adminRoutes.post('/api/import/preview', async (c) => {
       guess_account_missing: !rec.account_hint,
     });
 
-    const sourceLabel = parsed.source === 'alipay' ? '支付宝账单' : parsed.source === 'wechat' ? '微信账单' : '通用 CSV';
+    const sourceLabel = native ? 'HomeLedger 导出' : parsed.source === 'alipay' ? '支付宝账单' : parsed.source === 'wechat' ? '微信账单' : '通用 CSV';
     return c.json({
       ok: true,
       token,
@@ -1109,7 +1159,9 @@ adminRoutes.post('/api/import/commit', async (c) => {
       Number(ctx.ledger!.id),
       body.default_account_id ? Number(body.default_account_id) : null,
     );
-    const result = await importRecords(db, {
+    const result = payload.source === 'homeledger' && payload.fileHash
+      ? await importNativeRecords(db, Number(ctx.ledger!.id), Number(ctx.user!.id), payload.records, payload.fileHash)
+      : await importRecords(db, {
       ledgerId: Number(ctx.ledger!.id),
       userId: Number(ctx.user!.id),
       records: payload.records,
@@ -1233,13 +1285,14 @@ adminRoutes.get('/export', async (c) => {
       <div class="row wrap mt8">
         <button class="btn btn-primary" type="submit">下载当前账本 JSON</button>
         <a class="btn" href="/export/ledger.json">全量账本 JSON</a>
+        <a class="btn" href="/ledgers#ledger-import-form">导入为新账本</a>
       </div>
     </form>
   </div>
 </div>
 <div class="card mt16">
   <div class="card-head"><b>整库 JSON 备份与恢复（站点管理员）</b></div>
-  <p class="muted small mb12">${ctx.isAdmin ? '管理员可导出全库（含所有用户与账本）JSON 快照并在必要时覆盖恢复。' : '仅站点管理员可执行全库级 JSON 备份与恢复；普通账本成员请使用上方「导出当前账本结构化 JSON」。'}</p>
+  <p class="muted small mb12">${ctx.isAdmin ? '管理员可导出 D1 全库 JSON 快照并覆盖恢复。凭证与头像原图保存在 R2，随整站归档命令备份。' : '仅站点管理员可执行全库级 JSON 备份与恢复；普通账本成员请使用上方「导出当前账本结构化 JSON」。'}</p>
   ${ctx.isAdmin ? `<div class="row wrap"><a class="btn btn-primary" href="/export/json">下载全库 JSON 备份</a><label class="btn" style="cursor:pointer">从 JSON 恢复<input type="file" id="restore-file" accept=".json,application/json" class="hidden"></label></div>` : ''}
 </div>`,
     }),
@@ -1252,13 +1305,14 @@ adminRoutes.get('/export/csv', async (c) => {
   const db = dbOf(c);
   const ledgerId = Number(c.get('ctx').ledger!.id);
   const filter = parseExportFilter(c.req.query());
+  const baseCurrency = String(await getSetting(db, 'site.currency', 'CNY'));
   const enc = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
-        controller.enqueue(enc.encode(`\uFEFF${csvLine(EXPORT_HEADER)}`));
+        controller.enqueue(enc.encode(`\uFEFF${csvLine(NATIVE_EXPORT_HEADER)}`));
         for await (const batch of txn.iterateAllForExport(db, ledgerId, 1000, filter)) {
-          const rows = exportRows(ledgerId, batch);
+          const rows = exportRows(ledgerId, batch, baseCurrency);
           let chunk = '';
           for (const row of rows) chunk += csvLine(row);
           if (chunk) controller.enqueue(enc.encode(chunk));
@@ -1286,6 +1340,7 @@ adminRoutes.get('/export/ledger.json', async (c) => {
   const ctx = c.get('ctx');
   const ledgerId = Number(ctx.ledger!.id);
   const filter = parseExportFilter(c.req.query());
+  const full = !Object.values(filter).some(Boolean);
   const [
     ledger,
     accounts,
@@ -1299,6 +1354,9 @@ adminRoutes.get('/export/ledger.json', async (c) => {
     session_cards,
     session_card_logs,
     transactions,
+    splits,
+    transactionTags,
+    baseCurrency,
   ] = await Promise.all([
     db.get('SELECT id, name, kind, currency, icon, color, note, is_archived, created_at FROM ledgers WHERE id = ?', ledgerId),
     db.all('SELECT * FROM accounts WHERE ledger_id = ? ORDER BY sort_order, id', ledgerId),
@@ -1314,13 +1372,21 @@ adminRoutes.get('/export/ledger.json', async (c) => {
     db.all('SELECT * FROM goals WHERE ledger_id = ? ORDER BY id', ledgerId),
     db.all('SELECT * FROM session_cards WHERE ledger_id = ? ORDER BY id', ledgerId),
     db.all('SELECT * FROM session_card_logs WHERE ledger_id = ? ORDER BY id', ledgerId),
-    txn.listAllForExport(db, ledgerId, 1000, filter),
+    full ? db.all('SELECT * FROM transactions WHERE ledger_id = ? ORDER BY txn_date DESC, id DESC', ledgerId)
+      : txn.listAllForExport(db, ledgerId, 1000, filter),
+    full ? db.all('SELECT * FROM splits WHERE ledger_id = ? ORDER BY id', ledgerId) : [],
+    full ? db.all(`SELECT tt.* FROM transaction_tags tt
+      JOIN transactions t ON t.id = tt.transaction_id JOIN tags g ON g.id = tt.tag_id AND g.ledger_id = t.ledger_id
+      WHERE t.ledger_id = ?`, ledgerId) : [],
+    getSetting(db, 'site.currency', 'CNY'),
   ]);
 
   const payload = JSON.stringify(
     {
       app: 'homeledger',
       scope: 'ledger',
+      version: 1,
+      base_currency: baseCurrency,
       exported_at: nowStr(),
       ledger_id: ledgerId,
       filter,
@@ -1336,6 +1402,8 @@ adminRoutes.get('/export/ledger.json', async (c) => {
       session_cards,
       session_card_logs,
       transactions,
+      splits,
+      transaction_tags: transactionTags,
       total_transactions: transactions.length,
     },
     null,
@@ -1351,11 +1419,9 @@ adminRoutes.get('/export/json', async (c) => {
   const r = requireAdmin(c);
   if (r) return r;
   const db = dbOf(c);
-  const tables: Record<string, unknown[]> = {};
-  for (const tbl of BACKUP_TABLES) {
-    tables[tbl] = await db.all(`SELECT * FROM ${tbl}`);
-  }
-  const dump = JSON.stringify({ app: 'homeledger', version: 2, exported_at: nowStr(), tables }, null, 2);
+  const snapshot = await db.batch(BACKUP_TABLES.map((table) => [`SELECT * FROM ${table}`]));
+  const tables = Object.fromEntries(BACKUP_TABLES.map((table, index) => [table, snapshot[index].results || []]));
+  const dump = JSON.stringify({ app: 'homeledger', version: 3, exported_at: nowStr(), tables });
   c.header('Content-Type', 'application/json; charset=utf-8');
   c.header('Content-Disposition', `attachment; filename="homeledger-backup-${todayStr()}.json"`);
   c.header('Cache-Control', 'no-store');
@@ -1399,10 +1465,35 @@ adminRoutes.post('/backup/restore', async (c) => {
     }
 
     const { stmts, counts } = validateAndBuildRestorePlan(parsed, schema);
+    if (body.archive !== undefined) {
+      if (!env.ATTACHMENTS) return c.json({ ok: false, error: '附件存储未配置' }, 400);
+      if (typeof body.archive !== 'string' || !/^[a-f0-9]{32}$/.test(body.archive)) {
+        return c.json({ ok: false, error: '归档批次无效' }, 400);
+      }
+      const files = backupObjectReferences(parsed);
+      for (const [avatar, dir] of [[false, 'uploads/'], [true, 'uploads/avatars/']] as const) {
+        const missing = new Set(files.filter((file) => file.avatar === avatar).map((file) => file.key));
+        const prefix = `${dir}restore-${body.archive}-`;
+        if ([...missing].some((key) => !key.startsWith(prefix))) {
+          return c.json({ ok: false, error: '归档引用不属于当前恢复批次' }, 400);
+        }
+        let cursor: string | undefined;
+        while (missing.size) {
+          const page: R2Objects = await env.ATTACHMENTS.list({ prefix, cursor });
+          for (const object of page.objects) missing.delete(object.key);
+          if (!page.truncated) break;
+          cursor = page.cursor;
+        }
+        if (missing.size) return c.json({ ok: false, error: '目标 R2 中缺少归档对象' }, 400);
+      }
+    }
+    if (Number((parsed as { version: number }).version) < 3) stmts.push(backfillLegacyAccountAmounts);
+    stmts.push(recomputeAccountBalances);
+    const bytes = crypto.getRandomValues(new Uint32Array(2));
+    const sessionVersion = (bytes[0] & 0x7ffff) * 0x1_0000_0000 + bytes[1] + 1;
+    stmts.push(['UPDATE users SET token_version = ?', [sessionVersion]]);
+    stmts.push(['UPDATE api_tokens SET revoked_at = ? WHERE revoked_at IS NULL', [nowStr()]]);
     await db.batch(stmts);
-
-    const ledgers = await db.all<{ id: number }>('SELECT id FROM ledgers');
-    for (const l of ledgers) await recalcBalances(db, Number(l.id));
 
     c.header('Set-Cookie', auth.clearSessionCookie(env), { append: true });
     c.header('Cache-Control', 'no-store');

@@ -9,7 +9,7 @@ import { groupList } from './layout.js';
 export interface DashboardViewData {
   cur: { income: number; expense: number; net: number; count: number };
   prev: { income: number; expense: number; net: number; count: number };
-  overview: { accounts: AccountRow[]; assets: number; liabilities: number; net: number };
+  overview: { accounts: AccountRow[]; assets: number; liabilities: number; net: number; rates: ReadonlyMap<string, number>; baseCurrency: string; missingCurrencies: string[] };
   trendChart: string;
   cats: Array<{ name: string; icon: string; color: string; total: number; cnt: number }>;
   incomeCats: Array<{ name: string; icon: string; color: string; total: number; cnt: number }>;
@@ -41,7 +41,7 @@ export function dashboardPage(d: DashboardViewData): string {
     ? donutChart(donutItems, {
         size: 168,
         thickness: 22,
-        centerValue: compactMoney(d.cur.expense),
+        centerValue: compactMoney(d.cur.expense, d.overview.baseCurrency),
         centerTitle: '本月支出',
       })
     : '<div class="empty">本月暂无支出</div>';
@@ -125,16 +125,17 @@ export function dashboardPage(d: DashboardViewData): string {
     <div class="card">
       <div class="card-head"><b>账户分层与余额</b><a class="btn btn-sm btn-ghost" href="/accounts">管理 →</a></div>
       ${(() => {
-        const g = groupAccountsSummary(d.overview.accounts);
+        const g = groupAccountsSummary(d.overview.accounts, d.overview.rates);
         return `<div class="tiny muted mb8" style="padding-bottom:8px;border-bottom:1px solid var(--border)">
-  <div class="between" style="padding:2px 0"><span>💰 资金账户</span><span class="amount bold">${money(g.fundsTotalCents)}</span></div>
-  <div class="between" style="padding:2px 0"><span>🎟️ 充值账户</span><span class="amount bold">${money(g.prepaidTotalCents)}</span></div>
-  <div class="between" style="padding:2px 0"><span>💳 信用待还</span><span class="amount bold ${g.creditDebtCents > 0 ? 'expense' : ''}">${money(g.creditDebtCents)}</span></div>
+  <div class="between" style="padding:2px 0"><span>💰 资金账户</span><span class="amount bold">${money(g.fundsTotalCents, d.overview.baseCurrency)}</span></div>
+  <div class="between" style="padding:2px 0"><span>🎟️ 充值账户</span><span class="amount bold">${money(g.prepaidTotalCents, d.overview.baseCurrency)}</span></div>
+  <div class="between" style="padding:2px 0"><span>💳 信用待还</span><span class="amount bold ${g.creditDebtCents > 0 ? 'expense' : ''}">${money(g.creditDebtCents, d.overview.baseCurrency)}</span></div>
   ${
     d.sessionCards.activeCount > 0
       ? `<div class="between" style="padding:2px 0"><a href="/accounts#session-cards">🎟️ 有效次卡（${d.sessionCards.activeCount} 张）</a><a href="/accounts#session-cards" class="amount bold">余 ${d.sessionCards.totalRemaining} 次</a></div>`
       : ''
   }
+${d.overview.missingCurrencies.length ? `<p>汇总未计入缺少汇率的币种 ${esc(d.overview.missingCurrencies.join('、'))}</p>` : ''}
 </div>`;
       })()}
       ${d.overview.accounts
@@ -142,7 +143,7 @@ export function dashboardPage(d: DashboardViewData): string {
         .map((a) => {
           const b = Number(a.balance_cents || 0);
           const isDebt = isCreditGroupType(a.type) && b < 0;
-          return `<div class="between"><span>${esc(a.icon || '💳')} ${esc(a.name)}</span><span class="amount bold ${isDebt ? 'expense' : ''}">${isDebt ? `待还 ${fmtAmount(Math.abs(b))}` : fmtAmount(b)}</span></div>`;
+          return `<div class="between"><span>${esc(a.icon || '💳')} ${esc(a.name)}</span><span class="amount bold ${isDebt ? 'expense' : ''}">${isDebt ? `待还 ${money(Math.abs(b), a.currency)}` : money(b, a.currency)}</span></div>`;
         })
         .join('') || '<div class="empty">暂无账户</div>'}
     </div>

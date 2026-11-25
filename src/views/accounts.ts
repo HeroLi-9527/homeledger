@@ -9,7 +9,7 @@ import { groupList, paginationHtml, simpleTable } from './layout.js';
 
 const typeLabelMap = Object.fromEntries(ACCOUNT_TYPES.map((t) => [t.key, `${t.icon} ${t.label}`]));
 
-function renderAccountRow(a: AccountRow, csrfInput: string, opts: { isCredit?: boolean } = {}): string {
+function renderAccountRow(a: AccountRow, csrfInput: string, opts: { isCredit?: boolean; writable: boolean }): string {
   const m = opts.isCredit ? creditMetrics(a) : null;
   const metaParts: string[] = [];
   if (a.institution) metaParts.push(esc(a.institution));
@@ -42,10 +42,10 @@ ${m.limitCents !== null && m.limitCents > 0 ? `<div class="mt8" style="max-width
       : m.overflowCents > 0
         ? `<span class="amount bold income">溢缴 +${fmtAmount(m.overflowCents)}</span>`
         : '<span class="amount bold">待还 0.00</span>'
-    : `<span class="amount bold">${fmtAmount(a.balance_cents)}</span>`;
+    : `<span class="amount bold">${money(a.balance_cents, a.currency)}</span>`;
 
   const repayBtn =
-    m && !a.is_archived
+    opts.writable && m && !a.is_archived
       ? `<a class="btn btn-sm btn-primary" href="/transactions/new?type=transfer&to_account_id=${a.id}${m.debtCents > 0 ? `&amount=${(m.debtCents / 100).toFixed(2)}` : ''}">去还款</a>`
       : '';
 
@@ -62,14 +62,14 @@ ${m.limitCents !== null && m.limitCents > 0 ? `<div class="mt8" style="max-width
   <div class="row wrap" style="justify-content:flex-end">
     ${rightBalance}
     ${repayBtn}
-    <a class="btn btn-sm" href="/accounts/${a.id}">明细/编辑</a>
-    <form method="post" action="/accounts/${a.id}/archive" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">${a.is_archived ? '恢复' : '归档'}</button></form>
-    <form method="post" action="/accounts/${a.id}/delete" style="display:inline" data-confirm="确认删除该账户？">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
+    <a class="btn btn-sm" href="/accounts/${a.id}">${opts.writable ? '明细/编辑' : '明细'}</a>
+${opts.writable ? `    <form method="post" action="/accounts/${a.id}/archive" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">${a.is_archived ? '恢复' : '归档'}</button></form>
+    <form method="post" action="/accounts/${a.id}/delete" style="display:inline" data-confirm="确认删除该账户？">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>` : ''}
   </div>
 </div>`;
 }
 
-function renderSessionCardItem(c: DecoratedSessionCard, csrfInput: string): string {
+function renderSessionCardItem(c: DecoratedSessionCard, csrfInput: string, writable: boolean): string {
   const badges: string[] = [];
   if (c.merchant) badges.push(`<span class="chip">${esc(c.merchant)}</span>`);
   if (c.is_archived) badges.push('<span class="chip">已归档</span>');
@@ -82,7 +82,7 @@ function renderSessionCardItem(c: DecoratedSessionCard, csrfInput: string): stri
   }
   if (c.isLowSessions && !c.is_archived) badges.push('<span class="chip warn">余次不足</span>');
 
-  const canUse = !c.is_archived && c.remaining_sessions > 0;
+  const canUse = writable && !c.is_archived && c.remaining_sessions > 0;
   return `<div class="card" style="padding:14px;background:var(--card-2)">
   <div class="between" style="padding:0 0 8px">
     <div class="row wrap" style="gap:6px">
@@ -100,7 +100,7 @@ function renderSessionCardItem(c: DecoratedSessionCard, csrfInput: string): stri
           ? `<form method="post" action="/session-cards/${c.id}/use" style="display:inline">${csrfInput}<input type="hidden" name="count" value="1"><input type="hidden" name="back" value="/accounts#session-cards"><button class="btn btn-sm btn-primary" type="submit">核销 -1 次</button></form>`
           : ''
       }
-      <a class="btn btn-sm" href="/session-cards/${c.id}">详情/续费</a>
+      <a class="btn btn-sm" href="/session-cards/${c.id}">${writable ? '详情/续费' : '详情'}</a>
     </div>
   </div>
 </div>`;
@@ -112,9 +112,10 @@ export function accountsPage({
   sessionCards,
   expenseCats,
   csrf,
+  writable,
 }: {
   accounts: AccountRow[];
-  ov: { assets: number; liabilities: number; net: number };
+  ov: { assets: number; liabilities: number; net: number; rates: ReadonlyMap<string, number>; baseCurrency: string; missingCurrencies: string[] };
   sessionCards: {
     all: DecoratedSessionCard[];
     active: DecoratedSessionCard[];
@@ -124,50 +125,52 @@ export function accountsPage({
   };
   expenseCats: Array<CategoryRow & { path: string }>;
   csrf: string;
+  writable: boolean;
 }): string {
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
-  const grouped = groupAccountsSummary(accounts);
+  const grouped = groupAccountsSummary(accounts, ov.rates);
   const today = todayStr();
 
   const archivedCount = grouped.archived.length + sessionCards.archivedOrExhausted.length;
 
   return `<div class="kpi-grid mb16">
-  <div class="stat"><div class="label">总资产</div><div class="value amount income">${fmtAmount(ov.assets)}</div></div>
-  <div class="stat"><div class="label">总负债</div><div class="value amount expense">${fmtAmount(ov.liabilities)}</div></div>
-  <div class="stat"><div class="label">净资产</div><div class="value amount">${fmtAmount(ov.net)}</div></div>
+  <div class="stat"><div class="label">总资产</div><div class="value amount income">${money(ov.assets, ov.baseCurrency)}</div></div>
+  <div class="stat"><div class="label">总负债</div><div class="value amount expense">${money(ov.liabilities, ov.baseCurrency)}</div></div>
+  <div class="stat"><div class="label">净资产</div><div class="value amount">${money(ov.net, ov.baseCurrency)}</div></div>
   <div class="stat"><div class="label">活跃账户与次卡</div><div class="value">${grouped.active.length} 账户${sessionCards.activeCount ? ` · ${sessionCards.activeCount} 次卡` : ''}</div></div>
 </div>
 
+${ov.missingCurrencies.length ? `<p class="muted">汇总未计入缺少汇率的币种 ${esc(ov.missingCurrencies.join('、'))}</p>` : ''}
 <div class="card mb16">
   <div class="card-head">
     <b>${ACCOUNT_GROUPS[0].icon} ${ACCOUNT_GROUPS[0].label}</b>
-    <span class="amount bold">小计 ${money(grouped.fundsTotalCents)}</span>
+    <span class="amount bold">小计 ${money(grouped.fundsTotalCents, ov.baseCurrency)}</span>
   </div>
-  ${grouped.groups.funds.map((a) => renderAccountRow(a, csrfInput)).join('') || '<div class="empty">暂无活跃资金账户</div>'}
+  ${grouped.groups.funds.map((a) => renderAccountRow(a, csrfInput, { writable })).join('') || '<div class="empty">暂无活跃资金账户</div>'}
 </div>
 
 <div class="card mb16" id="session-cards">
   <div class="card-head">
     <b>${ACCOUNT_GROUPS[1].icon} ${ACCOUNT_GROUPS[1].label}与次卡</b>
-    <span class="amount bold">储值余额 ${money(grouped.prepaidTotalCents)}${sessionCards.activeCount ? ` · 有效次卡 ${sessionCards.activeCount} 张（余 ${sessionCards.totalRemaining} 次）` : ''}</span>
+    <span class="amount bold">储值余额 ${money(grouped.prepaidTotalCents, ov.baseCurrency)}${sessionCards.activeCount ? ` · 有效次卡 ${sessionCards.activeCount} 张（余 ${sessionCards.totalRemaining} 次）` : ''}</span>
   </div>
-  ${grouped.groups.prepaid.length ? `<div class="mb12">${grouped.groups.prepaid.map((a) => renderAccountRow(a, csrfInput)).join('')}</div>` : ''}
+  ${grouped.groups.prepaid.length ? `<div class="mb12">${grouped.groups.prepaid.map((a) => renderAccountRow(a, csrfInput, { writable })).join('')}</div>` : ''}
   ${
     sessionCards.active.length
-      ? `<div class="grid grid-2">${sessionCards.active.map((c) => renderSessionCardItem(c, csrfInput)).join('')}</div>`
-      : '<div class="empty">暂无有效次卡（可在下方新增洗车卡、理发卡、健身次卡等）</div>'
+      ? `<div class="grid grid-2">${sessionCards.active.map((c) => renderSessionCardItem(c, csrfInput, writable)).join('')}</div>`
+      : '<div class="empty">暂无有效次卡</div>'
   }
 </div>
 
 <div class="card mb16">
   <div class="card-head">
     <b>${ACCOUNT_GROUPS[2].icon} ${ACCOUNT_GROUPS[2].label}（信用卡 / 花呗 / 白条）</b>
-    <span class="amount bold expense">总待还 ${money(grouped.creditDebtCents)}${grouped.creditLimitCents > 0 ? ` · 总额度 ${money(grouped.creditLimitCents)} · 可用 ${money(grouped.creditAvailableCents)}` : ''}</span>
+    <span class="amount bold expense">总待还 ${money(grouped.creditDebtCents, ov.baseCurrency)}${grouped.creditLimitCents > 0 ? ` · 总额度 ${money(grouped.creditLimitCents, ov.baseCurrency)} · 可用 ${money(grouped.creditAvailableCents, ov.baseCurrency)}` : ''}</span>
   </div>
-  ${grouped.groups.credit.map((a) => renderAccountRow(a, csrfInput, { isCredit: true })).join('') || '<div class="empty">暂无活跃信用账户</div>'}
+  ${grouped.groups.credit.map((a) => renderAccountRow(a, csrfInput, { isCredit: true, writable })).join('') || '<div class="empty">暂无活跃信用账户</div>'}
 </div>
 
-<div class="grid grid-2 mb16">
+${writable ? `<div class="grid grid-2 mb16">
   <div class="card">
     <div class="card-head"><b>新建账户</b><span class="tiny muted">支持三层分组与信用账期</span></div>
     <div class="row wrap mb12">
@@ -228,17 +231,17 @@ export function accountsPage({
       <button class="btn btn-primary btn-block" type="submit">创建次卡</button>
     </form>
   </div>
-</div>
+</div>` : ''}
 
 ${
   archivedCount
     ? `<details class="card mt16">
   <summary class="bold" style="cursor:pointer">已归档账户与已用完/归档次卡（${archivedCount}）</summary>
   <div class="mt12">
-    ${grouped.archived.map((a) => renderAccountRow(a, csrfInput, { isCredit: isCreditGroupType(a.type) })).join('')}
+    ${grouped.archived.map((a) => renderAccountRow(a, csrfInput, { isCredit: isCreditGroupType(a.type), writable })).join('')}
     ${
       sessionCards.archivedOrExhausted.length
-        ? `<div class="grid grid-2 mt12">${sessionCards.archivedOrExhausted.map((c) => renderSessionCardItem(c, csrfInput)).join('')}</div>`
+        ? `<div class="grid grid-2 mt12">${sessionCards.archivedOrExhausted.map((c) => renderSessionCardItem(c, csrfInput, writable)).join('')}</div>`
         : ''
     }
   </div>
@@ -250,6 +253,7 @@ ${
 export function accountDetailPage({
   acc,
   groups,
+  unresolved,
   result,
   from = '',
   to = '',
@@ -257,6 +261,7 @@ export function accountDetailPage({
   csrf,
 }: {
   acc: AccountRow;
+  unresolved: Array<{ id: number; txn_date: string }>;
   groups: TxnDateGroup[];
   result: { total: number; page: number; pages: number; sum: { income: number; expense: number } };
   from?: string;
@@ -366,7 +371,11 @@ export function accountDetailPage({
   ${groupList(groups, { writable })}
   ${paginationHtml(`/accounts/${acc.id}`, { from: from || undefined, to: to || undefined }, result.page, result.pages, result.total)}
 </div>`;
-  return headerCard + editAndAdjustGrid + txnsCard;
+  const reconcile = unresolved.length ? `<div class="flash warn mb16"><div>
+    <b>历史流水待补原币金额</b><p>以下历史流水缺少账户原币金额，相关变动暂未计入此账户余额，最多显示 30 条。</p>
+    <ul>${unresolved.map((t) => `<li>${esc(t.txn_date)} ${writable ? `<a href="/transactions/${t.id}/edit">流水 #${t.id}</a>` : `流水 #${t.id}`}</li>`).join('')}</ul>
+  </div></div>` : '';
+  return headerCard + reconcile + editAndAdjustGrid + txnsCard;
 }
 
 export function sessionCardDetailPage({
@@ -375,7 +384,9 @@ export function sessionCardDetailPage({
   accounts,
   expenseCats,
   csrf,
+  writable,
 }: {
+  writable: boolean;
   card: DecoratedSessionCard;
   logs: SessionCardLogRow[];
   accounts: AccountRow[];
@@ -403,8 +414,8 @@ export function sessionCardDetailPage({
     </div>
     <div class="row wrap">
       <a class="btn btn-sm" href="/accounts#session-cards">← 返回账户与次卡</a>
-      <form method="post" action="/session-cards/${card.id}/archive" style="display:inline">${csrfInput}<input type="hidden" name="back" value="/session-cards/${card.id}"><button class="btn btn-sm" type="submit">${card.is_archived ? '恢复' : '归档'}</button></form>
-      <form method="post" action="/session-cards/${card.id}/delete" style="display:inline" data-confirm="确认删除该次卡？（不会删除已产生的购卡支出流水）">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
+      ${writable ? `<form method="post" action="/session-cards/${card.id}/archive" style="display:inline">${csrfInput}<input type="hidden" name="back" value="/session-cards/${card.id}"><button class="btn btn-sm" type="submit">${card.is_archived ? '恢复' : '归档'}</button></form>
+      <form method="post" action="/session-cards/${card.id}/delete" style="display:inline" data-confirm="确认删除该次卡？（不会删除已产生的购卡支出流水）">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>` : ''}
     </div>
   </div>
   <div class="kpi-grid mb12">
@@ -481,8 +492,8 @@ export function sessionCardDetailPage({
           ? `<span class="chip expense">${l.delta} 次</span>`
           : `<span class="chip income">+${l.delta} 次</span>`;
         const ops: string[] = [];
-        if (l.txn_id) ops.push(`<a class="btn btn-sm" href="/transactions/${l.txn_id}/edit">关联流水</a>`);
-        if (isUse) {
+        if (writable && l.txn_id) ops.push(`<a class="btn btn-sm" href="/transactions/${l.txn_id}/edit">关联流水</a>`);
+        if (writable && isUse) {
           ops.push(
             `<form method="post" action="/session-cards/${card.id}/logs/${l.id}/undo" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">撤销</button></form>`,
           );
@@ -498,7 +509,7 @@ export function sessionCardDetailPage({
       .join('') || '<tr><td colspan="5">暂无使用记录</td></tr>',
   );
 
-  return header + actionsGrid + editCard + logsTable;
+  return header + (writable ? actionsGrid + editCard : '') + logsTable;
 }
 
 export type CategoryTreeItem = Omit<CategoryRow, 'children'> & {
@@ -510,9 +521,11 @@ export type CategoryTreeItem = Omit<CategoryRow, 'children'> & {
 export function categoriesPage({
   tree,
   csrf,
+  writable,
 }: {
   tree: CategoryTreeItem[];
   csrf: string;
+  writable: boolean;
 }): string {
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
   const dot = (color?: string | null) =>
@@ -528,12 +541,12 @@ export function categoriesPage({
       (root) => `<div class="mb12">
   <div class="between" style="padding:4px 0">
     <span>${dot(root.color)} <b>${esc(root.icon)} ${esc(root.name)}</b>${Number(root.year_cnt) > 0 ? ` <span class="tiny muted">近1年 ${root.year_cnt} 笔 · ${fmtAmount(root.year_total_cents || 0)}</span>` : ''}</span>
-    ${root.ledger_id ? `<div class="row" style="gap:4px"><details style="display:inline-block"><summary class="btn btn-sm btn-ghost">编辑</summary><form method="post" action="/categories/${root.id}" class="row mt8" style="gap:4px">${csrfInput}<input name="icon" value="${esc(root.icon)}" style="width:46px" maxlength="8"><input name="name" value="${esc(root.name)}" style="width:110px" maxlength="20" required><input type="color" name="color" value="${esc(root.color || '#4f7cff')}" title="颜色" style="width:36px;padding:2px"><button class="btn btn-sm btn-primary" type="submit">保存</button></form></details><form method="post" action="/categories/${root.id}/delete" style="display:inline" data-confirm="确认删除一级分类「${esc(root.name)}」？">${csrfInput}<button class="btn btn-sm btn-ghost" type="submit">删</button></form></div>` : '<span class="tiny muted">内置</span>'}
+    ${root.ledger_id && writable ? `<div class="row" style="gap:4px"><details style="display:inline-block"><summary class="btn btn-sm btn-ghost">编辑</summary><form method="post" action="/categories/${root.id}" class="row mt8" style="gap:4px">${csrfInput}<input name="icon" value="${esc(root.icon)}" style="width:46px" maxlength="8"><input name="name" value="${esc(root.name)}" style="width:110px" maxlength="20" required><input type="color" name="color" value="${esc(root.color || '#4f7cff')}" title="颜色" style="width:36px;padding:2px"><button class="btn btn-sm btn-primary" type="submit">保存</button></form></details><form method="post" action="/categories/${root.id}/delete" style="display:inline" data-confirm="确认删除一级分类「${esc(root.name)}」？">${csrfInput}<button class="btn btn-sm btn-ghost" type="submit">删</button></form></div>` : root.ledger_id ? '' : '<span class="tiny muted">内置</span>'}
   </div>
   <div class="row wrap">${(root.children || [])
     .map((ch) => {
       const chStat = Number(ch.year_cnt) > 0 ? ` <span class="tiny muted">${ch.year_cnt}笔/${fmtAmount(ch.year_total_cents || 0)}</span>` : '';
-      return ch.ledger_id
+      return ch.ledger_id && writable
         ? `<span class="chip" style="gap:4px;flex-wrap:wrap"><span>${dot(ch.color)} ${esc(ch.icon)} ${esc(ch.name)}${chStat}</span><details style="display:inline"><summary style="cursor:pointer;font-size:11px;color:var(--muted)" title="编辑二级分类">✎</summary><form method="post" action="/categories/${ch.id}" class="row" style="gap:4px;margin-top:4px">${csrfInput}<input name="icon" value="${esc(ch.icon)}" style="width:42px;padding:2px 4px;font-size:12px" maxlength="8"><input name="name" value="${esc(ch.name)}" style="width:88px;padding:2px 6px;font-size:12px" maxlength="20" required><input type="color" name="color" value="${esc(ch.color || '#4f7cff')}" title="颜色" style="width:32px;padding:1px"><button class="btn btn-sm btn-primary" type="submit">保存</button></form></details><form method="post" action="/categories/${ch.id}/delete" style="display:inline" data-confirm="确认删除二级分类「${esc(ch.name)}」？">${csrfInput}<button type="submit" title="删除二级分类" style="border:0;background:transparent;color:var(--expense);cursor:pointer;padding:0 2px;font-size:12px;line-height:1">✕</button></form></span>`
         : `<span class="chip">${esc(ch.icon)} ${esc(ch.name)}${chStat}</span>`;
     })
@@ -541,7 +554,7 @@ export function categoriesPage({
 </div>`,
     )
     .join('')}
-  <form method="post" action="/categories" class="mt16" style="border-top:1px solid var(--border);padding-top:12px">
+${writable ? `  <form method="post" action="/categories" class="mt16" style="border-top:1px solid var(--border);padding-top:12px">
     ${csrfInput}
     <input type="hidden" name="kind" value="${kind}">
     <div class="grid grid-2 mb8">
@@ -556,7 +569,7 @@ export function categoriesPage({
       </div>
     </div>
     <button class="btn btn-primary btn-sm" type="submit">添加分类</button>
-  </form>
+  </form>` : ''}
 </div>`;
     })
     .join('')}
@@ -566,9 +579,11 @@ export function categoriesPage({
 export function tagsPage({
   tags,
   csrf,
+  writable,
 }: {
   tags: Array<{ id: number; name: string; color?: string; cnt: number; total_cents?: number }>;
   csrf: string;
+  writable: boolean;
 }): string {
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
   return (
@@ -578,11 +593,11 @@ export function tagsPage({
       tags
         .map(
           (t) => `<tr><td><span class="chip" style="border-left:4px solid ${esc(t.color || '#0F766E')}"># ${esc(t.name)}</span></td><td>${t.cnt}</td><td class="num amount">${fmtAmount(Number(t.total_cents || 0))}</td>
-<td><div class="row wrap"><form method="post" action="/tags/${t.id}" class="row" style="display:inline-flex;gap:4px">${csrfInput}<input name="name" value="${esc(t.name)}" maxlength="20" style="width:120px;padding:4px 8px;font-size:12px" required><input type="color" name="color" value="${esc(t.color || '#0F766E')}" title="标签颜色" style="width:36px;padding:2px"><button class="btn btn-sm" type="submit">保存</button></form><form method="post" action="/tags/${t.id}/delete" style="display:inline">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form></div></td></tr>`,
+<td>${writable ? `<div class="row wrap"><form method="post" action="/tags/${t.id}" class="row" style="display:inline-flex;gap:4px">${csrfInput}<input name="name" value="${esc(t.name)}" maxlength="20" style="width:120px;padding:4px 8px;font-size:12px" required><input type="color" name="color" value="${esc(t.color || '#0F766E')}" title="标签颜色" style="width:36px;padding:2px"><button class="btn btn-sm" type="submit">保存</button></form><form method="post" action="/tags/${t.id}/delete" style="display:inline">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form></div>` : ''}</td></tr>`,
         )
         .join('') || '<tr><td colspan="4">暂无标签（记账时输入标签可自动创建）</td></tr>',
     ) +
-    `<div class="card mt16"><div class="card-head"><b>新建标签</b></div>
-<form method="post" action="/tags" class="row wrap">${csrfInput}<input name="name" placeholder="标签名称" required><input type="color" name="color" value="#0F766E" title="标签颜色" style="max-width:48px;padding:2px"><button class="btn btn-primary" type="submit">添加</button></form></div>`
+    (writable ? `<div class="card mt16"><div class="card-head"><b>新建标签</b></div>
+<form method="post" action="/tags" class="row wrap">${csrfInput}<input name="name" placeholder="标签名称" required><input type="color" name="color" value="#0F766E" title="标签颜色" style="max-width:48px;padding:2px"><button class="btn btn-primary" type="submit">添加</button></form></div>` : '')
   );
 }

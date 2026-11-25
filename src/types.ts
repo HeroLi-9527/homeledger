@@ -152,6 +152,8 @@ export interface TxnRow {
   currency: string;
   rate: number;
   amount_base_cents: number;
+  account_amount_cents: number | null;
+  to_account_amount_cents: number | null;
   account_id: number | null;
   to_account_id: number | null;
   category_id: number | null;
@@ -176,6 +178,8 @@ export interface TxnRow {
   category_parent?: string | null;
   account_name?: string | null;
   account_icon?: string | null;
+  account_currency?: string | null;
+  to_account_currency?: string | null;
   account_type?: string | null;
   to_account_name?: string | null;
   to_account_icon?: string | null;

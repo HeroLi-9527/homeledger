@@ -50,6 +50,8 @@ function readForm(body: Record<string, unknown>): txn.TxnWriteInput {
     rate: body.rate === undefined || body.rate === '' ? null : Number(body.rate),
     account_id: (body.account_id as string | null) || null,
     to_account_id: (body.to_account_id as string | null) || null,
+    account_amount_cents: body.account_amount ? u.parseAmountToCents(body.account_amount) : undefined,
+    to_account_amount_cents: body.to_account_amount ? u.parseAmountToCents(body.to_account_amount) : undefined,
     category_id: (body.category_id as string | null) || null,
     txn_date: String(body.txn_date || todayStr()),
     note: String(body.note || ''),
@@ -263,7 +265,8 @@ txnRoutes.get('/transactions/new', async (c) => {
     merchant: '',
     tags: '',
     is_reimbursable: 0,
-    currency: 'CNY',
+    currency: (type === 'transfer' && toAccountId ? form.accounts.find((a) => String(a.id) === toAccountId)?.currency :
+      form.accounts.find((a) => String(a.id) === defaultAccountId)?.currency) || meta.baseCurrency,
     rate: '',
     status: 'cleared',
   };
@@ -345,7 +348,7 @@ txnRoutes.post('/transactions/bulk', async (c) => {
   try {
     if (!ids.length) throw new Error('请先选择要操作的流水');
     if (action === 'delete') {
-      const res = await txn.bulkDelete(db, ids, ledgerId, { env: envOf(c) });
+      const res = await txn.bulkDelete(db, ids, ledgerId);
       if (isJson) return c.json({ ok: true, action, ...res });
       const reasons = [...new Set(res.skipped.map((s) => s.reason))];
       setFlash(
@@ -435,7 +438,7 @@ txnRoutes.post('/transactions/bulk-delete', async (c) => {
   const ctx = c.get('ctx');
   const body = await bodyOf(c);
   const ids = collectBulkIds(body);
-  const res = await txn.bulkDelete(db, ids, Number(ctx.ledger!.id), { env: envOf(c) });
+  const res = await txn.bulkDelete(db, ids, Number(ctx.ledger!.id));
   if (body._json === '1' || wantsJson(c)) return c.json({ ok: true, ...res });
   const reasons = [...new Set(res.skipped.map((s) => s.reason))];
   setFlash(c, 'success', `已删除 ${res.deleted} 笔${res.skipped.length ? `，${res.skipped.length} 笔跳过（${reasons.join('；')}）` : ''}`);
@@ -496,7 +499,7 @@ txnRoutes.get('/transactions/deleted', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const writable = auth.canWrite(ctx.ledger!.role);
-  const rows = await db.all<{ id: number; txn_date: string; type: string; amount_cents: number; note: string | null; merchant: string | null; category_name: string | null; deleted_at: string }>(
+  const rows = await db.all<{ id: number; txn_date: string; type: string; amount_cents: number; note: string | null; merchant: string | null; category_name: string | null; deleted_at: string; purge_started: number }>(
     `SELECT t.*, c.name AS category_name FROM transactions t
      LEFT JOIN categories c ON c.id = t.category_id
      WHERE t.ledger_id = ? AND t.deleted_at IS NOT NULL ORDER BY t.deleted_at DESC LIMIT 100`,
@@ -521,8 +524,8 @@ ${
     ? `<div class="scroll-x"><table class="table"><thead><tr>${writable ? '<th style="width:32px"><input type="checkbox" id="bulk-all" title="全选"></th>' : ''}<th>日期</th><th>类型</th><th>金额</th><th>备注</th><th>删除时间</th>${writable ? '<th>操作</th>' : ''}</tr></thead><tbody>
 ${rows
   .map(
-    (t) => `<tr>${writable ? `<td><input type="checkbox" class="bulk-item" name="ids" value="${t.id}"></td>` : ''}<td>${esc(t.txn_date)}</td><td>${esc(TXN_TYPE_MAP[t.type]?.label || t.type)}</td><td class="amount">${esc(u.fmtAmount(t.amount_cents))}</td><td>${esc(t.note || t.merchant || t.category_name || '')}</td><td class="tiny muted">${esc(u.fmtDateTime(t.deleted_at))}</td>
-${writable ? `<td><button class="btn btn-sm" type="submit" formaction="/transactions/${t.id}/restore">恢复</button></td>` : ''}</tr>`,
+    (t) => `<tr>${writable ? `<td><input type="checkbox" class="bulk-item" name="ids" value="${t.id}" ${t.purge_started ? 'disabled' : ''}></td>` : ''}<td>${esc(t.txn_date)}</td><td>${esc(TXN_TYPE_MAP[t.type]?.label || t.type)}</td><td class="amount">${esc(u.fmtAmount(t.amount_cents))}</td><td>${esc(t.note || t.merchant || t.category_name || '')}</td><td class="tiny muted">${esc(u.fmtDateTime(t.deleted_at))}</td>
+${writable ? `<td>${t.purge_started ? '<span class="chip warn">待完成永久删除</span>' : `<button class="btn btn-sm" type="submit" formaction="/transactions/${t.id}/restore">恢复</button>`} <button class="btn btn-sm btn-danger" type="submit" formaction="/transactions/${t.id}/purge" form="purge-${t.id}">永久删除</button></td>` : ''}</tr>`,
   )
   .join('')}</tbody></table></div>`
     : '<div class="empty">没有已删除的记账</div>'
@@ -537,9 +540,22 @@ ${writable ? `<td><button class="btn btn-sm" type="submit" formaction="/transact
   </div>`
       : ''
   }
-</form>`,
+</form>
+${writable ? rows.map((t) => `<form id="purge-${t.id}" method="post" data-confirm="永久删除此流水及其附件？此操作无法撤销。"><input type="hidden" name="_csrf" value="${esc(csrf)}"></form>`).join('') : ''}`,
     }),
   );
+});
+
+txnRoutes.post('/transactions/:id/purge', async (c) => {
+  const r = requireWrite(c);
+  if (r) return r;
+  try {
+    await txn.purgeTransaction(dbOf(c), envOf(c), Number(c.req.param('id')), Number(c.get('ctx').ledger!.id));
+    setFlash(c, 'success', '已永久删除流水及其附件');
+  } catch (e) {
+    setFlash(c, 'error', toPublicError(e));
+  }
+  return c.redirect('/transactions/deleted');
 });
 
 txnRoutes.post('/transactions/:id/restore', async (c) => {
@@ -744,7 +760,7 @@ txnRoutes.post('/transactions/:id/delete', async (c) => {
   const ctx = c.get('ctx');
   const body = await bodyOf(c);
   try {
-    const ok = await txn.softDelete(db, Number(c.req.param('id')), Number(ctx.ledger!.id), { env: envOf(c) });
+    const ok = await txn.softDelete(db, Number(c.req.param('id')), Number(ctx.ledger!.id));
     if (!ok) {
       if (body._json === '1' || wantsJson(c)) return c.json({ ok: false, error: '记录不存在或已删除' }, 404);
       setFlash(c, 'error', '记录不存在或已删除');

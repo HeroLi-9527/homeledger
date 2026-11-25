@@ -29,6 +29,33 @@ export const BACKUP_TABLES = [
 export const MAX_BACKUP_BYTES = 20 * 1024 * 1024;
 export const MAX_SQL_PARAMS = 95;
 
+export function backupObjectReferences(snapshot: unknown) {
+  if (!isPlainObject(snapshot) || snapshot.app !== 'homeledger' || !isPlainObject(snapshot.tables)) {
+    throw new Error('整库 JSON 格式无效');
+  }
+  const tables = snapshot.tables;
+  const references: Array<{ key: string; avatar: boolean; replace: (key: string) => void }> = [];
+  const append = (table: 'users' | 'attachments', field: string, avatar: boolean) => {
+    const rows = tables[table];
+    if (!Array.isArray(rows)) throw new Error(`整库 JSON 缺少 ${table}`);
+    for (const row of rows) {
+      if (!isPlainObject(row)) throw new Error(`${table} 格式无效`);
+      const raw = row[field];
+      if (avatar && (raw == null || raw === '')) continue;
+      if (typeof raw !== 'string') throw new Error(`${table} 的对象路径无效`);
+      const key = avatar && !raw.startsWith('uploads/avatars/') ? `uploads/avatars/${raw}` : raw;
+      if (!/^uploads\/(?:[\w-]+\/)*[\w-]+\.(png|jpe?g|webp|gif|bmp|heic|heif|avif)$/i.test(key) ||
+          (avatar ? key.split('/').length !== 3 : key.startsWith('uploads/avatars/'))) {
+        throw new Error(`${table} 的对象路径无效`);
+      }
+      references.push({ key, avatar, replace: (next) => { row[field] = next; } });
+    }
+  };
+  append('attachments', 'rel_path', false);
+  append('users', 'avatar_path', true);
+  return references;
+}
+
 export interface TableColumnInfo {
   name: string;
   type: string;
@@ -69,7 +96,7 @@ export function validateAndBuildRestorePlan(
     throw new Error('备份文件来源不匹配（app 字段必须为 homeledger）');
   }
   const version = Number(parsed.version);
-  if (version !== 1 && version !== 2) {
+  if (version !== 1 && version !== 2 && version !== 3) {
     throw new Error(`不支持的备份版本：${String(parsed.version ?? '未知')}`);
   }
   if (!isPlainObject(parsed.tables)) {

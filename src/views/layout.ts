@@ -150,6 +150,7 @@ export function layout({
     .map(
       (g) => `<div class="nav-group-label">${esc(g.label)}</div>
 ${g.items
+  .filter(([key]) => writable || !['new', 'ai', 'import'].includes(key))
   .map(
     ([key, href, ico, label]) =>
       `<a class="nav-item ${activeNav === key ? 'active' : ''}" href="${href}"><span class="nav-ico">${ico}</span><span>${esc(label)}</span></a>`,

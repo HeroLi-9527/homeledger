@@ -111,7 +111,11 @@
 
     const applyType = (type) => {
       $$('[data-for-type]').forEach((el) => {
-        el.classList.toggle('hidden', !el.dataset.forType.split(',').includes(type));
+        const hidden = !el.dataset.forType.split(',').includes(type);
+        el.classList.toggle('hidden', hidden);
+        el.querySelectorAll('[name="to_account_id"], [name="to_account_amount"]').forEach((input) => {
+          input.disabled = hidden;
+        });
       });
       $$('[data-not-type]').forEach((el) => {
         el.classList.toggle('hidden', el.dataset.notType.split(',').includes(type));
@@ -684,7 +688,7 @@
         esc(res.stat.maxDate || '—') +
         '</div></div></div>';
       html +=
-        '<div class="row mb12 wrap"><label class="check"><input type="checkbox" id="imp-auto-acc" checked> 自动创建缺失的支付账户</label>' +
+        '<div class="row mb12 wrap">' + (res.source === 'homeledger' ? '' : '<label class="check"><input type="checkbox" id="imp-auto-acc" checked> 自动创建缺失的支付账户</label>') +
         (res.neutralCount
           ? '<label class="check"><input type="checkbox" id="imp-include-neutral"> 一并导入 ' +
             res.neutralCount +
@@ -696,7 +700,9 @@
       html +=
         '<div class="scroll-x"><table class="table"><thead><tr><th>日期</th><th>类型</th><th class="num">金额</th><th>商家/说明</th><th>建议分类</th><th>账户</th></tr></thead><tbody>';
       res.sample.slice(0, 60).forEach((r) => {
-        const accCell = r.guess_account_missing
+        const accCell = r.native
+          ? '<td class="small muted">' + esc((r.account_hint || '—') + (r.native.toName ? ' → ' + r.native.toName : '')) + '</td>'
+          : r.guess_account_missing
           ? '<td class="small imp-warn">缺失（将用默认账户）</td>'
           : '<td class="small muted">' + esc(r.guess_account || r.account_hint || '—') + '</td>';
         html +=
@@ -705,7 +711,7 @@
           '</td><td><span class="chip">' +
           esc(r.type_label) +
           '</span></td><td class="num amount">' +
-          money(r.amount_cents) +
+          (r.native ? esc(r.native.currency) + ' ' + (r.amount_cents / 100).toFixed(2) : money(r.amount_cents)) +
           '</td><td>' +
           esc(r.merchant || r.note || '—') +
           '</td><td class="small muted">' +
@@ -757,7 +763,7 @@
         const defAccEl = $('#imp-default-acc');
         const r = await postJson('/api/import/commit', {
           token: state.token,
-          auto_create_account: $('#imp-auto-acc').checked,
+          auto_create_account: $('#imp-auto-acc')?.checked ?? false,
           include_neutral: !!(neutralChk && neutralChk.checked),
           default_account_id: defAccEl && defAccEl.value ? Number(defAccEl.value) : null,
         });
@@ -893,6 +899,25 @@
       });
     }
 
+    const ledgerImport = $('#ledger-import-form');
+    if (ledgerImport) {
+      ledgerImport.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const file = $('#ledger-import-file').files[0];
+        if (!file) return;
+        const submit = $('button[type="submit"]', ledgerImport);
+        submit.disabled = true;
+        try {
+          const result = await postJson('/ledgers/import', { dataUrl: await fileToDataUrl(file) });
+          if (!result.ok) throw new Error(result.error);
+          window.location.href = '/ledgers';
+        } catch (error) {
+          toast(error.message, 'error');
+          submit.disabled = false;
+        }
+      });
+    }
+
     const restoreInput = $('#restore-file');
     if (restoreInput) {
       restoreInput.addEventListener('change', async () => {
@@ -917,7 +942,7 @@
     if (!master || !$$('.bulk-item').length) return;
     const bar = $('#bulk-bar');
     const update = () => {
-      const boxes = $$('.bulk-item');
+      const boxes = $$('.bulk-item:not(:disabled)');
       const n = boxes.filter((b) => b.checked).length;
       if (bar) {
         bar.classList.toggle('hidden', n === 0);
@@ -928,7 +953,7 @@
       master.checked = n === boxes.length && n > 0;
     };
     master.addEventListener('change', () => {
-      $$('.bulk-item').forEach((b) => (b.checked = master.checked));
+      $$('.bulk-item:not(:disabled)').forEach((b) => (b.checked = master.checked));
       update();
     });
     $$('.bulk-item').forEach((b) => b.addEventListener('change', update));

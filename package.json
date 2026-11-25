@@ -14,6 +14,7 @@
     "db:migrate": "wrangler d1 migrations apply DB --remote",
     "ops:reset-password": "tsx scripts/reset-password.ts",
     "ops:seed-demo": "tsx scripts/seed-demo.ts",
+    "ops:backup": "tsx scripts/backup-archive.ts",
     "verify-notes": "npx tsx .agents/skills/write-notes-like-deepseek/scripts/verify-agent-note-tree.ts && npx tsx .agents/skills/write-notes-like-deepseek/scripts/verify-agent-note-format.ts && npx tsx .agents/skills/write-notes-like-deepseek/scripts/verify-archived-agent-notes.ts",
     "archive-note": "npx tsx .agents/skills/write-notes-like-deepseek/scripts/archive-agent-note.ts",
     "init-board": "npx tsx .agents/skills/write-notes-like-deepseek/scripts/build-board.ts --init board.html \"HomeLedger 决策看板\"",

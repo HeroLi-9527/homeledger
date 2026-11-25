@@ -26,6 +26,7 @@ export function budgetsPage({
   monthSum = { income: 0, expense: 0 },
   baseCurrency = 'CNY',
   csrf,
+  writable,
 }: {
   items: Array<Record<string, unknown>>;
   cats: Array<CategoryRow & { path?: string }>;
@@ -33,6 +34,7 @@ export function budgetsPage({
   monthSum?: { income: number; expense: number };
   baseCurrency?: string;
   csrf: string;
+  writable: boolean;
 }): string {
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
   const activeItems = items.filter((b) => Number(b.is_active) === 1);
@@ -68,9 +70,9 @@ export function budgetsPage({
   <td class="num amount">${dailyHtml}</td>
   <td style="min-width:150px">${ratio == null || used == null ? '—' : `${progressBar(used, amt)} <span class="tiny muted">${Math.round(ratio)}%</span>`}</td>
   <td>
-    <a class="btn btn-sm" href="/budgets/${b.id}/edit">编辑</a>
+    ${writable ? `<a class="btn btn-sm" href="/budgets/${b.id}/edit">编辑</a>
     <form method="post" action="/budgets/${b.id}/toggle" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">${b.is_active ? '停用' : '启用'}</button></form>
-    <form method="post" action="/budgets/${b.id}/delete" style="display:inline">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
+    <form method="post" action="/budgets/${b.id}/delete" style="display:inline">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>` : ''}
   </td>
 </tr>`;
       })
@@ -84,7 +86,7 @@ export function budgetsPage({
   <div class="stat"><div class="label">生效预算总额</div><div class="value amount">${fmtAmount(activeBudgetTotal)}</div></div>
 </div>` +
     simpleTable('预算中心', ['名称', '周期', '有效预算', '已用', '剩余', '日均可用', '进度', '操作'], rows) +
-    `<div class="card mt16"><div class="card-head"><b>新建预算</b></div>
+    (writable ? `<div class="card mt16"><div class="card-head"><b>新建预算</b></div>
 <form method="post" action="/budgets">${csrfInput}
   <div class="grid grid-3">
     <input name="name" placeholder="预算名称，如：月度餐饮预算" required>
@@ -100,7 +102,7 @@ export function budgetsPage({
     <input type="date" name="end_date" title="自定义结束">
   </div>
   <div class="row mt12"><label class="check"><input type="checkbox" name="rollover"> 剩余额度结转下期</label><button class="btn btn-primary" type="submit">创建预算</button></div>
-</form></div>`
+</form></div>` : '')
   );
 }
 
@@ -110,6 +112,7 @@ export function subscriptionsPage({
   cats,
   today,
   csrf,
+  writable,
 }: {
   ov: {
     monthlyTotal: number;
@@ -128,6 +131,7 @@ export function subscriptionsPage({
   cats: Array<CategoryRow & { path: string }>;
   today: string;
   csrf: string;
+  writable: boolean;
 }): string {
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
   const renderSubRow = (s: Record<string, unknown>) => {
@@ -146,12 +150,13 @@ export function subscriptionsPage({
   <td><span class="chip">${esc(statusLabel(String(s.status)))}</span></td>
   <td>
     <div class="row wrap">
-      <a class="btn btn-sm" href="/subscriptions/${s.id}/edit">编辑</a>
+      <a class="btn btn-sm" href="/subscriptions/${s.id}">扣费历史</a>
+      ${writable ? `<a class="btn btn-sm" href="/subscriptions/${s.id}/edit">编辑</a>
       <form method="post" action="/subscriptions/${s.id}/charge" style="display:inline">${csrfInput}<input type="hidden" name="next_charge_at" value="${esc(s.next_charge_at || '')}"><button class="btn btn-sm" type="submit">扣费</button></form>
       <form method="post" action="/subscriptions/${s.id}/skip" style="display:inline">${csrfInput}<input type="hidden" name="next_charge_at" value="${esc(s.next_charge_at || '')}"><button class="btn btn-sm" type="submit">跳过</button></form>
       <form method="post" action="/subscriptions/${s.id}/toggle" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">${s.status === 'paused' || s.status === 'canceled' ? '恢复' : '暂停'}</button></form>
       <form method="post" action="/subscriptions/${s.id}/cancel" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">取消</button></form>
-      <form method="post" action="/subscriptions/${s.id}/delete" style="display:inline" data-confirm="确认永久删除该订阅？（不会删除已生成的历史扣费流水）">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>
+      <form method="post" action="/subscriptions/${s.id}/delete" style="display:inline" data-confirm="确认永久删除该订阅？（不会删除已生成的历史扣费流水）">${csrfInput}<button class="btn btn-sm btn-danger" type="submit">删除</button></form>` : ''}
     </div>
   </td>
 </tr>`;
@@ -188,7 +193,7 @@ export function subscriptionsPage({
   <div class="stat"><div class="label">本月已扣</div><div class="value amount expense">-${fmtAmount(Number(ov.thisMonthCharged || 0))}</div></div>
 </div>
 ${groupHtml}
-<div class="card mt16"><div class="card-head"><b>新建订阅</b><span class="muted small">点击常用服务可快速填充</span></div>
+${writable ? `<div class="card mt16"><div class="card-head"><b>新建订阅</b><span class="muted small">点击常用服务可快速填充</span></div>
 <div class="row wrap mb12" style="gap:6px">${presetChips}</div>
 <form method="post" action="/subscriptions" data-require-trial-end>${csrfInput}
   <div class="grid grid-3">
@@ -210,5 +215,5 @@ ${groupHtml}
     <input name="note" placeholder="备注">
   </div>
   <div class="row mt12"><label class="check"><input type="checkbox" name="auto_renew" checked> 到期自动扣费记账</label><button class="btn btn-primary" type="submit">创建订阅</button></div>
-</form></div>`;
+</form></div>` : ''}`;
 }

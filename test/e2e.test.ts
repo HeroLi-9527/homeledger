@@ -3,9 +3,10 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import test from 'node:test';
-import { makeDb, todayStr } from '../src/db.js';
+import { makeDb, recomputeAccountBalances, todayStr } from '../src/db.js';
 import { app } from '../src/index.js';
 import { getAiConfig } from '../src/lib/ai.js';
+import { importRecords, mapNativeRecords, NATIVE_EXPORT_HEADER, parseBill, toCsv } from '../src/lib/importers.js';
 import { checkCreditAccounts, checkSessionCards, repairReimbursedLinks, runScheduled } from '../src/lib/scheduler.js';
 import { iterateAllForExport } from '../src/lib/txn.js';
 import type { Env } from '../src/types.js';
@@ -46,6 +47,7 @@ function createSqliteD1(sqlite: SqliteDatabase): D1Database {
       return (col ? row[col] : row) as T;
     },
     async run() {
+      if (/^\s*(?:SELECT|PRAGMA)\b/i.test(sql)) return this.all();
       const info = sqlite.prepare(sql).run(...bound);
       return {
         results: [],
@@ -379,7 +381,28 @@ test('HomeLedger 端到端全链路测试（极简 D1 + 无状态 Cookie + 离�
     body: JSON.stringify({}),
   });
   assert.equal(delRes.status, 200);
-  assert.equal(r2Store.has(analyzed.images[0].rel), false, '删除流水应同步清理 R2 原图');
+  assert.equal(r2Store.has(analyzed.images[0].rel), true, '回收站应保留原图');
+  assert.equal((await req(analyzed.images[0].url, { headers: { Cookie: cookieHeader } })).status, 404);
+  const trashAction = (action: string) => req(`/transactions/${confirmed.ids[0]}/${action}`, {
+    method: 'POST',
+    headers: { Cookie: cookieHeader, 'x-csrf-token': csrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  assert.equal((await trashAction('restore')).status, 302);
+  assert.equal((await req(analyzed.images[0].url, { headers: { Cookie: cookieHeader } })).status, 200);
+  await trashAction('delete');
+  const r2Delete = env.ATTACHMENTS.delete;
+  env.ATTACHMENTS.delete = async () => { throw new Error('R2 暂不可用'); };
+  try {
+    await trashAction('purge');
+    assert.equal(r2Store.has(analyzed.images[0].rel), true);
+    await trashAction('restore');
+    assert.equal((await req(analyzed.images[0].url, { headers: { Cookie: cookieHeader } })).status, 404);
+  } finally {
+    env.ATTACHMENTS.delete = r2Delete;
+  }
+  await trashAction('purge');
+  assert.equal(r2Store.has(analyzed.images[0].rel), false, '永久删除应同步清理 R2 原图');
 
   // 9. OpenAPI 鉴权 + 记账 + 只读零写校验，以及修改密码后 token_version 吊销全端会话与 API 令牌
   const unauthApi = await req('/api/open/ping');
@@ -1958,6 +1981,12 @@ test('OpenAPI 全资源 CRUD、业务动作与权限/跨账本隔离回归', asy
 
   assert.equal((await api(`/accounts/${accId}`, aliceToken, 'DELETE')).status, 400, '有流水账户禁删');
   assert.equal((await api(`/transactions/${adjUp.transaction.id}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/accounts/${accId}`, aliceToken, 'DELETE')).status, 400, '回收站仍引用该账户');
+  const purgeAdjust = await req(`/transactions/${adjUp.transaction.id}/purge`, {
+    method: 'POST', headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(purgeAdjust.status, 302);
   assert.equal((await api(`/accounts/${accId}`, aliceToken, 'DELETE')).status, 200);
   assert.equal((await api(`/accounts/${accId}`, aliceToken)).status, 404);
 
@@ -2015,6 +2044,11 @@ test('OpenAPI 全资源 CRUD、业务动作与权限/跨账本隔离回归', asy
   ).json()) as { id: number };
   assert.equal((await api(`/categories/${catSubJson.id}`, aliceToken, 'DELETE')).status, 400);
   assert.equal((await api(`/transactions/${catTxn.id}`, aliceToken, 'DELETE')).status, 200);
+  assert.equal((await api(`/categories/${catSubJson.id}`, aliceToken, 'DELETE')).status, 400);
+  assert.equal((await req(`/transactions/${catTxn.id}/purge`, {
+    method: 'POST', headers: { Cookie: aliceCookie, 'x-csrf-token': aliceCsrf, 'Content-Type': 'application/json' },
+    body: '{}',
+  })).status, 302);
   assert.equal((await api(`/categories/${catSubJson.id}`, aliceToken, 'DELETE')).status, 200);
   assert.equal((await api(`/categories/${catRootId}`, aliceToken, 'DELETE')).status, 200);
 
@@ -3709,6 +3743,9 @@ test('第 7 项回归：viewer 只读角色隐藏桌面顶栏记账入口与流�
     }),
   });
   const viewerCookie = extractSidCookie(bobJoin);
+  const viewerCsrf = extractCsrf(await (await req('/', { headers: { Cookie: viewerCookie } })).text());
+  sqlite.prepare("INSERT INTO subscriptions (ledger_id, name, amount_cents, next_charge_at, created_at) VALUES (1, 'Viewer subscription', 1000, ?, ?)").run(todayStr(), todayStr());
+  sqlite.prepare("UPDATE transactions SET subscription_id = 1 WHERE id = 1").run();
 
   const aliceHome = await (await req('/', { headers: { Cookie: aliceCookie } })).text();
   assert.ok(aliceHome.includes('🤖 AI 截图记账') && aliceHome.includes('+ 记一笔') && aliceHome.includes('data-del-txn="'));
@@ -3719,7 +3756,26 @@ test('第 7 项回归：viewer 只读角色隐藏桌面顶栏记账入口与流�
     assert.equal(html.includes('+ 记一笔'), false, `viewer 在 ${p} 不应看到桌面端 + 记一笔按钮`);
     assert.equal(html.includes('data-del-txn="'), false, `viewer 在 ${p} 不应看到流水删除按钮`);
     assert.equal(html.includes('/transactions/1/edit'), false, `viewer 在 ${p} 不应看到流水编辑按钮`);
+    assert.doesNotMatch(html, /href="\/(?:ai|import|transactions\/new)"/);
   }
+  for (const [path, action] of [
+    ['/accounts', '/accounts'], ['/categories', '/categories'], ['/tags', '/tags'], ['/budgets', '/budgets'],
+    ['/recurring', '/recurring'], ['/debts', '/debts'], ['/goals', '/goals'], ['/subscriptions', '/subscriptions'],
+  ]) {
+    const html = await (await req(path, { headers: { Cookie: viewerCookie } })).text();
+    assert.equal(html.includes(`action="${action}"`), false);
+  }
+  const details = await req('/subscriptions/1', { headers: { Cookie: viewerCookie } });
+  assert.equal(details.status, 200);
+  const html = await details.text();
+  assert.match(html, /Viewer subscription/);
+  assert.match(html, /viewer可见流水/);
+  assert.doesNotMatch(html, /action="\/subscriptions\/|\/transactions\/1\/edit/);
+  assert.equal((await req('/subscriptions/1/edit', { headers: { Cookie: viewerCookie } })).status, 403);
+  assert.equal((await req('/subscriptions/1/charge', {
+    method: 'POST', headers: { Cookie: viewerCookie, 'x-csrf-token': viewerCsrf, 'Content-Type': 'application/json' },
+    body: '{}',
+  })).status, 403);
 });
 
 test('第 8 项回归：新增迁移 0004 创建 idx_txn_subscription 索引', () => {
@@ -3730,6 +3786,196 @@ test('第 8 项回归：新增迁移 0004 创建 idx_txn_subscription 索引', (
   assert.ok(idx, 'migrations/0004_txn_subscription_idx.sql 应创建 idx_txn_subscription');
   assert.equal(idx.tbl_name, 'transactions');
   assert.ok(idx.sql.includes('subscription_id'));
+});
+
+test('跨币种转账、回收站、HomeLedger CSV 往返与单账本复制使用同一账户侧金额', async () => {
+  const { env, sqlite } = setupEnv();
+  const req = (path: string, init: RequestInit = {}) => app.fetch(new Request(`http://localhost${path}`, init), env);
+  const session = await req('/setup', {
+    method: 'POST', headers: { Origin: 'http://localhost', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ username: 'fxuser', display_name: 'FX', password: 'password123', password2: 'password123' }),
+  });
+  const Cookie = extractSidCookie(session);
+  const csrf = extractCsrf(await (await req('/', { headers: { Cookie } })).text());
+  const post = (path: string, body: Record<string, unknown>) => req(path, {
+    method: 'POST', headers: { Cookie, 'x-csrf-token': csrf, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const { token } = await (await post('/settings/api-tokens', { name: 'multicurrency' })).json() as { token: string };
+  const open = (path: string, method: string, body?: Record<string, unknown>) => req(`/api/open${path}`, {
+    method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const created = await (await open('/accounts', 'POST', { name: '美元钱包', type: 'cash', currency: 'USD', initial_cents: 5000 })).json() as { id: number };
+  const usd = created.id;
+  const balance = (id: number) => (sqlite.prepare('SELECT balance_cents FROM accounts WHERE id = ?').get(id) as { balance_cents: number }).balance_cents;
+  const opening = balance(1);
+  const create = await open('/transactions', 'POST', {
+    type: 'transfer', amount: '10', currency: 'USD', rate: 7,
+    account_id: 1, to_account_id: usd, account_amount_cents: 6950, to_account_amount_cents: 1000,
+    note: '外币转账验证', tags: '外币',
+  });
+  assert.equal(create.status, 201);
+  const { id } = await create.json() as { id: number };
+  sqlite.prepare("UPDATE transactions SET group_id = 'fx-split' WHERE id = ?").run(id);
+  sqlite.prepare("INSERT INTO splits (group_id, transaction_id, ledger_id, member_name, share_cents, created_at) VALUES ('fx-split', ?, 1, '成员', 1000, ?)").run(id, todayStr());
+  assert.equal(balance(1), opening - 6950);
+  assert.equal(balance(usd), 6000);
+  assert.equal((await open(`/transactions/${id}`, 'PATCH', { note: '外币转账验证' })).status, 200);
+  assert.equal(balance(1), opening - 6950);
+  assert.equal((await open(`/transactions/${id}`, 'DELETE')).status, 200);
+  assert.equal(balance(1), opening);
+  assert.equal(balance(usd), 5000);
+  assert.equal((sqlite.prepare('SELECT COUNT(*) AS c FROM transaction_tags WHERE transaction_id = ?').get(id) as { c: number }).c, 1);
+  await post(`/transactions/${id}/restore`, {});
+  assert.equal(balance(usd), 6000);
+  assert.equal((sqlite.prepare('SELECT COUNT(*) AS c FROM splits WHERE transaction_id = ?').get(id) as { c: number }).c, 1);
+
+  const csv = await (await req('/export/csv', { headers: { Cookie } })).text();
+  const encoded = (raw: string) => Buffer.from(raw).toString('base64');
+  const invalid = await post('/api/import/preview', { dataUrl: encoded(csv.replaceAll('美元钱包', '缺失账户')) });
+  assert.equal(invalid.status, 400);
+  assert.match(await invalid.text(), /第 2 行.*缺失账户/);
+  for (const expected of [1, 0]) {
+    const preview = await (await post('/api/import/preview', { dataUrl: encoded(csv) })).json() as {
+      token: string; sample: Array<{ type: string; native: { currency: string; toCents: number } }>;
+    };
+    assert.equal(preview.sample[0].type, 'transfer');
+    assert.equal(preview.sample[0].native.currency, 'USD');
+    assert.equal(preview.sample[0].native.toCents, 1000);
+    const committed = await (await post('/api/import/commit', { token: preview.token })).json() as { imported: number };
+    assert.equal(committed.imported, expected);
+  }
+  assert.equal(balance(usd), 7000);
+  sqlite.prepare(`INSERT INTO session_cards (ledger_id, name, total_sessions, remaining_sessions, purchase_txn_id, purchase_date, created_at, updated_at)
+    VALUES (1, '购卡引用', 1, 1, ?, ?, ?, ?)`).run(id, todayStr(), todayStr(), todayStr());
+  const exportJson = await (await req('/export/ledger.json', { headers: { Cookie } })).text();
+  const imported = await post('/ledgers/import', { dataUrl: encoded(exportJson), name: '仅复制账本' });
+  assert.equal(imported.status, 200, await imported.clone().text());
+  const { ledger } = await imported.json() as { ledger: { id: number } };
+  assert.notEqual(ledger.id, 1);
+  const copied = sqlite.prepare(`SELECT t.account_id, t.to_account_id, a.balance_cents FROM transactions t
+    JOIN accounts a ON a.id = t.to_account_id WHERE t.ledger_id = ? AND t.type = 'transfer'`).all(ledger.id) as Array<{
+      account_id: number; to_account_id: number; balance_cents: number;
+    }>;
+  assert.equal(copied.length, 2);
+  assert.ok(copied.every((row) => row.account_id !== 1 && row.to_account_id !== usd && row.balance_cents === 7000));
+  const copiedSplit = sqlite.prepare("SELECT s.group_id, t.group_id AS txn_group FROM splits s JOIN transactions t ON t.id = s.transaction_id WHERE s.ledger_id = ?").get(ledger.id) as {
+    group_id: string; txn_group: string;
+  };
+  assert.equal(copiedSplit.group_id, copiedSplit.txn_group);
+  assert.notEqual(copiedSplit.group_id, 'fx-split');
+  const copiedCard = sqlite.prepare(`SELECT s.purchase_txn_id, t.ledger_id AS txn_ledger
+    FROM session_cards s JOIN transactions t ON t.id = s.purchase_txn_id WHERE s.ledger_id = ?`)
+    .get(ledger.id) as { purchase_txn_id: number; txn_ledger: number };
+  assert.notEqual(copiedCard.purchase_txn_id, id);
+  assert.equal(copiedCard.txn_ledger, ledger.id);
+  await open(`/transactions/${id}`, 'DELETE');
+  await post(`/transactions/${id}/purge`, {});
+  assert.equal((sqlite.prepare('SELECT purchase_txn_id FROM session_cards WHERE ledger_id = 1').get() as {
+    purchase_txn_id: number | null;
+  }).purchase_txn_id, null);
+  assert.equal((await open(`/accounts/${usd}/adjust`, 'POST', { balance: '70.25' })).status, 200);
+  assert.equal(balance(usd), 7025);
+  const snapshot = await (await req('/export/json', { headers: { Cookie } })).json() as {
+    tables: { users: Array<{ avatar_path: string | null }> };
+  };
+  const archive = 'a'.repeat(32);
+  const broken = structuredClone(snapshot);
+  broken.tables.users[0].avatar_path = `uploads/avatars/restore-${archive}-0.png`;
+  assert.equal((await post('/backup/restore', { backup: broken, archive })).status, 400);
+  assert.equal(balance(usd), 7025);
+  assert.equal((await post('/backup/restore', { backup: snapshot })).status, 200);
+  assert.equal(balance(usd), 7025);
+  assert.equal((await open('/accounts', 'GET')).status, 401);
+});
+
+test('原币迁移和全库重算沿用历史卖出余额口径并保留待校准记录', async () => {
+  const sqlite = new DatabaseSync(':memory:');
+  const dir = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'migrations');
+  const files = fs.readdirSync(dir).filter((name) => name.endsWith('.sql')).sort();
+  for (const file of files.filter((name) => name < '0005')) sqlite.exec(fs.readFileSync(path.join(dir, file), 'utf8'));
+  sqlite.exec(`
+    INSERT INTO accounts (id, ledger_id, name, currency, initial_cents, balance_cents, created_at)
+    VALUES (1, 1, 'USD', 'USD', 5000, 12000, '2026-11-01'),
+           (2, 1, 'CNY', 'CNY', 10000, 3000, '2026-11-01'),
+           (3, 1, 'EUR', 'EUR', 1000, -6000, '2026-11-01');
+    INSERT INTO transactions (ledger_id, type, amount_cents, currency, rate, amount_base_cents,
+      account_id, to_account_id, user_id, txn_date, created_at, updated_at)
+    VALUES (1, 'transfer', 1000, 'USD', 7, 7000, 2, 1, 1, '2026-11-02', '2026-11-02', '2026-11-02'),
+           (1, 'expense', 1000, 'USD', 7, 7000, 3, NULL, 1, '2026-11-03', '2026-11-03', '2026-11-03'),
+           (1, 'invest_sell', 3000, 'CNY', 1, 3000, 2, NULL, 1, '2026-11-04', '2026-11-04', '2026-11-04');
+  `);
+  sqlite.exec(fs.readFileSync(path.join(dir, '0005_account_amounts_and_trash.sql'), 'utf8'));
+  const balances = sqlite.prepare('SELECT balance_cents FROM accounts ORDER BY id').all() as { balance_cents: number }[];
+  assert.deepEqual(balances.map((row) => row.balance_cents), [6000, 3000, 1000]);
+  const native = sqlite.prepare('SELECT account_amount_cents, to_account_amount_cents FROM transactions ORDER BY id').all() as {
+    account_amount_cents: number | null; to_account_amount_cents: number | null;
+  }[];
+  assert.deepEqual(native.map((row) => [row.account_amount_cents, row.to_account_amount_cents]), [[7000, 1000], [null, null], [3000, null]]);
+  const db = makeDb({ DB: createSqliteD1(sqlite) });
+  await db.run('UPDATE accounts SET balance_cents = 0');
+  await db.batch([recomputeAccountBalances]);
+  assert.deepEqual(await db.all('SELECT balance_cents FROM accounts ORDER BY id'), balances);
+});
+
+test('Web 表单只改交易金额时重新计算余额，并保留显式账户侧输入', async () => {
+  const { env, sqlite } = setupEnv();
+  const req = (path: string, init: RequestInit = {}) => app.fetch(new Request(`http://localhost${path}`, init), env);
+  const session = await req('/setup', {
+    method: 'POST', headers: { Origin: 'http://localhost', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ username: 'editfx', display_name: 'FX', password: 'password123', password2: 'password123' }),
+  });
+  const Cookie = extractSidCookie(session);
+  const csrf = extractCsrf(await (await req('/', { headers: { Cookie } })).text());
+  const postForm = (path: string, fields: Record<string, string>) => req(path, {
+    method: 'POST', headers: { Cookie, Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: csrf, type: 'expense', account_id: '1', currency: 'CNY', ...fields }),
+  });
+  const balance = () => Number((sqlite.prepare('SELECT balance_cents FROM accounts WHERE id = 1').get() as { balance_cents: number }).balance_cents);
+  const opening = balance();
+  assert.ok((await postForm('/transactions', { amount: '100' })).ok);
+  const html = await (await req('/transactions/1/edit', { headers: { Cookie } })).text();
+  const accountAmount = /name="account_amount"[^>]*value="([^"]*)"/.exec(html)?.[1];
+  assert.equal(accountAmount, '');
+  assert.match(html, /placeholder="已记 100\.00"/);
+  assert.ok((await postForm('/transactions/1', { amount: '150', account_amount: accountAmount })).ok);
+  assert.equal(balance(), opening - 15000);
+  assert.ok((await postForm('/transactions/1', { currency: 'USD', rate: '7', amount: '20', account_amount: '139' })).ok);
+  assert.equal(balance(), opening - 13900);
+  assert.ok((await postForm('/transactions/1', { currency: 'USD', rate: '7', amount: '20', note: '仅补备注' })).ok);
+  assert.equal(balance(), opening - 13900);
+});
+
+test('自身 CSV 复用交易校验，第三方批量导入按请求读取账户和汇率', async () => {
+  const { env } = setupEnv();
+  const db = makeDb(env);
+  await db.run("INSERT INTO accounts (id, ledger_id, name, currency, created_at) VALUES (1, 1, '美元账户', 'USD', ?)", todayStr());
+  const category = await db.get<{ name: string }>("SELECT name FROM categories WHERE kind = 'expense' AND parent_id IS NULL LIMIT 1");
+  assert.ok(category);
+  const nativeRow = (account: string, accountAmount = '10.00') => [
+    todayStr(), 'borrow', '10.00', 'USD', '70.00', category.name, account, '', '', '', '', '', '', 'cleared',
+    'CNY', '7', 'USD', accountAmount, '', '',
+  ];
+  const parse = (row: string[]) => parseBill(Buffer.from(toCsv(NATIVE_EXPORT_HEADER, [row]))).records;
+  await assert.rejects(mapNativeRecords(db, 1, parse(nativeRow(''))), /第 2 行.*请选择账户/);
+  await assert.rejects(mapNativeRecords(db, 1, parse(nativeRow('美元账户', '0.00'))), /第 2 行.*金额/);
+  assert.ok((await mapNativeRecords(db, 1, parse(nativeRow('美元账户'))))[0].categoryId);
+  let reads = 0;
+  const all = db.all.bind(db);
+  const get = db.get.bind(db);
+  db.all = (...args) => { reads++; return all(...args); };
+  db.get = (...args) => { reads++; return get(...args); };
+  const csv = toCsv(['交易时间', '交易分类', '收/支', '金额', '交易对方', '支付方式', '交易订单号'],
+    Array.from({ length: 60 }, (_, i) => [todayStr(), '餐饮', '支出', '70', '午餐', '美元账户', `TEST-${i}`]));
+  const result = await importRecords(db, { ledgerId: 1, userId: 1, records: parseBill(Buffer.from(csv)).records,
+    source: 'alipay', fileName: 'alipay.csv', autoCreateAccount: false });
+  assert.equal(result.imported, 60);
+  assert.ok(reads <= 10, `60 行不应逐笔查库，实际读取 ${reads} 次`);
+  const rows = await db.all<{ account_amount_cents: number }>('SELECT account_amount_cents FROM transactions');
+  assert.equal(new Set(rows.map((row) => row.account_amount_cents)).size, 1);
+  const rate = await db.get<{ rate: number }>("SELECT rate FROM exchange_rates WHERE base='USD' AND quote='CNY'");
+  assert.equal(rows[0].account_amount_cents, Math.round(7000 / rate!.rate));
 });
 
 test('第 9 项回归：关于页仓库链接一致性与 4 项统计卡片', async () => {

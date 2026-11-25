@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { visibleAttachment } from './lib/attachments.js';
 import { makeDb } from './db.js';
 import * as auth from './lib/auth.js';
 import { runScheduled } from './lib/scheduler.js';
@@ -162,10 +163,14 @@ app.get('/uploads/*', async (c) => {
   const db = c.get('db');
   const ctx = c.get('ctx');
   if (!key.startsWith('uploads/avatars/')) {
-    const att = await db.get<{ ledger_id: number }>('SELECT ledger_id FROM attachments WHERE rel_path = ?', key);
+    const att = await db.get<{ ledger_id: number }>(`SELECT a.ledger_id FROM attachments a WHERE a.rel_path = ? AND ${visibleAttachment}`, key);
     if (!att) return c.text('Not Found', 404);
     const member = await auth.membership(db, ctx.user!.id, Number(att.ledger_id));
     if (!member) return c.text('Forbidden', 403);
+  } else {
+    const filename = key.slice('uploads/avatars/'.length);
+    const linked = await db.get('SELECT 1 FROM users WHERE avatar_path IN (?, ?) LIMIT 1', key, filename);
+    if (!linked) return c.text('Not Found', 404);
   }
 
   if (!c.env.ATTACHMENTS) return c.text('Storage Not Configured', 404);
@@ -176,7 +181,7 @@ app.get('/uploads/*', async (c) => {
   headers.set('Content-Type', obj.httpMetadata?.contentType || mime);
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.set('Content-Security-Policy', 'sandbox');
-  headers.set('Cache-Control', 'private, max-age=86400');
+  headers.set('Cache-Control', 'no-store');
   return new Response(obj.body, { headers });
 });
 
