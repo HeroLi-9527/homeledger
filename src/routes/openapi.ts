@@ -1567,11 +1567,11 @@ openapiRoutes.get('/reports', async (c) => {
     txn.categoryBreakdown(db, oa.ledgerId, range.start, range.end, 'expense'),
     txn.categoryBreakdown(db, oa.ledgerId, range.start, range.end, 'income'),
     txn.subcategoryBreakdown(db, oa.ledgerId, range.start, range.end, kind, selectedCat),
-    txn.monthlyTrend(db, oa.ledgerId, 6),
+    txn.monthlyTrend(db, oa.ledgerId, 12),
     txn.dailyBreakdown(db, oa.ledgerId, `${heatmapMonth}-01`, u.monthEnd(heatmapMonth)),
     txn.weekdayExpenseBreakdown(db, oa.ledgerId, range.start, range.end),
     txn.memberBreakdown(db, oa.ledgerId, range.start, range.end),
-    txn.netWorthTrend(db, oa.ledgerId, 6),
+    txn.netWorthTrend(db, oa.ledgerId, 12),
     db.get<{ c: number; avg: number }>(
       `SELECT COUNT(*) AS c, COALESCE(AVG(amount_base_cents),0) AS avg
        FROM transactions
@@ -1627,6 +1627,15 @@ openapiRoutes.get('/export', async (c) => {
     for (const tbl of BACKUP_TABLES) {
       tables[tbl] = await db.all(`SELECT * FROM ${tbl}`);
     }
+    tables.users = (tables.users || []).map((row) => {
+      const { password_hash: _ph, ...rest } = row as Record<string, unknown>;
+      return rest;
+    });
+    tables.api_tokens = (tables.api_tokens || []).map((row) => {
+      const { token_hash: _th, ...rest } = row as Record<string, unknown>;
+      return rest;
+    });
+    tables.settings = (tables.settings || []).filter((row) => (row as { key?: unknown }).key !== 'ai.api_key');
     c.header('Cache-Control', 'no-store');
     return c.json({ ok: true, app: 'homeledger', version: 2, exported_at: nowStr(), tables });
   }

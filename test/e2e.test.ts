@@ -2876,14 +2876,24 @@ test('关于页、PWA 图标、防呆/报销/AI 加固、规划边界、CSV TTL/
   for (const key of ['range', 'kind', 'subcategories', 'daily', 'weekday_expense', 'expense_stats']) {
     assert.ok(key in openRepJson, `/reports 缺少 ${key}`);
   }
+  assert.ok(Array.isArray(openRepJson.trend) && openRepJson.trend.length === 12);
+  assert.ok(Array.isArray(openRepJson.net_worth) && openRepJson.net_worth.length === 12);
 
   assert.equal((await api('/export?scope=full', bobL2Token)).status, 403, '非站点管理员禁止导出全库备份');
   const fullExpRes = await api('/export?scope=full', aliceToken);
   assert.equal(fullExpRes.status, 200);
   assert.equal(fullExpRes.headers.get('cache-control'), 'no-store');
-  const fullExpJson = (await fullExpRes.json()) as { app: string; tables: Record<string, unknown[]> };
+  const fullExpJson = (await fullExpRes.json()) as { app: string; tables: Record<string, Array<Record<string, unknown>>> };
   assert.equal(fullExpJson.app, 'homeledger');
   assert.ok(Array.isArray(fullExpJson.tables.users) && Array.isArray(fullExpJson.tables.transactions));
+  assert.ok(fullExpJson.tables.users.length > 0 && fullExpJson.tables.users.every((uRow) => !('password_hash' in uRow)));
+  assert.ok(
+    fullExpJson.tables.api_tokens.length > 0 && fullExpJson.tables.api_tokens.every((tRow) => !('token_hash' in tRow)),
+  );
+  assert.equal(
+    fullExpJson.tables.settings.some((sRow) => sRow.key === 'ai.api_key'),
+    false,
+  );
 
   // 当月收入分类 TOP 与未来周期账单首页展示
   const incCatRow = sqlite.prepare("SELECT id FROM categories WHERE kind = 'income' LIMIT 1").get() as { id: number };
