@@ -1,3 +1,4 @@
+import { registerRolloverOpenApi } from './ledger-rollover.js';
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { accountGroupOf, isCreditGroupType, nowStr, todayStr, TXN_TYPE_MAP } from '../db.js';
@@ -135,7 +136,7 @@ async function createAutoAccount(
   const icon = type === 'credit' ? '💳' : type === 'prepaid' ? '🎟️' : type === 'virtual' ? '📱' : type === 'debit' ? '🏦' : '📦';
   const res = await db.run(
     `INSERT INTO accounts (ledger_id, name, type, icon, currency, initial_cents, balance_cents, sort_order, note, created_at)
-     VALUES (?,?,?,?,?,0,0,999,?,?)`,
+     SELECT ?,?,?,?,?,0,0,999,?,? WHERE ${txn.activeLedgerGuard}`,
     ledgerId,
     cleanName,
     type,
@@ -143,7 +144,9 @@ async function createAutoAccount(
     'CNY',
     '由开放 API 自动创建',
     nowStr(),
+    ledgerId,
   );
+  if (!res.changes) throw new Error('账本已归档，只能查阅和导出');
   createdAccounts.push(cleanName);
   return Number(res.lastInsertRowid);
 }
@@ -189,14 +192,12 @@ openapiRoutes.use('*', async (c, next) => {
   }
 
   const requestedLedger = Number(c.req.query('ledger_id') || c.req.header('x-ledger-id') || row.ledger_id || 0);
-  let member = requestedLedger ? await auth.membership(db, row.user_id, requestedLedger) : null;
-  if (!member && !requestedLedger) {
-    member = await db.get<{ id: number; ledger_id: number; user_id: number; role: Role; nickname: string | null }>(
-      `SELECT m.* FROM ledger_members m JOIN ledgers l ON l.id = m.ledger_id
-       WHERE m.user_id = ? AND l.is_archived = 0 ORDER BY m.id LIMIT 1`,
-      row.user_id,
-    );
-  }
+  const member = await db.get<{ ledger_id: number; role: Role; is_archived: number }>(
+    `SELECT m.ledger_id, m.role, l.is_archived
+     FROM ledger_members m JOIN ledgers l ON l.id = m.ledger_id
+     WHERE m.user_id = ? AND ${requestedLedger ? 'l.id = ?' : 'l.is_archived = 0'} ORDER BY m.id LIMIT 1`,
+    ...(requestedLedger ? [row.user_id, requestedLedger] : [row.user_id]),
+  );
   if (!member) {
     return c.json({ ok: false, error: '无权访问目标账本' }, 403);
   }
@@ -207,6 +208,7 @@ openapiRoutes.use('*', async (c, next) => {
     displayName: row.display_name,
     isAdmin: Boolean(row.is_admin),
     ledgerId: Number(member.ledger_id),
+    archived: Boolean(member.is_archived),
     role: member.role as NonNullable<HonoEnv['Variables']['openAuth']>['role'],
     tokenId: Number(row.token_id),
     tokenName: row.token_name,
@@ -397,7 +399,7 @@ openapiRoutes.post('/transactions', async (c) => {
       });
     } catch (err) {
       for (const accId of autoCreatedAccountIds) {
-        await db.run('DELETE FROM accounts WHERE id = ? AND ledger_id = ?', accId, oa.ledgerId).catch(() => {});
+        await db.run(`DELETE FROM accounts WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, accId, oa.ledgerId, oa.ledgerId).catch(() => {});
       }
       createdAccounts.length = 0;
       throw err;
@@ -497,7 +499,7 @@ openapiRoutes.post('/ai/bill', async (c) => {
   let autoCreatedDefaultAccId: number | null = null;
   const cleanupAutoDefaultAcc = async () => {
     if (autoCreatedDefaultAccId) {
-      await db.run('DELETE FROM accounts WHERE id = ? AND ledger_id = ?', autoCreatedDefaultAccId, oa.ledgerId).catch(() => {});
+      await db.run(`DELETE FROM accounts WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, autoCreatedDefaultAccId, oa.ledgerId, oa.ledgerId).catch(() => {});
       autoCreatedDefaultAccId = null;
       createdAccounts.length = 0;
     }
@@ -750,7 +752,7 @@ openapiRoutes.post('/accounts', async (c) => {
       `INSERT INTO accounts
        (ledger_id, name, type, icon, currency, initial_cents, balance_cents, credit_limit, bill_day, due_day,
         institution, card_no, note, include_in_net, sort_order, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
       oa.ledgerId,
       data.name,
       data.type,
@@ -767,7 +769,9 @@ openapiRoutes.post('/accounts', async (c) => {
       data.include_in_net,
       data.sort_order,
       nowStr(),
+      oa.ledgerId,
     );
+    if (!res.changes) return c.json({ ok: false, error: '账本已归档，只能查阅和导出' }, 403);
     const created = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', res.lastInsertRowid, oa.ledgerId);
     return c.json({ ok: true, id: res.lastInsertRowid, account: created ? enrichAccount(created) : null }, 201);
   } catch (e) {
@@ -795,7 +799,7 @@ async function handleApiAccountUpdate(c: Context<HonoEnv>) {
       `UPDATE accounts
        SET name = ?, type = ?, icon = ?, currency = ?, include_in_net = ?, is_archived = ?, sort_order = ?,
            institution = ?, card_no = ?, note = ?, credit_limit = ?, bill_day = ?, due_day = ?
-       WHERE id = ? AND ledger_id = ?`,
+       WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
       data.name,
       data.type,
       data.icon,
@@ -810,6 +814,7 @@ async function handleApiAccountUpdate(c: Context<HonoEnv>) {
       data.bill_day,
       data.due_day,
       id,
+      oa.ledgerId,
       oa.ledgerId,
     );
     const updated = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
@@ -839,7 +844,7 @@ openapiRoutes.post('/accounts/:id/archive', async (c) => {
         : existing.is_archived
           ? 0
           : 1;
-    await db.run('UPDATE accounts SET is_archived = ? WHERE id = ? AND ledger_id = ?', nextArchived, id, oa.ledgerId);
+    await db.run(`UPDATE accounts SET is_archived = ? WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, nextArchived, id, oa.ledgerId, oa.ledgerId);
     const updated = await db.get<AccountRow>('SELECT * FROM accounts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
     return c.json({ ok: true, id, account: updated ? enrichAccount(updated) : null });
   } catch (e) {
@@ -1064,17 +1069,8 @@ async function handleSessionCardUpdate(c: Context<HonoEnv>) {
       total_cost_cents: totalCostCents,
       expires_at: expiresAt,
       note: body.note !== undefined ? (body.note == null ? null : String(body.note)) : undefined,
+      is_archived: body.is_archived === undefined ? undefined : parseBoolFlag(body.is_archived, Number(existing.is_archived)),
     });
-    if (body.is_archived !== undefined) {
-      const nextArchived = parseBoolFlag(body.is_archived, Number(existing.is_archived));
-      await db.run(
-        'UPDATE session_cards SET is_archived = ?, updated_at = ? WHERE id = ? AND ledger_id = ?',
-        nextArchived,
-        nowStr(),
-        id,
-        oa.ledgerId,
-      );
-    }
     const card = await sc.getSessionCard(db, id, oa.ledgerId);
     return c.json({ ok: true, id, card });
   } catch (e) {
@@ -1102,13 +1098,9 @@ openapiRoutes.post('/session-cards/:id/archive', async (c) => {
         : existing.is_archived
           ? 0
           : 1;
-    await db.run(
-      'UPDATE session_cards SET is_archived = ?, updated_at = ? WHERE id = ? AND ledger_id = ?',
-      nextArchived,
-      nowStr(),
-      id,
-      oa.ledgerId,
-    );
+    if (!(await sc.toggleArchiveSessionCard(db, id, oa.ledgerId, nextArchived))) {
+      return c.json({ ok: false, error: '次卡不存在或账本已归档' }, 409);
+    }
     const card = await sc.getSessionCard(db, id, oa.ledgerId);
     return c.json({ ok: true, id, card });
   } catch (e) {
@@ -1200,7 +1192,7 @@ openapiRoutes.post('/categories', async (c) => {
         : 0;
 
     const ins = await db.run(
-      'INSERT INTO categories (ledger_id, parent_id, kind, name, icon, color, is_system, is_archived, sort_order) VALUES (?,?,?,?,?,?,0,0,?)',
+      `INSERT INTO categories (ledger_id, parent_id, kind, name, icon, color, is_system, is_archived, sort_order) SELECT ?,?,?,?,?,?,0,0,? WHERE ${txn.activeLedgerGuard}`,
       oa.ledgerId,
       parentId,
       kind,
@@ -1208,7 +1200,9 @@ openapiRoutes.post('/categories', async (c) => {
       icon,
       color,
       sortOrder,
+      oa.ledgerId,
     );
+    if (!ins.changes) return c.json({ ok: false, error: '账本已归档，只能查阅和导出' }, 403);
     const id = Number(ins.lastInsertRowid);
     const category = await getCategoryWithPath(db, id, oa.ledgerId);
     return c.json({ ok: true, id, category }, 201);
@@ -1257,13 +1251,14 @@ async function handleCategoryUpdate(c: Context<HonoEnv>) {
     const isArchived = parseBoolFlag(body.is_archived, Number(existing.is_archived));
 
     await db.run(
-      'UPDATE categories SET name = ?, icon = ?, color = ?, sort_order = ?, is_archived = ? WHERE id = ? AND ledger_id = ? AND is_system = 0',
+      `UPDATE categories SET name = ?, icon = ?, color = ?, sort_order = ?, is_archived = ? WHERE id = ? AND ledger_id = ? AND is_system = 0 AND ${txn.activeLedgerGuard}`,
       name,
       icon,
       color,
       sortOrder,
       isArchived,
       id,
+      oa.ledgerId,
       oa.ledgerId,
     );
     const category = await getCategoryWithPath(db, id, oa.ledgerId);
@@ -1311,7 +1306,7 @@ openapiRoutes.delete('/categories/:id', async (c) => {
   if (used > 0) {
     return c.json({ ok: false, error: `该分类下还有 ${used} 笔记账，无法删除` }, 400);
   }
-  await db.run('DELETE FROM categories WHERE id = ? AND ledger_id = ? AND is_system = 0', id, oa.ledgerId);
+  await db.run(`DELETE FROM categories WHERE id = ? AND ledger_id = ? AND is_system = 0 AND ${txn.activeLedgerGuard}`, id, oa.ledgerId, oa.ledgerId);
   return c.json({ ok: true });
 });
 
@@ -1344,7 +1339,8 @@ openapiRoutes.post('/tags', async (c) => {
     const dup = await db.get<{ id: number }>('SELECT id FROM tags WHERE ledger_id = ? AND name = ?', oa.ledgerId, name);
     if (dup) return c.json({ ok: false, error: '标签名称已存在' }, 409);
     const color = body.color ? String(body.color).trim().slice(0, 20) || '#0F766E' : '#0F766E';
-    const ins = await db.run('INSERT INTO tags (ledger_id, name, color) VALUES (?,?,?)', oa.ledgerId, name, color);
+    const ins = await db.run(`INSERT INTO tags (ledger_id, name, color) SELECT ?,?,? WHERE ${txn.activeLedgerGuard}`, oa.ledgerId, name, color, oa.ledgerId);
+    if (!ins.changes) return c.json({ ok: false, error: '账本已归档，只能查阅和导出' }, 403);
     const id = Number(ins.lastInsertRowid);
     const tag = await db.get<fd.TagWithCount>(TAG_SELECT, id, oa.ledgerId);
     return c.json({ ok: true, id, tag }, 201);
@@ -1381,7 +1377,7 @@ async function handleTagUpdate(c: Context<HonoEnv>) {
     }
     const color =
       body.color !== undefined ? String(body.color || '').trim().slice(0, 20) || existing.color : existing.color;
-    await db.run('UPDATE tags SET name = ?, color = ? WHERE id = ? AND ledger_id = ?', name, color, id, oa.ledgerId);
+    await db.run(`UPDATE tags SET name = ?, color = ? WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, name, color, id, oa.ledgerId, oa.ledgerId);
     const tag = await db.get<fd.TagWithCount>(TAG_SELECT, id, oa.ledgerId);
     return c.json({ ok: true, id, tag });
   } catch (e) {
@@ -1401,10 +1397,11 @@ openapiRoutes.delete('/tags/:id', async (c) => {
   if (!id) return c.json({ ok: false, error: '标签不存在' }, 404);
   const existing = await db.get<{ id: number }>('SELECT id FROM tags WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
   if (!existing) return c.json({ ok: false, error: '标签不存在' }, 404);
-  await db.batch([
-    ['DELETE FROM transaction_tags WHERE tag_id = ?', [id]],
-    ['DELETE FROM tags WHERE id = ? AND ledger_id = ?', [id, oa.ledgerId]],
+  const [, deleted] = await db.batch([
+    [`DELETE FROM transaction_tags WHERE tag_id = ? AND ${txn.activeLedgerGuard}`, [id, oa.ledgerId]],
+    [`DELETE FROM tags WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, [id, oa.ledgerId, oa.ledgerId]],
   ]);
+  if (!deleted.meta.changes) return c.json({ ok: false, error: '标签不存在或账本已归档' }, 409);
   return c.json({ ok: true });
 });
 
@@ -1615,6 +1612,7 @@ openapiRoutes.get('/reports', async (c) => {
 });
 
 registerPlanningOpenApi(openapiRoutes);
+registerRolloverOpenApi(openapiRoutes);
 
 openapiRoutes.get('/export', async (c) => {
   const oa = c.get('openAuth')!;

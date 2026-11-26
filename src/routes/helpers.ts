@@ -161,9 +161,17 @@ export function requireLedger(c: AppCtx): Response | null {
   return null;
 }
 
+export function archivedLedgerResponse(c: AppCtx): Response {
+  const message = '账本已归档，只能查阅和导出';
+  return wantsJson(c)
+    ? c.json({ ok: false, error: message }, 403)
+    : c.html(`<h1>归档账本只读</h1><p>${message}</p>`, 403);
+}
+
 export function requireWrite(c: AppCtx): Response | null {
   const r = requireLedger(c);
   if (r) return r;
+  if (c.get('ctx').ledger?.is_archived) return archivedLedgerResponse(c);
   if (!canWrite(c.get('ctx').ledger?.role)) {
     if (wantsJson(c)) return c.json({ ok: false, error: '只读权限，无法修改' }, 403);
     return c.html('<h1>只读权限</h1><p>你在该账本中只有只读权限，无法进行此操作</p>', 403);
@@ -174,6 +182,7 @@ export function requireWrite(c: AppCtx): Response | null {
 export function requireManage(c: AppCtx): Response | null {
   const r = requireLedger(c);
   if (r) return r;
+  if (c.get('ctx').ledger?.is_archived) return archivedLedgerResponse(c);
   if (!canManage(c.get('ctx').ledger?.role)) {
     return c.html('<h1>权限不足</h1><p>需要账本管理员及以上权限</p>', 403);
   }

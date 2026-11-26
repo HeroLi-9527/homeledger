@@ -1,4 +1,4 @@
-import { canWrite } from '../lib/auth.js';
+import { canWriteLedger } from '../lib/auth.js';
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { nowStr, todayStr } from '../db.js';
@@ -575,7 +575,7 @@ aiRoutes.get('/attachments', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: attachmentsPage({ writable: canWrite(ctx.ledger.role), rows, page: curPage, total, totalPages, csrf: c.get('csrf') || '' }),
+      body: attachmentsPage({ writable: canWriteLedger(ctx.ledger), rows, page: curPage, total, totalPages, csrf: c.get('csrf') || '' }),
     }),
   );
 });

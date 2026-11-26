@@ -1,0 +1,3 @@
+ALTER TABLE ledgers ADD COLUMN rollover_year INTEGER;
+ALTER TABLE ledgers ADD COLUMN rolled_over_to_id INTEGER;
+ALTER TABLE debts ADD COLUMN opening_cents INTEGER NOT NULL DEFAULT 0;

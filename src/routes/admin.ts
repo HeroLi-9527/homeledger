@@ -42,6 +42,7 @@ import type { AccountRow, BatchStatement, HonoEnv, LedgerRow, Role, UserRow } fr
 import { membersPage, settingsPage } from '../views/admin.js';
 import { layout, simpleTable } from '../views/layout.js';
 import {
+  archivedLedgerResponse,
   bodyOf,
   dbOf,
   envOf,
@@ -452,11 +453,12 @@ adminRoutes.get('/ledgers', async (c) => {
     note: string | null;
     is_archived: number;
     role: string;
+    rolled_over_to_id: number | null;
     txn_cnt: number;
     member_cnt: number;
     acc_cnt: number;
   }>(
-    `SELECT l.id, l.name, l.kind, l.currency, l.icon, l.color, l.note, l.is_archived, m.role,
+    `SELECT l.id, l.name, l.kind, l.currency, l.icon, l.color, l.note, l.is_archived, l.rolled_over_to_id, m.role,
             (SELECT COUNT(*) FROM transactions t WHERE t.ledger_id = l.id AND t.deleted_at IS NULL) AS txn_cnt,
             (SELECT COUNT(*) FROM ledger_members lm WHERE lm.ledger_id = l.id) AS member_cnt,
             (SELECT COUNT(*) FROM accounts a WHERE a.ledger_id = l.id AND a.is_archived = 0) AS acc_cnt
@@ -479,8 +481,10 @@ adminRoutes.get('/ledgers', async (c) => {
   <td>${esc(auth.ROLE_LABEL[l.role as Role] || l.role)}</td>
   <td><div class="row wrap">
     <form method="post" action="/ledgers/switch" style="display:inline">${csrfInput}<input type="hidden" name="ledger_id" value="${l.id}"><button class="btn btn-sm" type="submit">切换</button></form>
-    ${auth.canManage(l.role) ? `<a class="btn btn-sm" href="/ledgers/${l.id}/edit">编辑</a>` : ''}
-    ${l.role === 'owner' ? `<form method="post" action="/ledgers/${l.id}/archive" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">${l.is_archived ? '取消归档' : '归档'}</button></form>` : ''}
+    ${!l.is_archived && auth.canManage(l.role) ? `<a class="btn btn-sm" href="/ledgers/${l.id}/edit">编辑</a>` : ''}
+    ${l.role === 'owner' && !l.is_archived ? `<a class="btn btn-sm" href="/ledgers/${l.id}/rollover">年度结转</a>` : ''}
+    ${l.role === 'owner' && l.is_archived ? `<a class="btn btn-sm" href="/ledgers/${l.id}/edit">账本管理</a>` : ''}
+    ${l.role === 'owner' && !l.rolled_over_to_id ? `<form method="post" action="/ledgers/${l.id}/archive" style="display:inline">${csrfInput}<button class="btn btn-sm" type="submit">${l.is_archived ? '取消归档' : '归档'}</button></form>` : ''}
   </div></td>
 </tr>`,
     )
@@ -598,7 +602,7 @@ adminRoutes.get('/ledgers/:id/edit', async (c) => {
   const id = Number(c.req.param('id'));
   const m = await auth.membership(db, ctx.user!.id, id);
   const ledger = await db.get<LedgerRow>('SELECT * FROM ledgers WHERE id = ?', id);
-  if (!ledger || !m || !auth.canManage(m.role)) {
+  if (!ledger || !m || !auth.canManage(m.role) || (ledger.is_archived && m.role !== 'owner')) {
     setFlash(c, 'error', '无权编辑该账本');
     return c.redirect('/ledgers');
   }
@@ -615,7 +619,7 @@ adminRoutes.get('/ledgers/:id/edit', async (c) => {
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
       body: `<div class="grid grid-2">
-  <div class="card">
+  ${ledger.is_archived ? '<div class="notice warn">归档账本只读，可切换到账本查阅或导出。</div>' : `  <div class="card">
     <div class="card-head"><b>编辑账本信息</b><a class="btn btn-sm" href="/ledgers">← 返回账本列表</a></div>
     <form method="post" action="/ledgers/${ledger.id}">
       ${csrfInput}
@@ -631,7 +635,7 @@ adminRoutes.get('/ledgers/:id/edit', async (c) => {
       <div class="field"><label>备注（可选）</label><input name="note" value="${esc(ledger.note || '')}" maxlength="200"></div>
       <button class="btn btn-primary" type="submit">保存账本信息</button>
     </form>
-  </div>
+  </div>`}
   ${
     m.role === 'owner'
       ? `<div class="card">
@@ -665,6 +669,7 @@ adminRoutes.post('/ledgers/:id', async (c) => {
     setFlash(c, 'error', '账本不存在');
     return c.redirect('/ledgers');
   }
+  if (ledger.is_archived) return archivedLedgerResponse(c);
   const body = await bodyOf(c);
   const name = String(body.name || '').trim().slice(0, 30);
   if (!name) {
@@ -679,8 +684,8 @@ adminRoutes.post('/ledgers/:id', async (c) => {
   const colorRaw = String(body.color || '').trim();
   const color = body.color !== undefined && HEX_COLOR_RE.test(colorRaw) ? colorRaw.toLowerCase() : ledger.color || '#4f7cff';
   const note = body.note !== undefined ? String(body.note).trim().slice(0, 200) || null : ledger.note;
-  await db.run(
-    'UPDATE ledgers SET name = ?, icon = ?, kind = ?, color = ?, note = ? WHERE id = ?',
+  const updated = await db.run(
+    'UPDATE ledgers SET name = ?, icon = ?, kind = ?, color = ?, note = ? WHERE id = ? AND is_archived = 0',
     name,
     icon,
     kind,
@@ -688,6 +693,7 @@ adminRoutes.post('/ledgers/:id', async (c) => {
     note,
     id,
   );
+  if (!updated.changes) return archivedLedgerResponse(c);
   setFlash(c, 'success', '账本已更新');
   return c.redirect('/ledgers');
 });
@@ -702,8 +708,8 @@ adminRoutes.post('/ledgers/:id/archive', async (c) => {
     setFlash(c, 'error', '仅账本所有者可归档');
     return c.redirect('/ledgers');
   }
-  const row = await db.get<{ is_archived: number }>('SELECT is_archived FROM ledgers WHERE id = ?', id);
-  if (row) await db.run('UPDATE ledgers SET is_archived = ? WHERE id = ?', row.is_archived ? 0 : 1, id);
+  const result = await db.run('UPDATE ledgers SET is_archived = 1 - is_archived WHERE id = ? AND rolled_over_to_id IS NULL', id);
+  if (!result.changes) return archivedLedgerResponse(c);
   return c.redirect('/ledgers');
 });
 
@@ -786,7 +792,7 @@ adminRoutes.post('/ledgers/:id/delete', async (c) => {
   if (Number(ctx.ledger?.id) === id) {
     const nextLedger = await db.get<{ id: number }>(
       `SELECT l.id FROM ledgers l JOIN ledger_members lm ON lm.ledger_id = l.id
-       WHERE lm.user_id = ? AND l.is_archived = 0 ORDER BY l.sort_order, l.id LIMIT 1`,
+       WHERE lm.user_id = ? ORDER BY l.is_archived, l.sort_order, l.id LIMIT 1`,
       ctx.user!.id,
     );
     const sess = c.get('sess');
@@ -862,6 +868,7 @@ adminRoutes.get('/members', async (c) => {
 adminRoutes.post('/members/:id/nickname', async (c) => {
   const r = requireLedger(c);
   if (r) return r;
+  if (c.get('ctx').ledger?.is_archived) return archivedLedgerResponse(c);
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const ledgerId = Number(ctx.ledger!.id);
@@ -881,7 +888,8 @@ adminRoutes.post('/members/:id/nickname', async (c) => {
   }
   const body = await bodyOf(c);
   const nickname = String(body.nickname || '').trim().slice(0, 24) || null;
-  await db.run('UPDATE ledger_members SET nickname = ? WHERE id = ? AND ledger_id = ?', nickname, mid, ledgerId);
+  const updated = await db.run(`UPDATE ledger_members SET nickname = ? WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, nickname, mid, ledgerId, ledgerId);
+  if (!updated.changes) return archivedLedgerResponse(c);
   setFlash(c, 'success', nickname ? `账本昵称已更新为「${nickname}」` : '账本昵称已清空');
   return c.redirect('/members');
 });
@@ -896,15 +904,17 @@ adminRoutes.post('/members/invite', async (c) => {
   const days = Math.max(1, Math.min(30, Number(body.days) || 7));
   const code = u.uid(12);
   const expiresAt = u.addDays(todayStr(), days);
-  await db.run(
-    'INSERT INTO ledger_invites (ledger_id, code, role, created_by, expires_at, created_at) VALUES (?,?,?,?,?,?)',
+  const created = await db.run(
+    `INSERT INTO ledger_invites (ledger_id, code, role, created_by, expires_at, created_at) SELECT ?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
     Number(ctx.ledger!.id),
     code,
     role,
     ctx.user!.id,
     expiresAt,
     nowStr(),
+    Number(ctx.ledger!.id),
   );
+  if (!created.changes) return archivedLedgerResponse(c);
   setFlash(c, 'success', `已生成邀请链接：/join/${code}`);
   return c.redirect('/members');
 });
@@ -913,8 +923,9 @@ adminRoutes.post('/members/invites/:id/revoke', async (c) => {
   const r = requireManage(c);
   if (r) return r;
   await dbOf(c).run(
-    'DELETE FROM ledger_invites WHERE id = ? AND ledger_id = ?',
+    `DELETE FROM ledger_invites WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
     Number(c.req.param('id')),
+    Number(c.get('ctx').ledger!.id),
     Number(c.get('ctx').ledger!.id),
   );
   setFlash(c, 'success', '邀请码已吊销');
@@ -941,7 +952,8 @@ adminRoutes.post('/members/:id', async (c) => {
     setFlash(c, 'error', '无效角色');
     return c.redirect('/members');
   }
-  await db.run('UPDATE ledger_members SET role = ? WHERE id = ?', role, mid);
+  const updated = await db.run(`UPDATE ledger_members SET role = ? WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, role, mid, ledgerId, ledgerId);
+  if (!updated.changes) return archivedLedgerResponse(c);
   setFlash(c, 'success', '成员角色已更新');
   return c.redirect('/members');
 });
@@ -961,7 +973,8 @@ adminRoutes.post('/members/:id/remove', async (c) => {
     setFlash(c, 'error', '不能移除自己或账本所有者');
     return c.redirect('/members');
   }
-  await db.run('DELETE FROM ledger_members WHERE id = ?', mid);
+  const removed = await db.run(`DELETE FROM ledger_members WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, mid, ledgerId, ledgerId);
+  if (!removed.changes) return archivedLedgerResponse(c);
   setFlash(c, 'success', '成员已移出');
   return c.redirect('/members');
 });
@@ -1358,7 +1371,7 @@ adminRoutes.get('/export/ledger.json', async (c) => {
     transactionTags,
     baseCurrency,
   ] = await Promise.all([
-    db.get('SELECT id, name, kind, currency, icon, color, note, is_archived, created_at FROM ledgers WHERE id = ?', ledgerId),
+    db.get('SELECT id, name, kind, currency, icon, color, note, is_archived, rollover_year, created_at FROM ledgers WHERE id = ?', ledgerId),
     db.all('SELECT * FROM accounts WHERE ledger_id = ? ORDER BY sort_order, id', ledgerId),
     db.all(
       'SELECT * FROM categories WHERE ledger_id IS NULL OR ledger_id = ? ORDER BY kind, sort_order, id',

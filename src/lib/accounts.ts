@@ -412,6 +412,7 @@ export async function deleteAccountIfUnreferenced(
   const res = await db.run(
     `DELETE FROM accounts
      WHERE id = ? AND ledger_id = ?
+       AND EXISTS (SELECT 1 FROM ledgers WHERE id = accounts.ledger_id AND is_archived = 0)
        AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.ledger_id = accounts.ledger_id AND (t.account_id = accounts.id OR t.to_account_id = accounts.id))
        AND NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.ledger_id = accounts.ledger_id AND s.account_id = accounts.id)
        AND NOT EXISTS (SELECT 1 FROM budgets b WHERE b.ledger_id = accounts.ledger_id AND b.account_id = accounts.id)

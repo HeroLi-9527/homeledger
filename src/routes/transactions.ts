@@ -100,7 +100,7 @@ txnRoutes.get('/transactions', async (c) => {
     fd.txFormData(db, ledgerId),
   ]);
   const groups = await txn.groupByDate(result.rows, db);
-  const writable = auth.canWrite(ctx.ledger.role);
+  const writable = auth.canWriteLedger(ctx.ledger);
   const filterQuery: Record<string, string | number | undefined> = {
     type: f.type,
     kind: f.kind,
@@ -498,7 +498,7 @@ txnRoutes.get('/transactions/deleted', async (c) => {
   const db = dbOf(c);
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
-  const writable = auth.canWrite(ctx.ledger!.role);
+  const writable = auth.canWriteLedger(ctx.ledger);
   const rows = await db.all<{ id: number; txn_date: string; type: string; amount_cents: number; note: string | null; merchant: string | null; category_name: string | null; deleted_at: string; purge_started: number }>(
     `SELECT t.*, c.name AS category_name FROM transactions t
      LEFT JOIN categories c ON c.id = t.category_id

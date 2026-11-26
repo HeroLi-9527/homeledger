@@ -1,6 +1,7 @@
+import { activeLedgerGuard } from '../lib/txn.js';
 import { Hono, type Context } from 'hono';
 import { nowStr, todayStr } from '../db.js';
-import { canWrite, ledgerWriterIds, notify } from '../lib/auth.js';
+import { canWriteLedger } from '../lib/auth.js';
 import * as fd from '../lib/formdata.js';
 import * as subs from '../lib/subscriptions.js';
 import * as u from '../lib/util.js';
@@ -8,7 +9,7 @@ import { esc } from '../lib/util.js';
 import type { HonoEnv } from '../types.js';
 import { layout, simpleTable } from '../views/layout.js';
 import { subscriptionsPage } from '../views/planning.js';
-import { bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
+import { archivedLedgerResponse, bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
 import { assertAccountInLedger, assertCategoryInLedger } from './openapi-helpers.js';
 
 export const subscriptionsRoutes = new Hono<HonoEnv>();
@@ -89,7 +90,7 @@ subscriptionsRoutes.get('/subscriptions', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: subscriptionsPage({ writable: canWrite(ctx.ledger?.role), ov, accounts, cats, today: todayStr(), csrf: c.get('csrf') || '' }),
+      body: subscriptionsPage({ writable: canWriteLedger(ctx.ledger), ov, accounts, cats, today: todayStr(), csrf: c.get('csrf') || '' }),
     }),
   );
 });
@@ -125,7 +126,7 @@ async function subscriptionDetails(c: Context<HonoEnv, '/subscriptions/:id' | '/
   <td class="num amount">-${u.fmtAmount(ch.amount_base_cents)}</td>
   <td><span class="chip ${ch.status === 'pending' ? 'warn' : 'income'}">${ch.status === 'pending' ? '待确认' : '已入账'}</span></td>
   <td>${esc(ch.note || '—')}</td>
-  <td>${canWrite(ctx.ledger?.role) ? `<a class="btn btn-sm" href="/transactions/${ch.id}/edit">查看流水 →</a>` : esc(ch.id)}</td>
+  <td>${canWriteLedger(ctx.ledger) ? `<a class="btn btn-sm" href="/transactions/${ch.id}/edit">查看流水 →</a>` : esc(ch.id)}</td>
 </tr>`,
       )
       .join('') || '<tr><td colspan="5">暂无历史扣费流水</td></tr>';
@@ -181,11 +182,11 @@ subscriptionsRoutes.post('/subscriptions', async (c) => {
     if (!d.name || !d.amount_cents) throw new Error('请填写订阅名称与金额');
     if (d.account_id !== null) await assertAccountInLedger(db, ledgerId(c), d.account_id);
     if (d.category_id !== null) await assertCategoryInLedger(db, ledgerId(c), d.category_id, 'expense');
-    await db.run(
+    const inserted = await db.run(
       `INSERT INTO subscriptions (ledger_id, name, icon, plan, vendor_url, amount_cents, currency, cycle, cycle_n,
         anchor_month, anchor_day, account_id, category_id, auto_renew, trial_ends_on, next_charge_at,
         reminder_days, status, note, created_by_user_id, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${activeLedgerGuard}`,
       ledgerId(c),
       d.name,
       d.icon,
@@ -207,7 +208,9 @@ subscriptionsRoutes.post('/subscriptions', async (c) => {
       d.note,
       d.created_by_user_id,
       nowStr(),
+      ledgerId(c),
     );
+    if (!inserted.changes) return archivedLedgerResponse(c);
     setFlash(c, 'success', `订阅「${d.name}」已添加`);
   } catch (e) {
     setFlash(c, 'error', toPublicError(e));
@@ -240,7 +243,7 @@ subscriptionsRoutes.post('/subscriptions/:id', async (c) => {
     await db.run(
       `UPDATE subscriptions SET name=?, icon=?, plan=?, vendor_url=?, amount_cents=?, currency=?, cycle=?, cycle_n=?,
         anchor_month=?, anchor_day=?, account_id=?, category_id=?, auto_renew=?, trial_ends_on=?, next_charge_at=?,
-        reminder_days=?, status=?, note=? WHERE id=? AND ledger_id=?`,
+        reminder_days=?, status=?, note=? WHERE id=? AND ledger_id=? AND ${activeLedgerGuard}`,
       d.name,
       d.icon,
       d.plan,
@@ -260,6 +263,7 @@ subscriptionsRoutes.post('/subscriptions/:id', async (c) => {
       d.status,
       d.note,
       id,
+      ledgerId(c),
       ledgerId(c),
     );
     setFlash(c, 'success', '订阅已更新');
@@ -286,34 +290,14 @@ subscriptionsRoutes.post('/subscriptions/:id/charge', async (c) => {
     return c.redirect('/subscriptions');
   }
   const period = DAY_RE.test(String(body.next_charge_at || '')) ? String(body.next_charge_at) : s.next_charge_at;
-  const next = subs.advance(period, s);
-  const claim = await db.run('UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ?', next, s.id, period);
-  if (claim.changes !== 1) {
-    setFlash(c, 'error', '该期已扣费，请勿重复提交');
-    return c.redirect('/subscriptions');
-  }
   try {
-    await subs.charge(db, { ...s, next_charge_at: period }, ctx.user!.id, {
-      date: period,
-      expectedNextChargeAt: next,
-      prevLastChargeAt: s.last_charge_at ?? null,
-    });
+    const result = await subs.charge(db, s, ctx.user!.id, period);
+    if (!result) {
+      setFlash(c, 'error', '该期已扣费，请勿重复提交');
+      return c.redirect('/subscriptions');
+    }
     setFlash(c, 'success', `已扣费入账（${period}）`);
   } catch (e) {
-    const rb = await db.run('UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ?', period, s.id, next).catch(() => null);
-    if (!rb || rb.changes !== 1) {
-      const key = `sub-rollback-fail:${s.id}:${period}`;
-      for (const uid of await ledgerWriterIds(db, s.ledger_id)) {
-        await notify(db, uid, {
-          kind: 'danger',
-          ledgerId: s.ledger_id,
-          title: `订阅扣费异常：${s.name}（${period}）`,
-          body: `${period} 一期扣费失败且抢占回滚失败，请检查订阅与流水`,
-          link: '/subscriptions',
-          dedupeKey: key,
-        });
-      }
-    }
     setFlash(c, 'error', `扣费失败：${toPublicError(e)}`);
   }
   return c.redirect('/subscriptions');
@@ -328,7 +312,7 @@ subscriptionsRoutes.post('/subscriptions/:id/skip', async (c) => {
   if (s) {
     const period = DAY_RE.test(String(body.next_charge_at || '')) ? String(body.next_charge_at) : s.next_charge_at;
     const next = subs.advance(period, s);
-    await db.run('UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ?', next, s.id, period);
+    await db.run(`UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ? AND ${activeLedgerGuard}`, next, s.id, period, s.ledger_id);
     setFlash(c, 'success', `已跳过本期，下次扣费顺延至 ${next}`);
   }
   return c.redirect('/subscriptions');
@@ -353,11 +337,12 @@ subscriptionsRoutes.post('/subscriptions/:id/toggle', async (c) => {
     }
     const restoreStatus = back && s.trial_ends_on && s.trial_ends_on > todayStr() ? 'trial' : 'active';
     await db.run(
-      'UPDATE subscriptions SET status = ?, next_charge_at = ?, canceled_at = ? WHERE id = ?',
+      `UPDATE subscriptions SET status = ?, next_charge_at = ?, canceled_at = ? WHERE id = ? AND ${activeLedgerGuard}`,
       back ? restoreStatus : 'paused',
       next,
       back ? null : s.canceled_at,
       s.id,
+      s.ledger_id,
     );
   }
   return c.redirect('/subscriptions');
@@ -367,9 +352,10 @@ subscriptionsRoutes.post('/subscriptions/:id/cancel', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
   await dbOf(c).run(
-    "UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE id = ? AND ledger_id = ?",
+    `UPDATE subscriptions SET status = 'canceled', canceled_at = ? WHERE id = ? AND ledger_id = ? AND ${activeLedgerGuard}`,
     nowStr(),
     Number(c.req.param('id')),
+    ledgerId(c),
     ledgerId(c),
   );
   return c.redirect('/subscriptions');
@@ -379,8 +365,9 @@ subscriptionsRoutes.post('/subscriptions/:id/delete', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
   const res = await dbOf(c).run(
-    'DELETE FROM subscriptions WHERE id = ? AND ledger_id = ?',
+    `DELETE FROM subscriptions WHERE id = ? AND ledger_id = ? AND ${activeLedgerGuard}`,
     Number(c.req.param('id')),
+    ledgerId(c),
     ledgerId(c),
   );
   setFlash(c, res.changes ? 'success' : 'error', res.changes ? '订阅已删除（历史扣费流水已保留）' : '订阅不存在');

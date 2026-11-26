@@ -7,7 +7,7 @@ import {
   budgetPeriodRange,
   budgetUsedInRange,
   effectiveBudget,
-  recurringPostStmts,
+  postRecurringPeriod,
   ruleBadAccount,
   tzRefDate,
   type BudgetRow,
@@ -69,6 +69,7 @@ interface DebtRow {
   counterparty: string;
   principal_cents: number;
   balance_cents: number;
+  opening_cents: number;
   currency: string;
   account_id: number | null;
   due_date: string | null;
@@ -503,16 +504,17 @@ async function handleCreateDebt(c: Context<HonoEnv>) {
       });
       if (dueDate) {
         await db.run(
-          'UPDATE debts SET due_date = ? WHERE ledger_id = ? AND direction = ? AND counterparty = ? AND note = ?',
+          `UPDATE debts SET due_date = ? WHERE ledger_id = ? AND direction = ? AND counterparty = ? AND opening_cents = 0 AND note = ? AND ${txn.activeLedgerGuard}`,
           dueDate,
           oa.ledgerId,
           direction,
           counterparty,
           AUTO_DEBT_NOTE,
+          oa.ledgerId,
         );
       }
       const debt = await db.get<DebtRow>(
-        'SELECT * FROM debts WHERE ledger_id = ? AND direction = ? AND counterparty = ? AND note = ? ORDER BY id DESC LIMIT 1',
+        'SELECT * FROM debts WHERE ledger_id = ? AND direction = ? AND counterparty = ? AND opening_cents = 0 AND note = ? ORDER BY id DESC LIMIT 1',
         oa.ledgerId,
         direction,
         counterparty,
@@ -535,7 +537,7 @@ async function handleCreateDebt(c: Context<HonoEnv>) {
 
     const ins = await db.run(
       `INSERT INTO debts (ledger_id, direction, counterparty, principal_cents, balance_cents, currency, account_id, due_date, status, note, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+       SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
       oa.ledgerId,
       direction,
       counterparty,
@@ -547,7 +549,9 @@ async function handleCreateDebt(c: Context<HonoEnv>) {
       status,
       rawNote,
       nowStr(),
+      oa.ledgerId,
     );
+    if (!ins.changes) return c.json({ ok: false, error: '账本已归档，只能查阅和导出' }, 403);
     const id = Number(ins.lastInsertRowid);
     const debt = await db.get<DebtRow>('SELECT * FROM debts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
     return c.json({ ok: true, id, debt }, 201);
@@ -569,13 +573,13 @@ async function handleUpdateDebt(c: Context<HonoEnv>) {
 
   try {
     const body = await readJsonObject(c);
-    if (existing.note === AUTO_DEBT_NOTE) {
+    if (existing.opening_cents > 0 || existing.note === AUTO_DEBT_NOTE) {
       const touchesProtected = DEBT_PROTECTED_KEYS.some((k) => k in body && body[k] !== undefined);
       if (touchesProtected) {
-        return c.json({ ok: false, error: '自动汇总借贷由流水派生，仅允许修改 due_date（到期日）' }, 400);
+        return c.json({ ok: false, error: '期初或自动汇总借贷仅允许修改 due_date（到期日）' }, 400);
       }
       const dueDate = parseOptionalDate(body.due_date, existing.due_date, '到期日');
-      await db.run('UPDATE debts SET due_date = ? WHERE id = ? AND ledger_id = ?', dueDate, id, oa.ledgerId);
+      await db.run(`UPDATE debts SET due_date = ? WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, dueDate, id, oa.ledgerId, oa.ledgerId);
       const debt = await db.get<DebtRow>('SELECT * FROM debts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
       return c.json({ ok: true, id, debt });
     }
@@ -622,12 +626,14 @@ async function handleUpdateDebt(c: Context<HonoEnv>) {
 
     await db.run(
       `UPDATE debts
-       SET direction = ?, counterparty = ?, principal_cents = ?, balance_cents = ?, currency = ?,
+       SET direction = ?, counterparty = ?, principal_cents = ?,
+           manual_balance_cents = manual_balance_cents + ? - balance_cents, balance_cents = ?, currency = ?,
            account_id = ?, due_date = ?, status = ?, note = ?
-       WHERE id = ? AND ledger_id = ?`,
+       WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
       direction,
       counterparty,
       principal,
+      balance,
       balance,
       currency,
       accountId,
@@ -635,6 +641,7 @@ async function handleUpdateDebt(c: Context<HonoEnv>) {
       status,
       note,
       id,
+      oa.ledgerId,
       oa.ledgerId,
     );
     const debt = await db.get<DebtRow>('SELECT * FROM debts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
@@ -654,10 +661,10 @@ async function handleDeleteDebt(c: Context<HonoEnv>) {
 
   const existing = await db.get<DebtRow>('SELECT * FROM debts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
   if (!existing) return c.json({ ok: false, error: '借贷记录不存在' }, 404);
-  if (existing.note === AUTO_DEBT_NOTE) {
-    return c.json({ ok: false, error: '自动汇总借贷不可直接删除，请删除对应借出/借入流水' }, 400);
+  if (existing.opening_cents > 0 || existing.note === AUTO_DEBT_NOTE) {
+    return c.json({ ok: false, error: '期初或自动汇总借贷不能直接删除' }, 400);
   }
-  await db.run('DELETE FROM debts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+  await db.run(`DELETE FROM debts WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, id, oa.ledgerId, oa.ledgerId);
   return c.json({ ok: true });
 }
 
@@ -689,37 +696,19 @@ async function handleSettleDebt(c: Context<HonoEnv>) {
         ? String(body.note).trim().slice(0, 300)
         : `${existing.direction === 'receivable' ? '收回借款 · ' : '偿还借款 · '}${existing.counterparty}`;
 
-    const txnId = await txn.createTransaction(db, oa.ledgerId, oa.userId, {
-      type: existing.direction === 'receivable' ? 'repay_receive' : 'repay_pay',
+    const txnId = await txn.settleDebt(db, oa.ledgerId, oa.userId, existing, {
       amount_cents: settleAmt,
       account_id: accountId,
       txn_date: txnDate,
-      merchant: existing.counterparty,
       note,
       source: 'openapi',
     });
-
-    let debt: DebtRow | undefined;
-    if (existing.note === AUTO_DEBT_NOTE) {
-      debt = await db.get<DebtRow>(
-        'SELECT * FROM debts WHERE ledger_id = ? AND direction = ? AND counterparty = ? AND note = ? ORDER BY id DESC LIMIT 1',
-        oa.ledgerId,
-        existing.direction,
-        existing.counterparty,
-        AUTO_DEBT_NOTE,
-      );
-    } else {
-      const newBalance = Math.max(0, Number(existing.balance_cents) - settleAmt);
-      await db.run(
-        'UPDATE debts SET balance_cents = ?, status = ? WHERE id = ? AND ledger_id = ?',
-        newBalance,
-        newBalance <= 0 ? 'closed' : 'open',
-        id,
-        oa.ledgerId,
-      );
-      debt = await db.get<DebtRow>('SELECT * FROM debts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
-    }
-
+    const debt = existing.opening_cents === 0 && existing.note === AUTO_DEBT_NOTE
+      ? await db.get<DebtRow>(
+        'SELECT * FROM debts WHERE ledger_id = ? AND direction = ? AND counterparty = ? AND opening_cents = 0 AND note = ? ORDER BY id DESC LIMIT 1',
+        oa.ledgerId, existing.direction, existing.counterparty, AUTO_DEBT_NOTE,
+      )
+      : await db.get<DebtRow>('SELECT * FROM debts WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
     return c.json({ ok: true, settled_cents: settleAmt, transaction_id: txnId, debt: debt || null });
   } catch (e) {
     return c.json({ ok: false, error: toPublicError(e) }, 400);
@@ -764,7 +753,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
       const res = await db.run(
         `INSERT INTO budgets (ledger_id, name, scope, category_id, account_id, period, amount_cents, currency,
           trigger_type, rollover, alert_pct, start_date, end_date, is_active, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
         oa.ledgerId,
         d.name,
         d.scope,
@@ -780,7 +769,9 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         d.end_date,
         d.is_active,
         nowStr(),
+        oa.ledgerId,
       );
+      if (!res.changes) return c.json({ ok: false, error: '账本已归档，只能查阅和导出' }, 403);
       const id = Number(res.lastInsertRowid);
       const created = await db.get<BudgetRow>('SELECT * FROM budgets WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
       return c.json({ ok: true, id, budget: created ? await enrichBudget(db, created, tzRefDate()) : null }, 201);
@@ -805,7 +796,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         `UPDATE budgets
          SET name = ?, scope = ?, category_id = ?, account_id = ?, period = ?, amount_cents = ?, currency = ?,
              trigger_type = ?, rollover = ?, alert_pct = ?, start_date = ?, end_date = ?, is_active = ?
-         WHERE id = ? AND ledger_id = ?`,
+         WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
         d.name,
         d.scope,
         d.category_id,
@@ -820,6 +811,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         d.end_date,
         d.is_active,
         id,
+        oa.ledgerId,
         oa.ledgerId,
       );
       const updated = await db.get<BudgetRow>('SELECT * FROM budgets WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
@@ -838,7 +830,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
     const oa = c.get('openAuth')!;
     const id = parsePositiveIntId(c.req.param('id'));
     if (!id) return c.json({ ok: false, error: '预算不存在' }, 404);
-    const res = await dbOf(c).run('DELETE FROM budgets WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+    const res = await dbOf(c).run(`DELETE FROM budgets WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, id, oa.ledgerId, oa.ledgerId);
     if (res.changes !== 1) return c.json({ ok: false, error: '预算不存在' }, 404);
     return c.json({ ok: true });
   });
@@ -904,7 +896,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
       const res = await db.run(
         `INSERT INTO recurring_rules
          (ledger_id, name, payload, frequency, interval_n, day_of_month, weekday, next_run_at, auto_post, is_active, created_by_user_id, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+         SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
         oa.ledgerId,
         name,
         JSON.stringify({ items, user_id: oa.userId }),
@@ -917,7 +909,9 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         isActive,
         oa.userId,
         nowStr(),
+        oa.ledgerId,
       );
+      if (!res.changes) return c.json({ ok: false, error: '账本已归档，只能查阅和导出' }, 403);
       const id = Number(res.lastInsertRowid);
       const created = await db.get<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
       return c.json({ ok: true, id, recurring: created ? decorateRecurring(created) : null }, 201);
@@ -1002,7 +996,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
       await db.run(
         `UPDATE recurring_rules
          SET name = ?, payload = ?, frequency = ?, interval_n = ?, day_of_month = ?, weekday = ?, next_run_at = ?, auto_post = ?, is_active = ?
-         WHERE id = ? AND ledger_id = ?`,
+         WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
         name,
         payload,
         frequency,
@@ -1013,6 +1007,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         autoPost,
         isActive,
         id,
+        oa.ledgerId,
         oa.ledgerId,
       );
       const updated = await db.get<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
@@ -1031,7 +1026,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
     const oa = c.get('openAuth')!;
     const id = parsePositiveIntId(c.req.param('id'));
     if (!id) return c.json({ ok: false, error: '周期账单不存在' }, 404);
-    const res = await dbOf(c).run('DELETE FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+    const res = await dbOf(c).run(`DELETE FROM recurring_rules WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, id, oa.ledgerId, oa.ledgerId);
     if (res.changes !== 1) return c.json({ ok: false, error: '周期账单不存在' }, 404);
     return c.json({ ok: true });
   });
@@ -1046,29 +1041,12 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
     if (bad) return { status: 400, data: { ok: false, error: bad } };
 
     const period = parseOptionalDate(body.next_run_at, rule.next_run_at, '执行期次') || rule.next_run_at;
-    const runDate = parseOptionalDate(body.txn_date ?? body.date, todayStr(), '入账日期') || todayStr();
-    const { stmts, created } = await recurringPostStmts(db, rule, runDate);
-    const next = advanceDate(period, rule);
-
-    const claim = await db.run(
-      'UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND ledger_id = ? AND next_run_at = ?',
-      next,
-      rule.id,
-      oa.ledgerId,
-      period,
-    );
-    if (claim.changes !== 1) {
+    const today = todayStr();
+    const defaultDate = period < today ? period : today;
+    const runDate = parseOptionalDate(body.txn_date ?? body.date, defaultDate, '入账日期') || defaultDate;
+    const result = await postRecurringPeriod(db, rule, period, runDate);
+    if (!result) {
       return { status: 409, data: { ok: false, error: '该期已执行，请勿重复提交' } };
-    }
-
-    try {
-      stmts.push(['UPDATE recurring_rules SET last_run_at = ? WHERE id = ?', [nowStr(), rule.id]]);
-      await db.batch(stmts);
-    } catch (e) {
-      await db
-        .run('UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND next_run_at = ?', period, rule.id, next)
-        .catch(() => {});
-      throw e;
     }
 
     const updated = await db.get<RecurringRuleRow>(
@@ -1080,8 +1058,8 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
       status: 200,
       data: {
         ok: true,
-        created,
-        next_run_at: next,
+        created: result.created,
+        next_run_at: result.next,
         recurring: updated ? decorateRecurring(updated) : null,
       },
     };
@@ -1106,51 +1084,16 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
       return { status: 400, data: { ok: false, error: '扣费账户不存在或已归档，请先在订阅设置里更换账户' } };
     }
     const period = parseOptionalDate(body.next_charge_at, s.next_charge_at, '扣费日期') || s.next_charge_at;
-    const next = subs.advance(period, s);
-    const claim = await db.run(
-      'UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND ledger_id = ? AND next_charge_at = ?',
-      next,
-      s.id,
-      oa.ledgerId,
-      period,
-    );
-    if (claim.changes !== 1) {
-      return { status: 409, data: { ok: false, error: '该期已扣费，请勿重复提交' } };
-    }
-    let txnId: number | null;
-    try {
-      txnId = await subs.charge(db, { ...s, next_charge_at: period }, oa.userId, {
-        date: period,
-        expectedNextChargeAt: next,
-        prevLastChargeAt: s.last_charge_at ?? null,
-      });
-    } catch (e) {
-      const rb = await db
-        .run('UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ?', period, s.id, next)
-        .catch(() => null);
-      if (!rb || rb.changes !== 1) {
-        const key = `sub-rollback-fail:${s.id}:${period}`;
-        for (const uid of await ledgerWriterIds(db, s.ledger_id)) {
-          await notify(db, uid, {
-            kind: 'danger',
-            ledgerId: s.ledger_id,
-            title: `订阅扣费异常：${s.name}（${period}）`,
-            body: `${period} 一期扣费失败且抢占回滚失败，请检查订阅与流水`,
-            link: '/subscriptions',
-            dedupeKey: key,
-          });
-        }
-      }
-      throw e;
-    }
+    const result = await subs.charge(db, s, oa.userId, period);
+    if (!result) return { status: 409, data: { ok: false, error: '该期已扣费，请勿重复提交' } };
     const subscription = await getDecoratedSub(db, s.id, oa.ledgerId);
     return {
       status: 200,
       data: {
         ok: true,
-        transaction_id: txnId,
+        transaction_id: result.transactionId,
         charged_date: period,
-        next_charge_at: next,
+        next_charge_at: result.next,
         subscription,
       },
     };
@@ -1283,7 +1226,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         `INSERT INTO subscriptions (ledger_id, name, icon, plan, vendor_url, amount_cents, currency, cycle, cycle_n,
           anchor_month, anchor_day, account_id, category_id, auto_renew, trial_ends_on, next_charge_at,
           reminder_days, status, note, created_by_user_id, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
         oa.ledgerId,
         d.name,
         d.icon,
@@ -1305,7 +1248,9 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         d.note,
         oa.userId,
         nowStr(),
+        oa.ledgerId,
       );
+      if (!res.changes) return c.json({ ok: false, error: '账本已归档，只能查阅和导出' }, 403);
       const id = Number(res.lastInsertRowid);
       const subscription = await getDecoratedSub(db, id, oa.ledgerId);
       return c.json({ ok: true, id, subscription }, 201);
@@ -1335,7 +1280,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
          SET name = ?, icon = ?, plan = ?, vendor_url = ?, amount_cents = ?, currency = ?, cycle = ?, cycle_n = ?,
              anchor_month = ?, anchor_day = ?, account_id = ?, category_id = ?, auto_renew = ?, trial_ends_on = ?,
              next_charge_at = ?, reminder_days = ?, status = ?, note = ?, canceled_at = ?
-         WHERE id = ? AND ledger_id = ?`,
+         WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
         d.name,
         d.icon,
         d.plan,
@@ -1357,6 +1302,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         d.canceled_at,
         id,
         oa.ledgerId,
+        oa.ledgerId,
       );
       const subscription = await getDecoratedSub(db, id, oa.ledgerId);
       return c.json({ ok: true, id, subscription });
@@ -1374,7 +1320,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
     const oa = c.get('openAuth')!;
     const id = parsePositiveIntId(c.req.param('id'));
     if (!id) return c.json({ ok: false, error: '订阅不存在' }, 404);
-    const res = await dbOf(c).run('DELETE FROM subscriptions WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+    const res = await dbOf(c).run(`DELETE FROM subscriptions WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, id, oa.ledgerId, oa.ledgerId);
     if (res.changes !== 1) return c.json({ ok: false, error: '订阅不存在' }, 404);
     return c.json({ ok: true });
   });
@@ -1419,11 +1365,12 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
       const period = parseOptionalDate(body.next_charge_at, s.next_charge_at, '跳过日期') || s.next_charge_at;
       const next = subs.advance(period, s);
       const claim = await db.run(
-        'UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND ledger_id = ? AND next_charge_at = ?',
+        `UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND ledger_id = ? AND next_charge_at = ? AND ${txn.activeLedgerGuard}`,
         next,
         s.id,
         oa.ledgerId,
         period,
+        oa.ledgerId,
       );
       if (claim.changes !== 1) {
         return c.json({ ok: false, error: '该期已处理或下次扣费日已变更，请刷新后重试' }, 409);
@@ -1508,7 +1455,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
 
       const ins = await db.run(
         `INSERT INTO goals (ledger_id, name, icon, target_cents, saved_cents, account_id, target_date, status, note, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+         SELECT ?,?,?,?,?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
         oa.ledgerId,
         name,
         icon,
@@ -1519,7 +1466,9 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         status,
         note,
         nowStr(),
+        oa.ledgerId,
       );
+      if (!ins.changes) return c.json({ ok: false, error: '账本已归档，只能查阅和导出' }, 403);
       const id = Number(ins.lastInsertRowid);
       const goal = await db.get<GoalRow>('SELECT * FROM goals WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
       return c.json({ ok: true, id, goal }, 201);
@@ -1568,7 +1517,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
       await db.run(
         `UPDATE goals
          SET name = ?, icon = ?, target_cents = ?, saved_cents = ?, account_id = ?, target_date = ?, status = ?, note = ?
-         WHERE id = ? AND ledger_id = ?`,
+         WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
         name,
         icon,
         target,
@@ -1578,6 +1527,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
         status,
         note,
         id,
+        oa.ledgerId,
         oa.ledgerId,
       );
       const goal = await db.get<GoalRow>('SELECT * FROM goals WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
@@ -1596,7 +1546,7 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
     const oa = c.get('openAuth')!;
     const id = parsePositiveIntId(c.req.param('id'));
     if (!id) return c.json({ ok: false, error: '储蓄目标不存在' }, 404);
-    const res = await dbOf(c).run('DELETE FROM goals WHERE id = ? AND ledger_id = ?', id, oa.ledgerId);
+    const res = await dbOf(c).run(`DELETE FROM goals WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, id, oa.ledgerId, oa.ledgerId);
     if (res.changes !== 1) return c.json({ ok: false, error: '储蓄目标不存在' }, 404);
     return c.json({ ok: true });
   });
@@ -1635,12 +1585,13 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
       const done = Number(g.target_cents) > 0 && saved >= Number(g.target_cents);
       const nextStatus = done ? 'completed' : 'active';
       const claim = await db.run(
-        'UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ? AND saved_cents = ?',
+        `UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ? AND saved_cents = ? AND ${txn.activeLedgerGuard}`,
         saved,
         nextStatus,
         id,
         oa.ledgerId,
         prevSaved,
+        oa.ledgerId,
       );
       if (Number(claim.changes || 0) !== 1) {
         return c.json({ ok: false, error: '储蓄目标刚被并发更新，请重试' }, 409);
@@ -1668,10 +1619,11 @@ export function registerPlanningOpenApi(openapiRoutes: Hono<HonoEnv>): void {
               `UPDATE goals
                SET saved_cents = MAX(0, saved_cents - ?),
                    status = CASE WHEN target_cents > 0 AND MAX(0, saved_cents - ?) >= target_cents THEN 'completed' ELSE 'active' END
-               WHERE id = ? AND ledger_id = ?`,
+               WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
               amt,
               amt,
               id,
+              oa.ledgerId,
               oa.ledgerId,
             )
             .catch(() => {});

@@ -1,3 +1,4 @@
+import type { BatchStatement } from '../types.js';
 import { accountAmounts, balanceDeltaStmts, nowStr, todayStr } from '../db.js';
 import type { Db } from '../types.js';
 import { ledgerWriterIds, notify } from './auth.js';
@@ -259,93 +260,54 @@ export async function accountUsable(db: Db, accountId: number | null | undefined
   return !!row;
 }
 
-export async function charge(
-  db: Db,
-  sub: SubscriptionRow,
-  userId: number | null,
-  {
-    date = todayStr(),
-    expectedNextChargeAt = null,
-    prevLastChargeAt = undefined,
-  }: {
-    date?: string;
-    silent?: boolean;
-    expectedNextChargeAt?: string | null;
-    prevLastChargeAt?: string | null;
-  } = {},
-): Promise<number | null> {
+export async function charge(db: Db, sub: SubscriptionRow, userId: number | null, period = sub.next_charge_at) {
   const amount = Math.abs(Number(sub.amount_cents) || 0);
-  if (!amount) return null;
-  if (!(await accountUsable(db, sub.account_id, sub.ledger_id))) {
-    throw new Error('扣费账户不存在或已归档，请先在订阅设置里更换账户');
-  }
-  const label = sub.plan ? `${sub.name}（${sub.plan}）` : sub.name;
-  const currency = sub.currency || 'CNY';
-  const rate = await resolveRate(db, currency);
-  const baseCents = toBase(amount, rate);
-  const effect = { type: 'expense', amount_base_cents: baseCents, account_id: sub.account_id || null, to_account_id: null };
-  const chargeTxn = { ...effect, ...await accountAmounts(db, sub.ledger_id, { ...effect, currency, amount_cents: amount }) };
-  const expectedNext = expectedNextChargeAt || advance(date, sub);
-  const progress = await db.run(
-    'UPDATE subscriptions SET last_charge_at = ?, charge_count = charge_count + 1 WHERE id = ? AND next_charge_at = ?',
-    date,
-    Number(sub.id),
-    expectedNext,
-  );
-  if (Number(progress.changes || 0) !== 1) {
-    throw new Error('该期已被另一路扣费抢占，请勿重复提交');
-  }
+  const next = advance(period, sub);
+  const guard = `EXISTS (
+    SELECT 1 FROM subscriptions s JOIN ledgers l ON l.id = s.ledger_id WHERE s.id = ?
+      AND s.next_charge_at = ? AND s.status = ? AND s.account_id IS ? AND s.amount_cents = ?
+      AND s.auto_renew = ? AND s.currency = ? AND s.category_id IS ? AND s.trial_ends_on IS ?
+      AND s.cycle = ? AND s.cycle_n = ? AND s.anchor_day IS ? AND l.is_archived = 0
+  )`;
+  const params = [sub.id, period, sub.status, sub.account_id, sub.amount_cents, sub.auto_renew,
+    sub.currency, sub.category_id, sub.trial_ends_on, sub.cycle, sub.cycle_n, sub.anchor_day];
   const stamp = nowStr();
-  let results: D1Result[];
-  try {
-    results = await db.batch([
-      [
-        `INSERT INTO transactions
-         (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
-          user_id, txn_date, note, merchant, status, source, subscription_id, created_at, updated_at, account_amount_cents)
-         VALUES (?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?)`,
-        [
-          Number(sub.ledger_id),
-          'expense',
-          amount,
-          currency,
-          rate,
-          baseCents,
-          sub.account_id || null,
-          sub.category_id || null,
-          Number(userId) || Number(sub.created_by_user_id) || 1,
-          date,
-          `订阅扣费 · ${label}`,
-          sub.name,
-          'cleared',
-          'subscription',
-          Number(sub.id),
-          stamp,
-          stamp,
-          chargeTxn.account_amount_cents,
-        ],
-      ],
-      ...balanceDeltaStmts([[chargeTxn, 1]]),
+  const statements: BatchStatement[] = [];
+  if (amount) {
+    if (!(await accountUsable(db, sub.account_id, sub.ledger_id))) {
+      throw new Error('扣费账户不存在或已归档，请先在订阅设置里更换账户');
+    }
+    const label = sub.plan ? `${sub.name}（${sub.plan}）` : sub.name;
+    const currency = sub.currency || 'CNY';
+    const rate = await resolveRate(db, currency);
+    const baseCents = toBase(amount, rate);
+    const effect = { type: 'expense', amount_base_cents: baseCents, account_id: sub.account_id || null };
+    const chargeTxn = { ...effect, ...await accountAmounts(db, sub.ledger_id, { ...effect, currency, amount_cents: amount }) };
+    statements.push([
+      `INSERT INTO transactions
+       (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, category_id,
+        user_id, txn_date, note, merchant, status, source, subscription_id, created_at, updated_at, account_amount_cents, scheduled_period)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${guard}`,
+      [sub.ledger_id, 'expense', amount, currency, rate, baseCents, sub.account_id, sub.category_id,
+        userId || sub.created_by_user_id || 1, period, `订阅扣费 · ${label}`, sub.name, 'cleared', 'subscription',
+        sub.id, stamp, stamp, chargeTxn.account_amount_cents, period, ...params],
     ]);
-  } catch (e) {
-    const prevLast = prevLastChargeAt === undefined ? (sub.last_charge_at ?? null) : prevLastChargeAt;
-    await db
-      .run(
-        'UPDATE subscriptions SET last_charge_at = ?, charge_count = charge_count - 1 WHERE id = ? AND next_charge_at = ?',
-        prevLast,
-        Number(sub.id),
-        expectedNext,
-      )
-      .catch((ce) => console.error('[subscriptions] 扣费进度补偿失败:', sub.id, ce));
-    throw e;
+    for (const [sql, args] of balanceDeltaStmts([[chargeTxn, 1]])) statements.push([`${sql} AND ${guard}`, [...(args ?? []), ...params]]);
   }
-  return Number(results[0]?.meta?.last_row_id || 0);
+  statements.push([
+    `UPDATE subscriptions SET next_charge_at = ?, last_charge_at = CASE WHEN ? THEN ? ELSE last_charge_at END,
+      charge_count = charge_count + ? WHERE id = ? AND ${guard}`,
+    [next, Number(Boolean(amount)), period, Number(Boolean(amount)), sub.id, ...params],
+  ]);
+  const results = await db.batch(statements);
+  if (results.at(-1)?.meta.changes !== 1) return null;
+  return { transactionId: amount ? Number(results[0].meta.last_row_id) : null, next };
 }
 
 export async function runDue(db: Db, today = todayStr()) {
   const month = today.slice(0, 7);
   const noEndTrials = await db.all<SubscriptionRow>(
-    "SELECT * FROM subscriptions WHERE status = 'trial' AND trial_ends_on IS NULL",
+    "SELECT s.* FROM subscriptions s JOIN ledgers l ON l.id = s.ledger_id WHERE l.is_archived = 0 AND status = 'trial' AND trial_ends_on IS NULL",
   );
   for (const t of noEndTrials) {
     const key = `subtrial-noend:${t.id}:${month}`;
@@ -362,12 +324,16 @@ export async function runDue(db: Db, today = todayStr()) {
   }
 
   const expiredTrials = await db.all<SubscriptionRow>(
-    "SELECT * FROM subscriptions WHERE status = 'trial' AND trial_ends_on IS NOT NULL AND trial_ends_on <= ?",
+    "SELECT s.* FROM subscriptions s JOIN ledgers l ON l.id = s.ledger_id WHERE l.is_archived = 0 AND status = 'trial' AND trial_ends_on IS NOT NULL AND trial_ends_on <= ?",
     today,
   );
   for (const t of expiredTrials) {
     const toStatus = t.auto_renew ? 'active' : 'paused';
-    await db.run('UPDATE subscriptions SET status = ? WHERE id = ?', toStatus, t.id);
+    const updated = await db.run(`UPDATE subscriptions SET status = ? WHERE id = ? AND status = 'trial'
+      AND trial_ends_on = ? AND auto_renew = ?
+      AND EXISTS (SELECT 1 FROM ledgers WHERE id = subscriptions.ledger_id AND is_archived = 0)`,
+      toStatus, t.id, t.trial_ends_on, t.auto_renew);
+    if (updated.changes !== 1) continue;
     const key = `subtrial-end:${t.id}:${t.trial_ends_on}`;
     for (const uid of await ledgerWriterIds(db, t.ledger_id)) {
       await notify(db, uid, {
@@ -384,7 +350,7 @@ export async function runDue(db: Db, today = todayStr()) {
   }
 
   const due = await db.all<SubscriptionRow>(
-    "SELECT * FROM subscriptions WHERE status IN ('active','trial') AND next_charge_at <= ? ORDER BY next_charge_at, id",
+    "SELECT s.* FROM subscriptions s JOIN ledgers l ON l.id = s.ledger_id WHERE l.is_archived = 0 AND status IN ('active','trial') AND next_charge_at <= ? ORDER BY next_charge_at, id",
     today,
   );
   const stat = { charged: 0, renewed: 0, notified: 0 };
@@ -411,107 +377,44 @@ export async function runDue(db: Db, today = todayStr()) {
     }
 
     let cursor = sub.next_charge_at;
-    let guard = 0;
-    let charged = false;
-    let failed = false;
-    let lastNext = cursor;
-    let lastChargedAt: string | null = null;
-    let prevLastChargeAt: string | null = sub.last_charge_at ?? null;
-
-    while (cursor <= today && guard < MAX_CATCHUP) {
-      const next = advance(cursor, sub);
-      const claim = await db.run(
-        'UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ?',
-        next,
-        sub.id,
-        cursor,
-      );
-      if (claim.changes !== 1) break;
-      lastNext = next;
-      if (!(await accountUsable(db, sub.account_id, sub.ledger_id))) {
-        const key = `sub-noaccount:${sub.id}:${cursor}`;
-        for (const uid of await ledgerWriterIds(db, sub.ledger_id)) {
-          await notify(db, uid, {
-            kind: 'warn',
-            ledgerId: sub.ledger_id,
-            title: `订阅扣费跳过：${sub.name}`,
-            body: `计划扣费 ${cursor}，扣费账户不存在或已归档，本期已跳过，请检查订阅设置`,
-            link: '/subscriptions',
-            dedupeKey: key,
-          });
-        }
-        cursor = next;
-        guard++;
-        continue;
-      }
+    let renewed = false;
+    for (let count = 0; cursor <= today && count < MAX_CATCHUP; count++) {
       try {
-        await charge(db, { ...sub, next_charge_at: cursor }, sub.created_by_user_id, {
-          date: cursor,
-          silent: true,
-          expectedNextChargeAt: next,
-          prevLastChargeAt,
-        });
-        lastChargedAt = cursor;
-        prevLastChargeAt = cursor;
-      } catch (e) {
-        const rb = await db
-          .run('UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ?', cursor, sub.id, next)
-          .catch(() => null);
-        if (rb && rb.changes === 1) {
-          lastNext = cursor;
-        } else {
-          const key = `sub-rollback-fail:${sub.id}:${cursor}`;
+        if (!(await accountUsable(db, sub.account_id, sub.ledger_id))) {
+          const next = advance(cursor, sub);
+          const skipped = await db.run(`UPDATE subscriptions SET next_charge_at = ?
+            WHERE id = ? AND next_charge_at = ? AND status = ? AND auto_renew = 1 AND account_id IS ?
+              AND EXISTS (SELECT 1 FROM ledgers WHERE id = subscriptions.ledger_id AND is_archived = 0)`,
+            next, sub.id, cursor, sub.status, sub.account_id);
+          if (skipped.changes !== 1) break;
           for (const uid of await ledgerWriterIds(db, sub.ledger_id)) {
             await notify(db, uid, {
-              kind: 'danger',
-              ledgerId: sub.ledger_id,
-              title: `订阅扣费异常：${sub.name}（${cursor}）`,
-              body: `${cursor} 一期扣费失败且抢占回滚失败，该期可能被跳过，请检查订阅与流水`,
-              link: '/subscriptions',
-              dedupeKey: key,
+              kind: 'warn', ledgerId: sub.ledger_id, title: `订阅扣费跳过：${sub.name}`,
+              body: `计划扣费 ${cursor}，扣费账户不存在或已归档，本期已跳过，请检查订阅设置`,
+              link: '/subscriptions', dedupeKey: `sub-noaccount:${sub.id}:${cursor}`,
             });
           }
+          cursor = next;
+          continue;
         }
-        console.error('[subscriptions] 扣费失败，已回滚抢占:', sub.id, e);
-        failed = true;
+        const result = await charge(db, sub, sub.created_by_user_id, cursor);
+        if (!result) break;
+        if (result.transactionId) stat.charged++;
+        if (sub.trial_ends_on && result.next > sub.trial_ends_on) renewed = true;
+        cursor = result.next;
+      } catch (error) {
+        console.error('[subscriptions] 扣费失败，本期保留:', sub.id, error);
         break;
       }
-      stat.charged++;
-      charged = true;
-      cursor = next;
-      guard++;
     }
+    if (renewed) stat.renewed++;
 
-    if (!failed && cursor <= today) {
-      while (cursor <= today && guard++ < 500) cursor = advance(cursor, sub);
-    }
-    let status = sub.status;
-    let renewedNow = false;
-    if (sub.trial_ends_on && cursor > sub.trial_ends_on) {
-      status = 'active';
-      renewedNow = true;
-    }
-    if (charged) {
-      await db.run(
-        'UPDATE subscriptions SET last_charge_at = ?, status = ? WHERE id = ?',
-        lastChargedAt || today,
-        status,
-        sub.id,
-      );
-      await db.run(
-        'UPDATE subscriptions SET next_charge_at = ? WHERE id = ? AND next_charge_at = ?',
-        cursor,
-        sub.id,
-        lastNext,
-      );
-      if (renewedNow) stat.renewed++;
-    }
   }
   return stat;
 }
 
 export async function checkReminders(db: Db, today = todayStr()): Promise<number> {
-  const items = await db.all<SubscriptionRow>("SELECT * FROM subscriptions WHERE status IN ('active','trial')");
+  const items = await db.all<SubscriptionRow>("SELECT s.* FROM subscriptions s JOIN ledgers l ON l.id = s.ledger_id WHERE l.is_archived = 0 AND status IN ('active','trial')");
   let n = 0;
   for (const sub of items) {
     const days = daysUntil(sub.next_charge_at);

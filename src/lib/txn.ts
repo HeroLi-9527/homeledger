@@ -1,3 +1,4 @@
+import { activeDebtScope, debtBalancesCte } from './debt-balances.js';
 import {
   accountAmounts,
   baseExchangeRates,
@@ -346,7 +347,12 @@ export interface TxnWriteInput {
   updated_at?: string;
 }
 
-export async function createTransaction(db: Db, ledgerId: number, userId: number, d: TxnWriteInput): Promise<number> {
+export const activeLedgerGuard = 'EXISTS (SELECT 1 FROM ledgers WHERE id = ? AND is_archived = 0)';
+
+export async function prepareTransactionWrites(
+  db: Db, ledgerId: number, userId: number, d: TxnWriteInput, extraGuard?: BatchStatement,
+  settlement?: { debtId: number; automatic: boolean; stamp: string },
+): Promise<BatchStatement[]> {
   const type = d.type && TXN_TYPE_MAP[d.type] ? d.type : 'expense';
   const amount = type === 'adjust' ? Math.round(Number(d.amount_cents) || 0) : Math.abs(Math.round(Number(d.amount_cents) || 0));
   if (!amount) throw new Error('金额必须大于 0');
@@ -365,14 +371,17 @@ export async function createTransaction(db: Db, ledgerId: number, userId: number
   const newTxn = { ...effect, ...amounts };
   const stamp = nowStr();
   const expected = d.expectedBalanceCents;
+  const guard = extraGuard ? `${activeLedgerGuard} AND (${extraGuard[0]})` : activeLedgerGuard;
+  const guardArgs = [ledgerId, ...(extraGuard?.[1] ?? [])];
   const balanceArgs = [accountId, ledgerId, expected];
   const stmts: BatchStatement[] = [
     [
       `INSERT INTO transactions
        (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
-        user_id, txn_date, note, merchant, status, is_reimbursable, group_id, source, ai_json, created_at, updated_at, account_amount_cents, to_account_amount_cents)
-       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
-       ${expected === undefined ? '' : 'WHERE EXISTS (SELECT 1 FROM accounts WHERE id = ? AND ledger_id = ? AND balance_cents = ? AND is_archived = 0)'}`,
+        user_id, txn_date, note, merchant, status, is_reimbursable, group_id, source, ai_json, created_at, updated_at, account_amount_cents, to_account_amount_cents, settlement_debt_id, settlement_auto)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+       WHERE ${guard}
+       ${expected === undefined ? '' : 'AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND ledger_id = ? AND balance_cents = ? AND is_archived = 0)'}`,
       [
         ledgerId,
         type,
@@ -393,20 +402,31 @@ export async function createTransaction(db: Db, ledgerId: number, userId: number
         d.source || 'manual',
         d.ai_json || null,
         stamp,
-        stamp,
+        settlement?.stamp ?? stamp,
         amounts.account_amount_cents,
         amounts.to_account_amount_cents,
+        settlement?.debtId ?? null,
+        Number(settlement?.automatic ?? false),
+        ...guardArgs,
         ...(expected === undefined ? [] : balanceArgs),
       ],
     ],
   ];
   for (const [sql, args = []] of balanceDeltaStmts([[newTxn, 1]])) {
-    stmts.push(expected === undefined ? [sql, args] : [
-      `${sql} AND ledger_id = ? AND balance_cents = ? AND is_archived = 0`, [...args, ledgerId, expected],
+    stmts.push(expected === undefined ? [`${sql} AND ${guard}`, [...args, ...guardArgs]] : [
+      `${sql} AND ledger_id = ? AND balance_cents = ? AND is_archived = 0 AND ${guard}`, [...args, ledgerId, expected, ...guardArgs],
     ]);
   }
+  return stmts;
+}
+
+export async function createTransaction(db: Db, ledgerId: number, userId: number, d: TxnWriteInput): Promise<number> {
+  const stmts = await prepareTransactionWrites(db, ledgerId, userId, d);
+  const expected = d.expectedBalanceCents;
   const results = await db.batch(stmts);
-  if (expected !== undefined && Number(results[0]?.meta?.changes || 0) !== 1) throw new Error('账户余额已变动，请重试');
+  if (Number(results[0]?.meta?.changes || 0) !== 1) {
+    throw new Error(expected === undefined ? '账本已归档，只能查阅和导出' : '账户余额已变动或账本已归档，请刷新后重试');
+  }
   const id = Number(results[0]?.meta?.last_row_id || 0);
   if (!id) throw new Error('记账失败，未能获取交易 ID');
   try {
@@ -427,6 +447,50 @@ export async function createTransaction(db: Db, ledgerId: number, userId: number
     console.error('syncDebts failed after create txn', id, e);
   }
   return id;
+}
+
+export async function settleDebt(
+  db: Db, ledgerId: number, userId: number,
+  debt: { id: number; direction: string; currency: string; counterparty: string; balance_cents: number; opening_cents: number; note: string | null },
+  input: { amount_cents: number; account_id: number; txn_date: string; note: string; source: string },
+): Promise<number> {
+  const automatic = debt.opening_cents === 0 && debt.note === '系统自动汇总';
+  const stamp = stampMs();
+  const inserted: BatchStatement = [
+    'EXISTS (SELECT 1 FROM transactions WHERE ledger_id = ? AND settlement_debt_id = ? AND updated_at = ?)',
+    [ledgerId, debt.id, stamp],
+  ];
+  // Ordinary repayments can commit before rebuilding the displayed debt balance.
+  const currentBalance = automatic ? 'SELECT balance_cents FROM auto_state WHERE direction = ? AND counterparty = ?'
+    : debt.opening_cents > 0 ? 'SELECT balance_cents FROM opening_state WHERE id = ?' : null;
+  const actualBalanceGuard = currentBalance
+    ? `AND (${inserted[0]} OR (${activeDebtScope()}${debtBalancesCte} ${currentBalance}) = ?)` : '';
+  const actualBalanceArgs = currentBalance ? [
+    ...inserted[1]!, ledgerId, ...(automatic ? [debt.direction, debt.counterparty] : [debt.id]), debt.balance_cents,
+  ] : [];
+  const guard: BatchStatement = [
+    `EXISTS (SELECT 1 FROM debts WHERE id = ? AND ledger_id = ? AND status = 'open' AND balance_cents = ?
+       AND direction = ? AND counterparty = ? AND currency = ?)
+     AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND ledger_id = ? AND is_archived = 0)
+     ${actualBalanceGuard}`,
+    [debt.id, ledgerId, debt.balance_cents, debt.direction, debt.counterparty, debt.currency,
+      input.account_id, ledgerId, ...actualBalanceArgs],
+  ];
+  const writes = await prepareTransactionWrites(db, ledgerId, userId, {
+    ...input,
+    type: debt.direction === 'receivable' ? 'repay_receive' : 'repay_pay',
+    currency: debt.currency || undefined,
+    merchant: debt.counterparty,
+  }, guard, { debtId: debt.id, automatic, stamp });
+  if (debt.opening_cents === 0 && !automatic) writes.push([
+    `UPDATE debts SET manual_balance_cents = balance_cents
+     WHERE id = ? AND manual_balance_cents IS NULL AND ${inserted[0]}`,
+    [debt.id, ...inserted[1]!],
+  ]);
+  writes.push(...debtSyncWrites(ledgerId, inserted));
+  const [created] = await db.batch(writes);
+  if (created.meta.changes !== 1) throw new Error('借贷或账户已变更，或账本已归档，请刷新后重试');
+  return Number(created.meta.last_row_id);
 }
 
 export async function updateTransaction(
@@ -454,6 +518,9 @@ export async function updateTransaction(
   if (d.splits && d.splits.length) checkSplitsTotal(d.splits, amount);
 
   const valuationChanged = amount !== Number(old.amount_cents) || currency !== old.currency || rate !== Number(old.rate);
+  if (old.settlement_debt_id != null && (
+    valuationChanged || type !== old.type || (d.merchant ? String(d.merchant).slice(0, 60) : null) !== old.merchant
+  )) throw new Error('借贷结算流水不能修改金额、币种、汇率、类型或往来对象，请删除后重新结算');
   const baseCents = valuationChanged ? toBase(amount, rate) : Number(old.amount_base_cents);
   const accountChanged = valuationChanged || type !== old.type || accountId !== old.account_id;
   const toAccountChanged = valuationChanged || type !== old.type || toAccountId !== old.to_account_id;
@@ -503,7 +570,7 @@ export async function updateTransaction(
     [`UPDATE transactions SET type=?, amount_cents=?, currency=?, rate=?, amount_base_cents=?, account_id=?,
        to_account_id=?, category_id=?, txn_date=?, note=?, merchant=?, status=?, is_reimbursable=?,
        account_amount_cents=?, to_account_amount_cents=?, updated_at=?
-       WHERE id=? AND ledger_id=? AND deleted_at IS NULL AND updated_at=?`,
+       WHERE id=? AND ledger_id=? AND deleted_at IS NULL AND updated_at=? AND ${activeLedgerGuard}`,
     [type,
     amount,
     currency,
@@ -522,7 +589,7 @@ export async function updateTransaction(
     stamp,
     id,
     ledgerId,
-    expectedToken]],
+    expectedToken, ledgerId]],
     ...delta.map(([sql, params = []]): BatchStatement => [
       `${sql} AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND ledger_id = ? AND updated_at = ?)`,
       [...params, id, ledgerId, stamp],
@@ -567,8 +634,9 @@ export async function softDelete(
   const delGuardParams = [id, ledgerId, stamp, stamp];
   const stmts: BatchStatement[] = [
     [
-      'UPDATE transactions SET deleted_at = ?, updated_at = ? WHERE id = ? AND ledger_id = ? AND deleted_at IS NULL AND updated_at = ?',
-      [stamp, stamp, id, ledgerId, pre.updated_at],
+      `UPDATE transactions SET deleted_at = ?, updated_at = ? WHERE id = ? AND ledger_id = ?
+        AND deleted_at IS NULL AND updated_at = ? AND ${activeLedgerGuard}`,
+      [stamp, stamp, id, ledgerId, pre.updated_at, ledgerId],
     ],
     ...balanceDeltaStmts([[pre, -1]]).map(([sql, params = []]): BatchStatement => [`${sql}${delGuardSql}`, [...params, ...delGuardParams]]),
   ];
@@ -647,7 +715,8 @@ export async function restoreTransaction(db: Db, id: number, ledgerId: number): 
     [...params, id, ledgerId, stamp],
   ]);
   const results = await db.batch([
-    ['UPDATE transactions SET deleted_at = NULL, updated_at = ? WHERE id = ? AND ledger_id = ? AND deleted_at IS NOT NULL AND purge_started = 0', [stamp, id, ledgerId]],
+    [`UPDATE transactions SET deleted_at = NULL, updated_at = ? WHERE id = ? AND ledger_id = ?
+      AND deleted_at IS NOT NULL AND purge_started = 0 AND ${activeLedgerGuard}`, [stamp, id, ledgerId, ledgerId]],
     ...balStmts,
   ]);
   if (Number(results[0]?.meta?.changes || 0) !== 1) throw new Error('记录已被恢复或删除，请刷新后重试');
@@ -661,10 +730,10 @@ export async function restoreTransaction(db: Db, id: number, ledgerId: number): 
 
 export async function purgeTransaction(db: Db, env: Pick<Env, 'ATTACHMENTS'>, id: number, ledgerId: number): Promise<void> {
   const claim = await db.run(
-    'UPDATE transactions SET purge_started = 1 WHERE id = ? AND ledger_id = ? AND deleted_at IS NOT NULL',
-    id, ledgerId,
+    `UPDATE transactions SET purge_started = 1 WHERE id = ? AND ledger_id = ? AND deleted_at IS NOT NULL AND ${activeLedgerGuard}`,
+    id, ledgerId, ledgerId,
   );
-  if (!claim.changes) throw new Error('回收站中找不到该流水');
+  if (!claim.changes) throw new Error('回收站中找不到该流水，或账本已归档');
   const rows = await db.all<{ rel_path: string }>(
     'SELECT rel_path FROM attachments WHERE txn_id = ? AND ledger_id = ?', id, ledgerId,
   );
@@ -732,11 +801,12 @@ export async function bulkUpdateCategory(
   }
   if (targetIds.length) {
     await db.run(
-      `UPDATE transactions SET category_id = ?, updated_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND id IN (${targetIds.map(() => '?').join(',')})`,
+      `UPDATE transactions SET category_id = ?, updated_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND id IN (${targetIds.map(() => '?').join(',')}) AND ${activeLedgerGuard}`,
       Number(cat.id),
       stampMs(),
       ledgerId,
       ...targetIds,
+      ledgerId,
     );
   }
   return { updated: targetIds.length, skipped };
@@ -778,10 +848,11 @@ export async function bulkAddTags(
   }
   if (targetIds.length) {
     await db.run(
-      `UPDATE transactions SET updated_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND id IN (${targetIds.map(() => '?').join(',')})`,
+      `UPDATE transactions SET updated_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND id IN (${targetIds.map(() => '?').join(',')}) AND ${activeLedgerGuard}`,
       stampMs(),
       ledgerId,
       ...targetIds,
+      ledgerId,
     );
   }
   return { updated: targetIds.length, skipped };
@@ -825,10 +896,11 @@ export async function bulkMarkReimbursable(
   }
   if (targetIds.length) {
     await db.run(
-      `UPDATE transactions SET is_reimbursable = 1, updated_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND reimbursed_at IS NULL AND id IN (${targetIds.map(() => '?').join(',')})`,
+      `UPDATE transactions SET is_reimbursable = 1, updated_at = ? WHERE ledger_id = ? AND deleted_at IS NULL AND reimbursed_at IS NULL AND id IN (${targetIds.map(() => '?').join(',')}) AND ${activeLedgerGuard}`,
       stampMs(),
       ledgerId,
       ...targetIds,
+      ledgerId,
     );
   }
   return { updated: targetIds.length, skipped };
@@ -883,19 +955,25 @@ export async function markReimbursed(
   if (!rows.length || !total) {
     throw new Error('没有可报销的记录' + (skipped.length ? `（${skipped[0].reason}）` : ''));
   }
-  const stamp = nowStr();
+  const stamp = stampMs();
   const note = `报销 ${rows.length} 笔，合计 ${(total / 100).toFixed(2)}`;
   const currency = String(await getSetting(db, 'site.currency', 'CNY'));
   const effect = { type: 'reimburse', amount_base_cents: total, account_id: Number(accountId), to_account_id: null };
   const reimburseTxn = { ...effect, ...await accountAmounts(db, ledgerId, { ...effect, currency, amount_cents: total }) };
   const inList = rows.map(() => '?').join(',');
   const rowIds = rows.map((r) => r.id);
+  const eligible = `ledger_id = ? AND deleted_at IS NULL AND reimbursed_at IS NULL
+    AND is_reimbursable = 1 AND type IN ('expense','fee') AND id IN (${inList})`;
+  const inserted = `EXISTS (SELECT 1 FROM transactions WHERE id = last_insert_rowid()
+    AND ledger_id = ? AND type = 'reimburse' AND updated_at = ?)`;
   const results = await db.batch([
     [
       `INSERT INTO transactions
        (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
         user_id, txn_date, note, merchant, status, is_reimbursable, group_id, source, ai_json, created_at, updated_at, account_amount_cents)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+       WHERE ${activeLedgerGuard} AND (SELECT COUNT(*) = ? AND SUM(amount_base_cents) = ?
+         FROM transactions WHERE ${eligible})`,
       [
         ledgerId,
         'reimburse',
@@ -916,37 +994,23 @@ export async function markReimbursed(
         'manual',
         null,
         nowStr(),
-        nowStr(),
+        stamp,
         reimburseTxn.account_amount_cents,
+        ledgerId, rows.length, total, ledgerId, ...rowIds,
       ],
     ],
     [
       `UPDATE transactions
        SET reimbursed_at = ?, related_id = last_insert_rowid()
-       WHERE ledger_id = ? AND deleted_at IS NULL AND reimbursed_at IS NULL
-         AND is_reimbursable = 1 AND type IN ('expense','fee') AND id IN (${inList})`,
-      [stamp, ledgerId, ...rowIds],
+       WHERE ${eligible} AND ${activeLedgerGuard} AND ${inserted}`,
+      [nowStr(), ledgerId, ...rowIds, ledgerId, ledgerId, stamp],
     ],
-    ...balanceDeltaStmts([[reimburseTxn, 1]]),
+    ...balanceDeltaStmts([[reimburseTxn, 1]]).map(([sql, args = []]): BatchStatement => [
+      `${sql} AND ${activeLedgerGuard} AND ${inserted}`, [...args, ledgerId, ledgerId, stamp],
+    ]),
   ]);
-  const txnId = Number(results[0]?.meta?.last_row_id || 0);
-  if (Number(results[1]?.meta?.changes || 0) !== rows.length || !txnId) {
-    try {
-      await db.batch([
-        [
-          `UPDATE transactions SET reimbursed_at = NULL, related_id = NULL WHERE ledger_id = ? AND (reimbursed_at = ? OR related_id = ?) AND id IN (${inList})`,
-          [ledgerId, stamp, txnId, ...rowIds],
-        ],
-        ...(txnId
-          ? ([['UPDATE transactions SET deleted_at = ?, updated_at = ? WHERE id = ?', [nowStr(), nowStr(), txnId]]] as BatchStatement[])
-          : []),
-        ...balanceDeltaStmts([[reimburseTxn, -1]]),
-      ]);
-    } catch (e) {
-      console.error('markReimbursed compensation failed', txnId, e);
-    }
-    throw new Error('部分记录已被删除或报销，请刷新后重试');
-  }
+  if (results[0].meta.changes !== 1) throw new Error('部分记录已被删除或报销，或账本已归档，请刷新后重试');
+  const txnId = Number(results[0].meta.last_row_id);
   return { txnId, total, count: rows.length, skipped };
 }
 
@@ -969,16 +1033,16 @@ export async function applyTags(
     .map((s) => s.trim())
     .filter(Boolean)
     .slice(0, 8);
-  if (replace) await db.run('DELETE FROM transaction_tags WHERE transaction_id = ?', txnId);
+  if (replace) await db.run(`DELETE FROM transaction_tags WHERE transaction_id = ? AND ${activeLedgerGuard}`, txnId, ledgerId);
   if (!names.length) return;
   for (const name of names) {
     let tag = await db.get<{ id: number }>('SELECT id FROM tags WHERE ledger_id = ? AND name = ?', ledgerId, name);
     if (!tag) {
-      await db.run('INSERT OR IGNORE INTO tags (ledger_id, name, color) VALUES (?,?,?)', ledgerId, name, colorFromName(name));
+      await db.run(`INSERT OR IGNORE INTO tags (ledger_id, name, color) SELECT ?,?,? WHERE ${activeLedgerGuard}`, ledgerId, name, colorFromName(name), ledgerId);
       tag = await db.get<{ id: number }>('SELECT id FROM tags WHERE ledger_id = ? AND name = ?', ledgerId, name);
     }
     if (tag) {
-      await db.run('INSERT OR IGNORE INTO transaction_tags (transaction_id, tag_id) VALUES (?,?)', txnId, tag.id);
+      await db.run(`INSERT OR IGNORE INTO transaction_tags (transaction_id, tag_id) SELECT ?,? WHERE ${activeLedgerGuard}`, txnId, tag.id, ledgerId);
     }
   }
 }
@@ -992,24 +1056,24 @@ export async function saveSplits(
 ): Promise<string | null> {
   if (!splits || !splits.length) {
     await db.batch([
-      ['DELETE FROM splits WHERE transaction_id = ?', [txnId]],
-      ['UPDATE transactions SET group_id = NULL WHERE id = ?', [txnId]],
+      [`DELETE FROM splits WHERE transaction_id = ? AND ${activeLedgerGuard}`, [txnId, ledgerId]],
+      [`UPDATE transactions SET group_id = NULL WHERE id = ? AND ${activeLedgerGuard}`, [txnId, ledgerId]],
     ]);
     return null;
   }
   const gid = groupId || `sp_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-  const stmts: BatchStatement[] = [['DELETE FROM splits WHERE group_id = ?', [gid]]];
+  const stmts: BatchStatement[] = [[`DELETE FROM splits WHERE group_id = ? AND ledger_id = ? AND ${activeLedgerGuard}`, [gid, ledgerId, ledgerId]]];
   const now = nowStr();
   for (const s of splits) {
     const share = Math.round(Number(s.share_cents) || 0);
     if (share <= 0) throw new Error('分账金额必须大于 0');
     stmts.push([
       `INSERT INTO splits (group_id, transaction_id, ledger_id, user_id, member_name, share_cents, created_at)
-       VALUES (?,?,?,?,?,?,?)`,
-      [gid, txnId, ledgerId, s.user_id || null, String(s.member_name || '成员').slice(0, 30), share, now],
+       SELECT ?,?,?,?,?,?,? WHERE ${activeLedgerGuard}`,
+      [gid, txnId, ledgerId, s.user_id || null, String(s.member_name || '成员').slice(0, 30), share, now, ledgerId],
     ]);
   }
-  stmts.push(['UPDATE transactions SET group_id = ? WHERE id = ?', [gid, txnId]]);
+  stmts.push([`UPDATE transactions SET group_id = ? WHERE id = ? AND ${activeLedgerGuard}`, [gid, txnId, ledgerId]]);
   await db.batch(stmts);
   return gid;
 }
@@ -1018,70 +1082,42 @@ export async function splitsOf(db: Db, txnId: number) {
   return db.all('SELECT * FROM splits WHERE transaction_id = ? ORDER BY id', txnId);
 }
 
+function debtSyncWrites(ledgerId: number, guard?: BatchStatement): BatchStatement[] {
+  const scope = activeDebtScope(guard?.[0]);
+  const args = [ledgerId, ...(guard?.[1] ?? [])];
+  return [
+    [`${scope}${debtBalancesCte}, changed_balances AS (
+        SELECT id, balance_cents FROM opening_state
+        UNION ALL
+        SELECT id, balance_cents FROM manual_state WHERE manual_balance_cents IS NOT NULL AND current_balance <> balance_cents
+      )
+      UPDATE debts AS d SET balance_cents = b.balance_cents,
+        status = CASE WHEN b.balance_cents = 0 THEN 'closed' ELSE 'open' END
+      FROM changed_balances b WHERE d.id = b.id
+        AND (d.balance_cents <> b.balance_cents OR d.status <> CASE WHEN b.balance_cents = 0 THEN 'closed' ELSE 'open' END)`,
+      args],
+    // Capture existing due dates before removing the previous derived rows.
+    [`${scope}${debtBalancesCte}
+      INSERT INTO debts (ledger_id, direction, counterparty, currency, account_id, due_date, note, principal_cents,
+                         balance_cents, status, created_at)
+      SELECT ?, direction, counterparty, currency, account_id, due_date, note, principal_cents, balance_cents,
+             CASE WHEN balance_cents = 0 THEN 'closed' ELSE 'open' END, ?
+      FROM auto_state`, [...args, ledgerId, nowStr()]],
+    [`${scope} DELETE FROM debts AS d WHERE ledger_id = (SELECT ledger_id FROM scope) AND opening_cents = 0 AND note = '系统自动汇总'
+      AND EXISTS (SELECT 1 FROM ledgers WHERE id = d.ledger_id AND is_archived = 0)
+      AND (NOT EXISTS (
+        SELECT 1 FROM transactions t WHERE t.ledger_id = d.ledger_id AND t.deleted_at IS NULL
+          AND t.type = CASE WHEN d.direction = 'receivable' THEN 'lend' ELSE 'borrow' END
+          AND COALESCE(NULLIF(t.merchant, ''), '未指定') = d.counterparty
+      ) OR EXISTS (
+        SELECT 1 FROM debts n WHERE n.id > d.id AND n.ledger_id = d.ledger_id AND n.opening_cents = 0
+          AND n.note = d.note AND n.direction = d.direction AND n.counterparty = d.counterparty
+      ))`, args],
+  ];
+}
+
 export async function syncDebts(db: Db, ledgerId: number): Promise<void> {
-  const [rows, repayRows, existingAuto] = await Promise.all([
-    db.all<TxnRow>(
-      `SELECT type, merchant, amount_base_cents, account_id, txn_date FROM transactions
-       WHERE ledger_id = ? AND deleted_at IS NULL AND type IN ('lend','borrow')`,
-      ledgerId,
-    ),
-    db.all<TxnRow>(
-      `SELECT type, merchant, amount_base_cents FROM transactions
-       WHERE ledger_id = ? AND deleted_at IS NULL AND type IN ('repay_receive','repay_pay')`,
-      ledgerId,
-    ),
-    db.all<{ direction: string; counterparty: string; due_date: string | null }>(
-      "SELECT direction, counterparty, due_date FROM debts WHERE ledger_id = ? AND note = '系统自动汇总' AND due_date IS NOT NULL",
-      ledgerId,
-    ),
-  ]);
-  const dueMap = new Map(existingAuto.map((r) => [`${r.direction}|${r.counterparty}`, r.due_date]));
-  const map = new Map<
-    string,
-    { direction: string; counterparty: string; principal: number; account_id: number | null; earliest: string }
-  >();
-  for (const t of rows) {
-    const key = `${t.type}|${t.merchant || '未指定'}`;
-    const cur = map.get(key) || {
-      direction: t.type === 'lend' ? 'receivable' : 'payable',
-      counterparty: t.merchant || '未指定',
-      principal: 0,
-      account_id: t.account_id,
-      earliest: t.txn_date,
-    };
-    cur.principal += Number(t.amount_base_cents);
-    if (t.txn_date < cur.earliest) cur.earliest = t.txn_date;
-    map.set(key, cur);
-  }
-  const repay = new Map<string, number>();
-  for (const t of repayRows) {
-    const key = `${t.type === 'repay_receive' ? 'lend' : 'borrow'}|${t.merchant || '未指定'}`;
-    repay.set(key, (repay.get(key) || 0) + Number(t.amount_base_cents));
-  }
-  const stmts: BatchStatement[] = [["DELETE FROM debts WHERE ledger_id = ? AND note = '系统自动汇总'", [ledgerId]]];
-  const now = nowStr();
-  for (const [, v] of map) {
-    const key = `${v.direction}|${v.counterparty}`;
-    const paid = repay.get(`${v.direction === 'receivable' ? 'lend' : 'borrow'}|${v.counterparty}`) || 0;
-    const balance = Math.max(0, v.principal - paid);
-    stmts.push([
-      `INSERT INTO debts (ledger_id, direction, counterparty, principal_cents, balance_cents, account_id, due_date, status, note, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [
-        ledgerId,
-        v.direction,
-        v.counterparty,
-        v.principal,
-        balance,
-        v.account_id,
-        dueMap.get(key) ?? null,
-        balance <= 0 ? 'closed' : 'open',
-        '系统自动汇总',
-        now,
-      ],
-    ]);
-  }
-  await db.batch(stmts);
+  await db.batch(debtSyncWrites(ledgerId));
 }
 
 export function rangeOf(month: string) {

@@ -79,7 +79,7 @@ function ruleItems(rule: RecurringRuleRow): { items: RuleItemPayload[]; userId?:
   return { items: [payload as RuleItemPayload], userId: (payload as { user_id?: number }).user_id };
 }
 
-export async function recurringPostStmts(db: Db, rule: RecurringRuleRow, dateStr: string) {
+async function recurringPostStmts(db: Db, rule: RecurringRuleRow, period: string, dateStr: string, guard: string, guardArgs: unknown[]) {
   const { items, userId } = ruleItems(rule);
   const stmts: BatchStatement[] = [];
   let created = 0;
@@ -100,8 +100,8 @@ export async function recurringPostStmts(db: Db, rule: RecurringRuleRow, dateStr
     stmts.push([
       `INSERT INTO transactions
        (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
-        user_id, txn_date, note, merchant, status, source, created_at, updated_at, account_amount_cents, to_account_amount_cents)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        user_id, txn_date, note, merchant, status, source, created_at, updated_at, account_amount_cents, to_account_amount_cents, recurring_rule_id, scheduled_period)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${guard}`,
       [
         rule.ledger_id,
         p.type || 'expense',
@@ -122,9 +122,12 @@ export async function recurringPostStmts(db: Db, rule: RecurringRuleRow, dateStr
         now,
         pTxn.account_amount_cents,
         pTxn.to_account_amount_cents,
+        rule.id,
+        period,
+        ...guardArgs,
       ],
     ]);
-    stmts.push(...balanceDeltaStmts([[pTxn, 1]]));
+    for (const [sql, args] of balanceDeltaStmts([[pTxn, 1]])) stmts.push([`${sql} AND ${guard}`, [...(args ?? []), ...guardArgs]]);
     created++;
   }
   return { stmts, created };
@@ -149,152 +152,66 @@ export async function ruleBadAccount(db: Db, rule: RecurringRuleRow): Promise<st
   return null;
 }
 
+export async function postRecurringPeriod(db: Db, rule: RecurringRuleRow, period: string, date: string, skip = false) {
+  const guard = `EXISTS (
+    SELECT 1 FROM recurring_rules r JOIN ledgers l ON l.id = r.ledger_id
+    WHERE r.id = ? AND r.next_run_at = ? AND r.is_active = ? AND r.payload = ? AND r.auto_post = ?
+      AND r.frequency = ? AND r.interval_n = ? AND r.day_of_month IS ? AND l.is_archived = 0
+  )`;
+  const params = [rule.id, period, rule.is_active, rule.payload, rule.auto_post, rule.frequency, rule.interval_n, rule.day_of_month];
+  const { stmts, created } = skip ? { stmts: [] as BatchStatement[], created: 0 }
+    : await recurringPostStmts(db, rule, period, date, guard, params);
+  const next = advanceDate(period, rule);
+  stmts.push([
+    `UPDATE recurring_rules SET next_run_at = ?, last_run_at = ? WHERE id = ? AND ${guard}`,
+    [next, nowStr(), rule.id, ...params],
+  ]);
+  const results = await db.batch(stmts);
+  return results.at(-1)?.meta.changes === 1 ? { created, next } : null;
+}
+
 export async function runDueRecurring(db: Db, today = todayStr()): Promise<number> {
   const rules = await db.all<RecurringRuleRow>(
-    'SELECT * FROM recurring_rules WHERE is_active = 1 AND next_run_at <= ?',
-    today,
+    `SELECT r.* FROM recurring_rules r JOIN ledgers l ON l.id = r.ledger_id
+     WHERE l.is_archived = 0 AND r.is_active = 1 AND r.next_run_at <= ?`, today,
   );
   let created = 0;
   for (const rule of rules) {
+    const period = rule.next_run_at;
     try {
-      try {
-        JSON.parse(rule.payload);
-      } catch {
-        const key = `recurring-badpayload:${rule.id}:${today}`;
-        for (const uid of await ledgerWriterIds(db, rule.ledger_id)) {
-          await notify(db, uid, {
-            kind: 'danger',
-            ledgerId: rule.ledger_id,
-            title: `周期账单损坏：${rule.name}`,
-            body: '规则数据解析失败，已跳过本次执行，请检查后重新保存',
-            link: '/recurring',
-            dedupeKey: key,
-          });
-        }
-        continue;
-      }
-
-      let stmts: BatchStatement[];
-      let count: number;
-      try {
-        ({ stmts, created: count } = await recurringPostStmts(db, rule, rule.next_run_at));
-      } catch (e) {
-        const key = `recurring-error:${rule.id}:${today}`;
-        const msg = e instanceof Error ? e.message : '执行失败';
-        for (const uid of await ledgerWriterIds(db, rule.ledger_id)) {
-          await notify(db, uid, {
-            kind: 'danger',
-            ledgerId: rule.ledger_id,
-            title: `周期账单执行失败：${rule.name}`,
-            body: `计划日期 ${rule.next_run_at}，${msg}，本期未记账，下轮重试`,
-            link: '/recurring',
-            dedupeKey: key,
-          });
-        }
-        continue;
-      }
-
+      JSON.parse(rule.payload);
       if (!rule.auto_post) {
-        const key = `recurring:${rule.id}:${rule.next_run_at}:${today}`;
         for (const uid of await ledgerWriterIds(db, rule.ledger_id)) {
           await notify(db, uid, {
-            kind: 'recurring',
-            ledgerId: rule.ledger_id,
-            title: `周期账单待确认：${rule.name}`,
-            body: `计划日期 ${rule.next_run_at}`,
-            link: '/recurring',
-            dedupeKey: key,
+            kind: 'recurring', ledgerId: rule.ledger_id, title: `周期账单待确认：${rule.name}`,
+            body: `计划日期 ${period}`, link: '/recurring', dedupeKey: `recurring:${rule.id}:${period}:${today}`,
           });
         }
-        await db.run('UPDATE recurring_rules SET last_run_at = ? WHERE id = ?', nowStr(), rule.id);
+        await db.run(`UPDATE recurring_rules SET last_run_at = ? WHERE id = ? AND is_active = 1 AND next_run_at = ?
+          AND EXISTS (SELECT 1 FROM ledgers WHERE id = ? AND is_archived = 0)`, nowStr(), rule.id, period, rule.ledger_id);
         continue;
       }
-
-      const next = advanceDate(rule.next_run_at, rule);
-      const claim = await db.run(
-        'UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND next_run_at = ?',
-        next,
-        rule.id,
-        rule.next_run_at,
-      );
-      if (claim.changes !== 1) continue;
-
-      let bad: string | null;
-      try {
-        bad = await ruleBadAccount(db, rule);
-      } catch (e) {
-        const rb = await db
-          .run(
-            'UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND next_run_at = ?',
-            rule.next_run_at,
-            rule.id,
-            next,
-          )
-          .catch(() => null);
-        if (!rb || rb.changes !== 1) {
-          const key = `recurring-rollback-fail:${rule.id}:${rule.next_run_at}`;
-          for (const uid of await ledgerWriterIds(db, rule.ledger_id)) {
-            await notify(db, uid, {
-              kind: 'danger',
-              ledgerId: rule.ledger_id,
-              title: `周期账单异常：${rule.name}`,
-              body: `计划日期 ${rule.next_run_at}，账户校验失败且抢占回滚失败，该期可能被跳过，请检查规则与流水`,
-              link: '/recurring',
-              dedupeKey: key,
-            });
-          }
-        }
-        console.error('[scheduler] ruleBadAccount failed:', rule.id, e);
-        continue;
+      const bad = await ruleBadAccount(db, rule);
+      const result = await postRecurringPeriod(db, rule, period, period, Boolean(bad));
+      if (!result) continue;
+      created += result.created;
+      if (!bad && result.created) continue;
+      for (const uid of await ledgerWriterIds(db, rule.ledger_id)) {
+        await notify(db, uid, {
+          kind: 'warn', ledgerId: rule.ledger_id,
+          title: `周期账单跳过：${rule.name}`, body: `计划日期 ${period}，${bad || '明细金额为 0'}`,
+          link: '/recurring', dedupeKey: `recurring-skip:${rule.id}:${period}`,
+        });
       }
-
-      if (bad) {
-        const key = `recurring-noaccount:${rule.id}:${rule.next_run_at}`;
-        for (const uid of await ledgerWriterIds(db, rule.ledger_id)) {
-          await notify(db, uid, {
-            kind: 'warn',
-            ledgerId: rule.ledger_id,
-            title: `周期账单跳过：${rule.name}`,
-            body: `计划日期 ${rule.next_run_at}，${bad}，本期已跳过，请检查规则设置`,
-            link: '/recurring',
-            dedupeKey: key,
-          });
-        }
-        continue;
+    } catch (error) {
+      console.error('[scheduler] 周期账单规则失败:', rule.id, error);
+      for (const uid of await ledgerWriterIds(db, rule.ledger_id)) {
+        await notify(db, uid, {
+          kind: 'danger', ledgerId: rule.ledger_id, title: `周期账单执行失败：${rule.name}`,
+          body: `计划日期 ${period}，${error instanceof Error ? error.message : '执行失败'}，本期未记账`,
+          link: '/recurring', dedupeKey: `recurring-error:${rule.id}:${today}`,
+        });
       }
-
-      try {
-        stmts.push(['UPDATE recurring_rules SET last_run_at = ? WHERE id = ?', [nowStr(), rule.id]]);
-        await db.batch(stmts);
-      } catch (e) {
-        await db
-          .run(
-            'UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND next_run_at = ?',
-            rule.next_run_at,
-            rule.id,
-            next,
-          )
-          .catch(() => {});
-        console.error('[scheduler] 周期账单入账失败，已回滚抢占:', rule.id, e);
-        continue;
-      }
-
-      created += count;
-      if (count === 0) {
-        const key = `recurring-zero:${rule.id}:${rule.next_run_at}`;
-        for (const uid of await ledgerWriterIds(db, rule.ledger_id)) {
-          await notify(db, uid, {
-            kind: 'warn',
-            ledgerId: rule.ledger_id,
-            title: `周期账单本期金额为 0：${rule.name}`,
-            body: `计划日期 ${rule.next_run_at} 的全部明细金额为 0，未生成流水，下次执行日已顺延`,
-            link: '/recurring',
-            dedupeKey: key,
-          });
-        }
-      }
-    } catch (e) {
-      console.error('[scheduler] 周期账单规则失败:', rule.id, e);
     }
   }
   return created;
@@ -432,7 +349,7 @@ export async function effectiveBudget(db: Db, b: BudgetRow, ref: Date) {
 }
 
 export async function checkBudgets(db: Db): Promise<number> {
-  const budgets = await db.all<BudgetRow>('SELECT * FROM budgets WHERE is_active = 1');
+  const budgets = await db.all<BudgetRow>('SELECT b.* FROM budgets b JOIN ledgers l ON l.id = b.ledger_id WHERE b.is_active = 1 AND l.is_archived = 0');
   const ref = tzRefDate();
   let alerted = 0;
   for (const b of budgets) {
@@ -470,7 +387,7 @@ export async function checkDebts(db: Db): Promise<number> {
     counterparty: string;
     balance_cents: number;
     due_date: string;
-  }>("SELECT * FROM debts WHERE status = 'open' AND due_date IS NOT NULL AND due_date <= date(?, '+3 day')", today);
+  }>("SELECT d.* FROM debts d JOIN ledgers l ON l.id = d.ledger_id WHERE l.is_archived = 0 AND status = 'open' AND due_date IS NOT NULL AND due_date <= date(?, '+3 day')", today);
   let n = 0;
   for (const d of soon) {
     const dedupeKey = `debt:${d.id}:${d.due_date}:${today.slice(0, 7)}`;
@@ -499,10 +416,10 @@ export async function checkDebts(db: Db): Promise<number> {
 export async function checkGoals(db: Db): Promise<number> {
   const today = todayStr();
   const done = await db.all<{ id: number; ledger_id: number; name: string; saved_cents: number; target_cents: number }>(
-    "SELECT * FROM goals WHERE status = 'active' AND target_cents > 0 AND saved_cents >= target_cents",
+    "SELECT g.* FROM goals g JOIN ledgers l ON l.id = g.ledger_id WHERE l.is_archived = 0 AND status = 'active' AND target_cents > 0 AND saved_cents >= target_cents",
   );
   for (const g of done) {
-    await db.run("UPDATE goals SET status = 'completed' WHERE id = ?", g.id);
+    await db.run("UPDATE goals SET status = 'completed' WHERE id = ? AND EXISTS (SELECT 1 FROM ledgers WHERE id = goals.ledger_id AND is_archived = 0)", g.id);
     const key = `goal-done:${g.id}`;
     for (const uid of await ledgerWriterIds(db, g.ledger_id)) {
       await notify(db, uid, {
@@ -522,7 +439,7 @@ export async function checkGoals(db: Db): Promise<number> {
     saved_cents: number;
     target_cents: number;
     target_date: string;
-  }>("SELECT * FROM goals WHERE status = 'active' AND target_date IS NOT NULL AND target_date <= date(?, '+7 day')", today);
+  }>("SELECT g.* FROM goals g JOIN ledgers l ON l.id = g.ledger_id WHERE l.is_archived = 0 AND status = 'active' AND target_date IS NOT NULL AND target_date <= date(?, '+7 day')", today);
   let n = 0;
   for (const g of goals) {
     const dedupeKey = `goal:${g.id}:${g.target_date}:${today.slice(0, 7)}`;
@@ -550,7 +467,7 @@ export async function checkGoals(db: Db): Promise<number> {
 export async function checkCreditAccounts(db: Db, today = todayStr()): Promise<number> {
   const rows = await db.all<
     Pick<AccountRow, 'id' | 'ledger_id' | 'name' | 'balance_cents' | 'due_day'>
-  >('SELECT id, ledger_id, name, balance_cents, due_day FROM accounts WHERE is_archived = 0 AND due_day BETWEEN 1 AND 31 AND balance_cents < 0');
+  >('SELECT a.id, a.ledger_id, a.name, a.balance_cents, a.due_day FROM accounts a JOIN ledgers l ON l.id = a.ledger_id WHERE a.is_archived = 0 AND l.is_archived = 0 AND due_day BETWEEN 1 AND 31 AND balance_cents < 0');
   let n = 0;
   for (const acc of rows) {
     const due = nextMonthlyDay(acc.due_day, today);
@@ -581,7 +498,7 @@ export async function checkCreditAccounts(db: Db, today = todayStr()): Promise<n
 
 export async function checkSessionCards(db: Db, today = todayStr()): Promise<number> {
   const rows = await db.all<SessionCardRow>(
-    'SELECT * FROM session_cards WHERE is_archived = 0 AND remaining_sessions > 0',
+    'SELECT c.* FROM session_cards c JOIN ledgers l ON l.id = c.ledger_id WHERE c.is_archived = 0 AND l.is_archived = 0 AND remaining_sessions > 0',
   );
   let n = 0;
   for (const raw of rows) {
@@ -647,6 +564,7 @@ export async function repairReimbursedLinks(db: Db): Promise<number> {
      SET reimbursed_at = NULL, related_id = NULL
      WHERE reimbursed_at IS NOT NULL
        AND deleted_at IS NULL
+       AND EXISTS (SELECT 1 FROM ledgers WHERE id = transactions.ledger_id AND is_archived = 0)
        AND related_id IS NOT NULL
        AND NOT EXISTS (
          SELECT 1 FROM transactions r

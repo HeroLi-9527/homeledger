@@ -213,13 +213,15 @@ export async function linkImagesToTxns(
   for (let i = 0; i < ids.length; i++) {
     const target = txns.length === ids.length ? txns[i] : txns[0];
     const res = await db.run(
-      `UPDATE attachments SET txn_id = ?, ai_status = ? WHERE id = ? AND ledger_id = ? AND txn_id IS NULL
-       AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at IS NULL)`,
+      `UPDATE attachments SET txn_id = ?, ai_status = ? WHERE id = ? AND ledger_id = ? AND txn_id IS NULL AND delete_started = 0
+       AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND ledger_id = ? AND deleted_at IS NULL)
+       AND EXISTS (SELECT 1 FROM ledgers WHERE id = ? AND is_archived = 0)`,
       target,
       aiStatus,
       ids[i],
       Number(ledgerId),
       target,
+      Number(ledgerId),
       Number(ledgerId),
     );
     if (res.changes === 1) pairs.push({ image_id: ids[i], txn_id: target });
@@ -336,6 +338,12 @@ export async function removeById(
   );
   if (!row) return false;
   if (!env.ATTACHMENTS) throw new Error('附件存储未配置');
+  const claim = await db.run(
+    `UPDATE attachments SET delete_started = 1 WHERE id = ? AND ledger_id = ?
+     AND EXISTS (SELECT 1 FROM ledgers WHERE id = ? AND is_archived = 0)`,
+    id, ledgerId, ledgerId,
+  );
+  if (!claim.changes) throw new Error('附件不存在或账本已归档');
   await deleteKeysFromR2(env, [String(row.rel_path)], { throwOnError: true });
   await db.run('DELETE FROM attachments WHERE id = ?', row.id);
   return true;

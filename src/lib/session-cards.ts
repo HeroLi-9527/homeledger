@@ -39,6 +39,7 @@ export interface UpdateSessionCardInput {
   total_cost_cents?: number;
   expires_at?: string | null;
   note?: string | null;
+  is_archived?: number;
 }
 
 export interface TopUpSessionCardInput {
@@ -188,69 +189,29 @@ export async function createSessionCard(
   const expiresAt = validOptionalDate(input.expires_at, '有效期');
   const note = input.note ? String(input.note).trim().slice(0, 200) || null : null;
 
-  let purchaseTxnId: number | null = null;
-  if (input.record_expense && cost > 0) {
-    purchaseTxnId = await txn.createTransaction(db, ledgerId, userId, {
-      type: 'expense',
-      amount_cents: cost,
-      currency,
-      account_id: input.account_id || null,
-      category_id: input.category_id || null,
-      txn_date: purchaseDate,
-      merchant: merchant || name,
-      note: `购买次卡：${name}（${total}次）`,
-      source: 'manual',
-    });
-  }
-
+  const linked = Boolean(input.record_expense && cost > 0);
+  const expense = linked ? await txn.prepareTransactionWrites(db, ledgerId, userId, {
+    type: 'expense', amount_cents: cost, currency, account_id: input.account_id || null,
+    category_id: input.category_id || null, txn_date: purchaseDate, merchant: merchant || name,
+    note: `购买次卡：${name}（${total}次）`, source: 'manual',
+  }) : [];
   const stamp = nowStr();
-  let cardId = 0;
-  try {
-    const ins = await db.run(
-      `INSERT INTO session_cards
-       (ledger_id, name, icon, merchant, total_sessions, remaining_sessions, total_cost_cents, currency,
-        purchase_date, expires_at, purchase_txn_id, is_archived, note, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)`,
-      ledgerId,
-      name,
-      icon,
-      merchant,
-      total,
-      remaining,
-      cost,
-      currency,
-      purchaseDate,
-      expiresAt,
-      purchaseTxnId,
-      note,
-      stamp,
-      stamp,
-    );
-    cardId = ins.lastInsertRowid;
-    const initNote =
-      remaining < total ? `补录存量卡（共 ${total} 次，当前余 ${remaining} 次）` : `开卡建账（共 ${total} 次）`;
-    await db.run(
-      `INSERT INTO session_card_logs (card_id, ledger_id, user_id, delta, used_at, note, txn_id, created_at)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      cardId,
-      ledgerId,
-      userId,
-      remaining,
-      purchaseDate,
-      initNote,
-      purchaseTxnId,
-      stamp,
-    );
-    return cardId;
-  } catch (e) {
-    if (cardId) {
-      await db.run('DELETE FROM session_cards WHERE id = ? AND ledger_id = ?', cardId, ledgerId).catch(() => {});
-    }
-    if (purchaseTxnId) {
-      await txn.softDelete(db, purchaseTxnId, ledgerId, { skipSync: true }).catch(() => {});
-    }
-    throw e;
-  }
+  const initNote = remaining < total
+    ? `补录存量卡（共 ${total} 次，当前余 ${remaining} 次）` : `开卡建账（共 ${total} 次）`;
+  const result = await db.batch([
+    ...expense,
+    [`INSERT INTO session_cards
+      (ledger_id, name, icon, merchant, total_sessions, remaining_sessions, total_cost_cents, currency,
+       purchase_date, expires_at, purchase_txn_id, is_archived, note, created_at, updated_at)
+      SELECT ?,?,?,?,?,?,?,?,?,?,${linked ? 'last_insert_rowid()' : 'NULL'},0,?,?,? WHERE ${txn.activeLedgerGuard}`,
+      [ledgerId, name, icon, merchant, total, remaining, cost, currency, purchaseDate, expiresAt, note, stamp, stamp, ledgerId]],
+    [`INSERT INTO session_card_logs (card_id, ledger_id, user_id, delta, used_at, note, txn_id, created_at)
+      SELECT c.id, c.ledger_id, ?, ?, ?, ?, c.purchase_txn_id, ? FROM session_cards c
+      WHERE c.id = last_insert_rowid() AND c.ledger_id = ? AND ${txn.activeLedgerGuard}`,
+      [userId, remaining, purchaseDate, initNote, stamp, ledgerId, ledgerId]],
+  ]);
+  if (result[expense.length]?.meta.changes !== 1) throw new Error('账本已归档，只能查阅和导出');
+  return Number(result[expense.length].meta.last_row_id);
 }
 
 export async function updateSessionCard(
@@ -274,20 +235,24 @@ export async function updateSessionCard(
     input.total_cost_cents !== undefined ? Math.round(Number(input.total_cost_cents)) : Number(existing.total_cost_cents);
   if (!Number.isFinite(cost) || cost < 0) throw new Error('购卡金额不能为负数');
 
-  await db.run(
+  const result = await db.run(
     `UPDATE session_cards
-     SET name = ?, icon = ?, merchant = ?, total_cost_cents = ?, expires_at = ?, note = ?, updated_at = ?
-     WHERE id = ? AND ledger_id = ?`,
+     SET name = ?, icon = ?, merchant = ?, total_cost_cents = ?, expires_at = ?, note = ?,
+         is_archived = COALESCE(?, is_archived), updated_at = ?
+     WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
     name,
     icon,
     merchant,
     cost,
     expiresAt,
     note,
+    input.is_archived ?? null,
     nowStr(),
     id,
     ledgerId,
+    ledgerId,
   );
+  if (!result.changes) throw new Error('次卡不存在或账本已归档');
   return (await getSessionCard(db, id, ledgerId))!;
 }
 
@@ -306,49 +271,23 @@ export async function useSessionCard(
   const note = opts.note ? String(opts.note).trim().slice(0, 200) || null : null;
   const stamp = nowStr();
 
-  // 先执行条件原子扣减，杜绝 batch 中无条件 INSERT 产生并发孤儿日志
-  const upd = await db.run(
-    `UPDATE session_cards
-     SET remaining_sessions = remaining_sessions - ?, updated_at = ?
-     WHERE id = ? AND ledger_id = ? AND is_archived = 0 AND remaining_sessions >= ?`,
-    count,
-    stamp,
-    id,
-    ledgerId,
-    count,
-  );
-  if (upd.changes !== 1) {
+  const available = `id = ? AND ledger_id = ? AND is_archived = 0 AND remaining_sessions >= ? AND ${txn.activeLedgerGuard}`;
+  const params = [id, ledgerId, count, ledgerId];
+  const [log, update] = await db.batch([
+    [`INSERT INTO session_card_logs (card_id, ledger_id, user_id, delta, used_at, note, created_at)
+      SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM session_cards WHERE ${available})`,
+      [id, ledgerId, userId, -count, usedAt, note, stamp, ...params]],
+    [`UPDATE session_cards SET remaining_sessions = remaining_sessions - ?, updated_at = ? WHERE ${available}`,
+      [count, stamp, ...params]],
+  ]);
+  if (update.meta.changes !== 1) {
     const existing = await getSessionCard(db, id, ledgerId);
     if (!existing) throw new Error('次卡不存在');
     if (existing.is_archived) throw new Error('次卡已归档，请先恢复后再核销');
-    throw new Error(`剩余次数不足（当前剩余 ${existing.remaining_sessions} 次）`);
+    if (existing.remaining_sessions < count) throw new Error(`剩余次数不足（当前剩余 ${existing.remaining_sessions} 次）`);
+    throw new Error('账本已归档，只能查阅和导出');
   }
-
-  try {
-    const logRes = await db.run(
-      `INSERT INTO session_card_logs (card_id, ledger_id, user_id, delta, used_at, note, txn_id, created_at)
-       VALUES (?,?,?,?,?,?,NULL,?)`,
-      id,
-      ledgerId,
-      userId,
-      -count,
-      usedAt,
-      note,
-      stamp,
-    );
-    return { card: (await getSessionCard(db, id, ledgerId))!, logId: logRes.lastInsertRowid };
-  } catch (e) {
-    await db
-      .run(
-        'UPDATE session_cards SET remaining_sessions = remaining_sessions + ?, updated_at = ? WHERE id = ? AND ledger_id = ?',
-        count,
-        nowStr(),
-        id,
-        ledgerId,
-      )
-      .catch(() => {});
-    throw e;
-  }
+  return { card: (await getSessionCard(db, id, ledgerId))!, logId: Number(log.meta.last_row_id) };
 }
 
 export async function topUpSessionCard(
@@ -368,52 +307,29 @@ export async function topUpSessionCard(
   const addCost = Math.round(Number(input.add_cost_cents || 0));
   if (!Number.isFinite(addCost) || addCost < 0) throw new Error('续费金额不能为负数');
   const topupDate = validOptionalDate(input.topup_date, '续费日期') || todayStr();
-  const nextExpiry =
-    input.expires_at !== undefined && String(input.expires_at || '').trim() !== ''
-      ? validOptionalDate(input.expires_at, '新有效期')
-      : existing.expires_at;
+  const nextExpiry = validOptionalDate(input.expires_at, '新有效期');
   const note = input.note ? String(input.note).trim().slice(0, 200) : `续费加次 +${addSessions} 次`;
-
-  let txnId: number | null = null;
-  if (input.record_expense && addCost > 0) {
-    txnId = await txn.createTransaction(db, ledgerId, userId, {
-      type: 'expense',
-      amount_cents: addCost,
-      currency: existing.currency || 'CNY',
-      account_id: input.account_id || null,
-      category_id: input.category_id || null,
-      txn_date: topupDate,
-      merchant: existing.merchant || existing.name,
-      note: `次卡续费：${existing.name}（+${addSessions}次）`,
-      source: 'manual',
-    });
-  }
+  const linked = Boolean(input.record_expense && addCost > 0);
+  const cardGuard: BatchStatement = ['EXISTS (SELECT 1 FROM session_cards WHERE id = ? AND ledger_id = ?)', [id, ledgerId]];
+  const expense = linked ? await txn.prepareTransactionWrites(db, ledgerId, userId, {
+    type: 'expense', amount_cents: addCost, currency: existing.currency || 'CNY', account_id: input.account_id || null,
+    category_id: input.category_id || null, txn_date: topupDate, merchant: existing.merchant || existing.name,
+    note: `次卡续费：${existing.name}（+${addSessions}次）`, source: 'manual',
+  }, cardGuard) : [];
 
   const stamp = nowStr();
-  const stmts: BatchStatement[] = [
-    [
-      `UPDATE session_cards
-       SET total_sessions = total_sessions + ?, remaining_sessions = remaining_sessions + ?,
-           total_cost_cents = total_cost_cents + ?, expires_at = ?, is_archived = 0, updated_at = ?
-       WHERE id = ? AND ledger_id = ?`,
-      [addSessions, addSessions, addCost, nextExpiry, stamp, id, ledgerId],
-    ],
-    [
-      `INSERT INTO session_card_logs (card_id, ledger_id, user_id, delta, used_at, note, txn_id, created_at)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      [id, ledgerId, userId, addSessions, topupDate, note, txnId, stamp],
-    ],
-  ];
-
-  try {
-    await db.batch(stmts);
-    return (await getSessionCard(db, id, ledgerId))!;
-  } catch (e) {
-    if (txnId) {
-      await txn.softDelete(db, txnId, ledgerId, { skipSync: true }).catch(() => {});
-    }
-    throw e;
-  }
+  const results = await db.batch([
+    ...expense,
+    [`INSERT INTO session_card_logs (card_id, ledger_id, user_id, delta, used_at, note, txn_id, created_at)
+      SELECT ?,?,?,?,?,?,${linked ? 'last_insert_rowid()' : 'NULL'},? WHERE ${cardGuard[0]} AND ${txn.activeLedgerGuard}`,
+      [id, ledgerId, userId, addSessions, topupDate, note, stamp, id, ledgerId, ledgerId]],
+    [`UPDATE session_cards SET total_sessions = total_sessions + ?, remaining_sessions = remaining_sessions + ?,
+        total_cost_cents = total_cost_cents + ?, expires_at = COALESCE(?, expires_at), is_archived = 0, updated_at = ?
+      WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
+      [addSessions, addSessions, addCost, nextExpiry, stamp, id, ledgerId, ledgerId]],
+  ]);
+  if (results.at(-1)?.meta.changes !== 1) throw new Error('次卡不存在或账本已归档');
+  return (await getSessionCard(db, id, ledgerId))!;
 }
 
 export async function undoSessionCardLog(db: Db, cardId: number, logId: number, ledgerId: number) {
@@ -426,50 +342,33 @@ export async function undoSessionCardLog(db: Db, cardId: number, logId: number, 
   if (!log) throw new Error('核销记录不存在');
   if (Number(log.delta) >= 0) throw new Error('仅支持撤销核销（扣减次数）记录');
 
-  const del = await db.run(
-    'DELETE FROM session_card_logs WHERE id = ? AND card_id = ? AND ledger_id = ? AND delta < 0',
-    logId,
-    cardId,
-    ledgerId,
-  );
-  if (del.changes !== 1) throw new Error('核销记录已被撤销或不存在');
-
+  const original = `id = ? AND card_id = ? AND ledger_id = ? AND delta < 0 AND ${txn.activeLedgerGuard}`;
+  const args = [logId, cardId, ledgerId, ledgerId];
   const restoreCount = Math.abs(Number(log.delta));
-  await db.run(
-    `UPDATE session_cards
-     SET remaining_sessions = MIN(total_sessions, remaining_sessions + ?), is_archived = 0, updated_at = ?
-     WHERE id = ? AND ledger_id = ?`,
-    restoreCount,
-    nowStr(),
-    cardId,
-    ledgerId,
-  );
+  const [, del] = await db.batch([
+    [`UPDATE session_cards SET remaining_sessions = MIN(total_sessions, remaining_sessions + ?),
+       is_archived = 0, updated_at = ? WHERE id = ? AND ledger_id = ?
+       AND EXISTS (SELECT 1 FROM session_card_logs WHERE ${original})`,
+      [restoreCount, nowStr(), cardId, ledgerId, ...args]],
+    [`DELETE FROM session_card_logs WHERE ${original}`, args],
+  ]);
+  if (del.meta.changes !== 1) throw new Error('核销记录已被撤销或账本已归档');
   return { card: (await getSessionCard(db, cardId, ledgerId))!, restored: restoreCount };
 }
 
-export async function toggleArchiveSessionCard(db: Db, id: number, ledgerId: number): Promise<boolean> {
-  const row = await db.get<{ is_archived: number }>(
-    'SELECT is_archived FROM session_cards WHERE id = ? AND ledger_id = ?',
-    id,
-    ledgerId,
+export async function toggleArchiveSessionCard(db: Db, id: number, ledgerId: number, archived?: number): Promise<boolean> {
+  const result = await db.run(
+    `UPDATE session_cards SET is_archived = COALESCE(?, 1 - is_archived), updated_at = ?
+     WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
+    archived ?? null, nowStr(), id, ledgerId, ledgerId,
   );
-  if (!row) return false;
-  await db.run(
-    'UPDATE session_cards SET is_archived = ?, updated_at = ? WHERE id = ? AND ledger_id = ?',
-    row.is_archived ? 0 : 1,
-    nowStr(),
-    id,
-    ledgerId,
-  );
-  return true;
+  return result.changes === 1;
 }
 
 export async function deleteSessionCard(db: Db, id: number, ledgerId: number): Promise<boolean> {
-  const row = await db.get<{ id: number }>('SELECT id FROM session_cards WHERE id = ? AND ledger_id = ?', id, ledgerId);
-  if (!row) return false;
-  await db.batch([
-    ['DELETE FROM session_card_logs WHERE card_id = ? AND ledger_id = ?', [id, ledgerId]],
-    ['DELETE FROM session_cards WHERE id = ? AND ledger_id = ?', [id, ledgerId]],
+  const [, deleted] = await db.batch([
+    [`DELETE FROM session_card_logs WHERE card_id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, [id, ledgerId, ledgerId]],
+    [`DELETE FROM session_cards WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, [id, ledgerId, ledgerId]],
   ]);
-  return true;
+  return deleted.meta.changes === 1;
 }

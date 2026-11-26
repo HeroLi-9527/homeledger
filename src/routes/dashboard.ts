@@ -195,7 +195,7 @@ dashboardRoutes.get('/', async (c) => {
         subs,
         sessionCards: { activeCount: sessionCards.activeCount, totalRemaining: sessionCards.totalRemaining },
         aiReady,
-        writable: auth.canWrite(ctx.ledger.role),
+        writable: auth.canWriteLedger(ctx.ledger),
         month,
         monthLabel: u.monthLabel(month),
       }),
@@ -245,7 +245,7 @@ dashboardRoutes.get('/calendar', async (c) => {
     )
     .join('');
 
-  const writable = auth.canWrite(ctx.ledger.role);
+  const writable = auth.canWriteLedger(ctx.ledger);
   return c.html(
     layout({
       title: '记账日历',
@@ -353,7 +353,7 @@ dashboardRoutes.get('/search', async (c) => {
     ['subscription', '订阅扣费'],
     ['openapi', '开放 API'],
   ];
-  const writable = auth.canWrite(ctx.ledger.role);
+  const writable = auth.canWriteLedger(ctx.ledger);
   return c.html(
     layout({
       title: '搜索筛选',

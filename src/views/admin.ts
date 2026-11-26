@@ -170,10 +170,10 @@ export function membersPage({
   csrf: string;
 }): string {
   const csrfInput = `<input type="hidden" name="_csrf" value="${esc(csrf)}">`;
-  const canManage = ctx.ledger?.role === 'owner' || ctx.ledger?.role === 'admin';
+  const canManage = !ctx.ledger?.is_archived && (ctx.ledger?.role === 'owner' || ctx.ledger?.role === 'admin');
   const rows = members
     .map((m) => {
-      const canEditNick = canManage || Number(m.user_id) === Number(ctx.user?.id);
+      const canEditNick = !ctx.ledger?.is_archived && (canManage || Number(m.user_id) === Number(ctx.user?.id));
       const nickCell = canEditNick
         ? `<form method="post" action="/members/${m.id}/nickname" class="row" style="display:inline-flex;gap:4px">${csrfInput}<input name="nickname" value="${esc(m.nickname || '')}" placeholder="账本内昵称" maxlength="24" style="width:110px;padding:3px 7px;font-size:12px"><button class="btn btn-sm" type="submit">保存</button></form>`
         : esc(m.nickname || '—');

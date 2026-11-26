@@ -9,7 +9,7 @@ import * as u from '../lib/util.js';
 import type { AccountRow, CategoryRow, HonoEnv } from '../types.js';
 import { accountDetailPage, accountsPage, categoriesPage, tagsPage } from '../views/accounts.js';
 import { layout } from '../views/layout.js';
-import { bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
+import { archivedLedgerResponse, bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
 
 export const accountsRoutes = new Hono<HonoEnv>();
 
@@ -35,7 +35,7 @@ accountsRoutes.get('/accounts', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: accountsPage({ writable: auth.canWrite(ctx.ledger?.role), accounts: rows, ov, sessionCards, expenseCats, csrf: c.get('csrf') || '' }),
+      body: accountsPage({ writable: auth.canWriteLedger(ctx.ledger), accounts: rows, ov, sessionCards, expenseCats, csrf: c.get('csrf') || '' }),
     }),
   );
 });
@@ -44,16 +44,16 @@ accountsRoutes.post('/accounts', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
   const db = dbOf(c);
-  const ctx = c.get('ctx');
+  const ledgerId = Number(c.get('ctx').ledger!.id);
   const body = await bodyOf(c);
   try {
     const data = normalizeAccountWrite(body, { mode: 'create', apiMode: false });
-    await db.run(
+    const created = await db.run(
       `INSERT INTO accounts
        (ledger_id, name, type, icon, currency, initial_cents, balance_cents, credit_limit, bill_day, due_day,
         institution, card_no, note, include_in_net, sort_order, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      Number(ctx.ledger!.id),
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
+      ledgerId,
       data.name,
       data.type,
       data.icon,
@@ -69,7 +69,9 @@ accountsRoutes.post('/accounts', async (c) => {
       data.include_in_net,
       data.sort_order,
       nowStr(),
+      ledgerId,
     );
+    if (!created.changes) return archivedLedgerResponse(c);
     setFlash(c, 'success', '账户已创建');
   } catch (e) {
     setFlash(c, 'error', toPublicError(e));
@@ -84,7 +86,11 @@ accountsRoutes.post('/accounts/:id/archive', async (c) => {
   const id = Number(c.req.param('id'));
   const ledgerId = Number(c.get('ctx').ledger!.id);
   const row = await db.get<{ is_archived: number }>('SELECT is_archived FROM accounts WHERE id = ? AND ledger_id = ?', id, ledgerId);
-  if (row) await db.run('UPDATE accounts SET is_archived = ? WHERE id = ?', row.is_archived ? 0 : 1, id);
+  if (row) {
+    const result = await db.run(`UPDATE accounts SET is_archived = 1 - is_archived WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
+      id, ledgerId, ledgerId);
+    if (!result.changes) return archivedLedgerResponse(c);
+  }
   return c.redirect('/accounts');
 });
 
@@ -209,7 +215,7 @@ accountsRoutes.get('/accounts/:id', async (c) => {
         result,
         from,
         to,
-        writable: auth.canWrite(ctx.ledger!.role),
+        writable: auth.canWriteLedger(ctx.ledger),
         csrf: c.get('csrf') || '',
       }),
     }),
@@ -240,7 +246,7 @@ accountsRoutes.post('/accounts/:id/edit', async (c) => {
       `UPDATE accounts
        SET name = ?, type = ?, icon = ?, currency = ?, include_in_net = ?, sort_order = ?,
            institution = ?, card_no = ?, note = ?, credit_limit = ?, bill_day = ?, due_day = ?
-       WHERE id = ? AND ledger_id = ?`,
+       WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
       data.name,
       data.type,
       data.icon,
@@ -254,6 +260,7 @@ accountsRoutes.post('/accounts/:id/edit', async (c) => {
       data.bill_day,
       data.due_day,
       id,
+      ledgerId,
       ledgerId,
     );
     setFlash(c, 'success', '账户信息已更新');
@@ -316,7 +323,7 @@ accountsRoutes.get('/categories', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: categoriesPage({ writable: auth.canWrite(ctx.ledger?.role), tree, csrf: c.get('csrf') || '' }),
+      body: categoriesPage({ writable: auth.canWriteLedger(ctx.ledger), tree, csrf: c.get('csrf') || '' }),
     }),
   );
 });
@@ -353,15 +360,17 @@ accountsRoutes.post('/categories', async (c) => {
     color = pickHexColor(body.color) || parent.color || color;
     parentId = Number(parent.id);
   }
-  await db.run(
-    'INSERT INTO categories (ledger_id, parent_id, kind, name, icon, color, sort_order) VALUES (?,?,?,?,?,?,0)',
+  const created = await db.run(
+    `INSERT INTO categories (ledger_id, parent_id, kind, name, icon, color, sort_order) SELECT ?,?,?,?,?,?,0 WHERE ${txn.activeLedgerGuard}`,
     ledgerId,
     parentId,
     kind,
     name.slice(0, 20),
     String(body.icon || '🏷️').slice(0, 8) || '🏷️',
     color,
+    ledgerId,
   );
+  if (!created.changes) return archivedLedgerResponse(c);
   setFlash(c, 'success', parentId ? '二级分类已添加' : '一级分类已添加');
   return c.redirect('/categories');
 });
@@ -391,11 +400,12 @@ accountsRoutes.post('/categories/:id', async (c) => {
   const icon = (iconRaw || cat.icon || '🏷️').slice(0, 8);
   const color = pickHexColor(body.color) || cat.color || u.colorFor(name);
   await db.run(
-    'UPDATE categories SET name = ?, icon = ?, color = ? WHERE id = ? AND ledger_id = ? AND is_system = 0',
+    `UPDATE categories SET name = ?, icon = ?, color = ? WHERE id = ? AND ledger_id = ? AND is_system = 0 AND ${txn.activeLedgerGuard}`,
     name,
     icon,
     color,
     id,
+    ledgerId,
     ledgerId,
   );
   setFlash(c, 'success', '分类已更新');
@@ -443,7 +453,7 @@ accountsRoutes.post('/categories/:id/delete', async (c) => {
     setFlash(c, 'error', `该分类下还有 ${used} 笔记账，无法删除`);
     return c.redirect('/categories');
   }
-  await db.run('DELETE FROM categories WHERE id = ? AND ledger_id = ? AND is_system = 0', id, ledgerId);
+  await db.run(`DELETE FROM categories WHERE id = ? AND ledger_id = ? AND is_system = 0 AND ${txn.activeLedgerGuard}`, id, ledgerId, ledgerId);
   setFlash(c, 'success', '分类已删除');
   return c.redirect('/categories');
 });
@@ -475,7 +485,7 @@ accountsRoutes.get('/tags', async (c) => {
       csrf: c.get('csrf') || '',
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
-      body: tagsPage({ writable: auth.canWrite(ctx.ledger?.role), tags: rows, csrf: c.get('csrf') || '' }),
+      body: tagsPage({ writable: auth.canWriteLedger(ctx.ledger), tags: rows, csrf: c.get('csrf') || '' }),
     }),
   );
 });
@@ -488,12 +498,14 @@ accountsRoutes.post('/tags', async (c) => {
   const name = String(body.name || '').trim().slice(0, 20);
   if (name) {
     const color = pickHexColor(body.color) || u.colorFor(name);
-    await db.run(
-      'INSERT OR IGNORE INTO tags (ledger_id, name, color) VALUES (?,?,?)',
-      Number(c.get('ctx').ledger!.id),
-      name,
-      color,
+    const ledgerId = Number(c.get('ctx').ledger!.id);
+    const result = await db.run(
+      `INSERT OR IGNORE INTO tags (ledger_id, name, color) SELECT ?,?,? WHERE ${txn.activeLedgerGuard}`,
+      ledgerId, name, color, ledgerId,
     );
+    if (!result.changes && !(await db.get('SELECT id FROM ledgers WHERE id = ? AND is_archived = 0', ledgerId))) {
+      return archivedLedgerResponse(c);
+    }
   }
   return c.redirect('/tags');
 });
@@ -530,7 +542,7 @@ accountsRoutes.post('/tags/:id', async (c) => {
     return c.redirect('/tags');
   }
   const color = pickHexColor(body.color) || tag.color || u.colorFor(name);
-  await db.run('UPDATE tags SET name = ?, color = ? WHERE id = ? AND ledger_id = ?', name, color, id, ledgerId);
+  await db.run(`UPDATE tags SET name = ?, color = ? WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, name, color, id, ledgerId, ledgerId);
   setFlash(c, 'success', '标签已更新');
   return c.redirect('/tags');
 });
@@ -540,9 +552,10 @@ accountsRoutes.post('/tags/:id/delete', async (c) => {
   if (r) return r;
   const db = dbOf(c);
   const id = Number(c.req.param('id'));
+  const ledgerId = Number(c.get('ctx').ledger!.id);
   await db.batch([
-    ['DELETE FROM transaction_tags WHERE tag_id = ?', [id]],
-    ['DELETE FROM tags WHERE id = ? AND ledger_id = ?', [id, Number(c.get('ctx').ledger!.id)]],
+    [`DELETE FROM transaction_tags WHERE tag_id = ? AND EXISTS (SELECT 1 FROM tags WHERE id = ? AND ledger_id = ?) AND ${txn.activeLedgerGuard}`, [id, id, ledgerId, ledgerId]],
+    [`DELETE FROM tags WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, [id, ledgerId, ledgerId]],
   ]);
   return c.redirect('/tags');
 });

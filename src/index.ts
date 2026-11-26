@@ -1,3 +1,4 @@
+import { rolloverRoutes } from './routes/ledger-rollover.js';
 import { Hono } from 'hono';
 import { visibleAttachment } from './lib/attachments.js';
 import { makeDb } from './db.js';
@@ -195,6 +196,7 @@ app.route('/', subscriptionsRoutes);
 app.route('/', aiRoutes);
 app.route('/', reportsRoutes);
 app.route('/', adminRoutes);
+app.route('/', rolloverRoutes);
 app.route('/', aboutRoutes);
 
 app.notFound((c) => {

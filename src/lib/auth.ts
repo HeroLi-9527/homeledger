@@ -174,6 +174,7 @@ export function csrfCheck(expectedToken: string, bodyToken?: string | null, head
 // ---- 权限与上下文 ----
 
 export const canWrite = (role?: string | null): boolean => (ROLE_RANK[role as Role] || 0) >= ROLE_RANK.member;
+export const canWriteLedger = (ledger?: LedgerRow | null): boolean => !!ledger && !ledger.is_archived && canWrite(ledger.role);
 export const canManage = (role?: string | null): boolean => (ROLE_RANK[role as Role] || 0) >= ROLE_RANK.admin;
 
 export async function membership(db: Db, userId: number, ledgerId: number) {
@@ -194,7 +195,7 @@ export async function loadContext(db: Db, sess: SessionPayload | null): Promise<
   const [ledgers, unread] = await Promise.all([
     db.all<LedgerRow>(
       `SELECT l.*, lm.role FROM ledgers l JOIN ledger_members lm ON lm.ledger_id = l.id
-       WHERE lm.user_id = ? AND l.is_archived = 0 ORDER BY l.sort_order, l.id`,
+       WHERE lm.user_id = ? ORDER BY l.is_archived, l.sort_order, l.id`,
       user.id,
     ),
     db.get<{ c: number }>('SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND is_read = 0', user.id),
@@ -218,7 +219,7 @@ export interface NotifyOptions {
 export async function notify(db: Db, userId: number, opts: NotifyOptions): Promise<boolean> {
   const r = await db.run(
     `INSERT OR IGNORE INTO notifications (user_id, ledger_id, kind, title, body, link, dedupe_key, created_at)
-     VALUES (?,?,?,?,?,?,?,?)`,
+     SELECT ?,?,?,?,?,?,?,? WHERE ? IS NULL OR EXISTS (SELECT 1 FROM ledgers WHERE id = ? AND is_archived = 0)`,
     Number(userId),
     opts.ledgerId ?? null,
     opts.kind || 'info',
@@ -227,6 +228,8 @@ export async function notify(db: Db, userId: number, opts: NotifyOptions): Promi
     opts.link || '',
     opts.dedupeKey ?? null,
     nowStr(),
+    opts.ledgerId ?? null,
+    opts.ledgerId ?? null,
   );
   return r.changes === 1;
 }

@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
-import { addLedgerMember, createDefaultLedger, nowStr, todayStr } from '../db.js';
+import { createDefaultLedger, nowStr, todayStr } from '../db.js';
 import * as auth from '../lib/auth.js';
+import { activeLedgerGuard } from '../lib/txn.js';
 import { colorFor, esc } from '../lib/util.js';
 import type { HonoEnv, Role, UserRow } from '../types.js';
 import { loginPage, registerPage, setupPage, joinRegisterPage } from '../views/auth.js';
@@ -86,7 +87,8 @@ authRoutes.post('/login', async (c) => {
 
   await db.run('UPDATE users SET last_login_at = ? WHERE id = ?', nowStr(), user.id);
   const m = await db.get<{ ledger_id: number }>(
-    'SELECT ledger_id FROM ledger_members WHERE user_id = ? ORDER BY id LIMIT 1',
+    `SELECT m.ledger_id FROM ledger_members m JOIN ledgers l ON l.id = m.ledger_id
+     WHERE m.user_id = ? ORDER BY l.is_archived, m.id LIMIT 1`,
     user.id,
   );
   const payload = auth.createSessionPayload(
@@ -269,6 +271,20 @@ authRoutes.post('/ledgers/switch', async (c) => {
   return c.redirect(safeNext(body.back));
 });
 
+async function acceptInvite(
+  db: ReturnType<typeof dbOf>, invite: { id: number; ledger_id: number; role: string }, userId: number,
+) {
+  const stamp = nowStr();
+  const [claim] = await db.batch([
+    [`UPDATE ledger_invites SET used_by = ?, used_at = ? WHERE id = ? AND used_by IS NULL AND ${activeLedgerGuard}`,
+      [userId, stamp, invite.id, invite.ledger_id]],
+    [`INSERT INTO ledger_members (ledger_id, user_id, role, joined_at)
+      SELECT ?,?,?,? WHERE changes() = 1 ON CONFLICT(ledger_id, user_id) DO NOTHING`,
+      [invite.ledger_id, userId, safeInviteRole(invite.role), stamp]],
+  ]);
+  return claim.meta.changes === 1;
+}
+
 async function loadJoinInvite(db: ReturnType<typeof dbOf>, code: string) {
   const invite = await db.get<{
     id: number;
@@ -282,7 +298,7 @@ async function loadJoinInvite(db: ReturnType<typeof dbOf>, code: string) {
   if (invite.expires_at && invite.expires_at < todayStr()) {
     return { error: { title: '邀请已过期', message: '请让账本管理员重新生成邀请链接。', status: 410 as const } };
   }
-  const ledger = await db.get<{ id: number; name: string }>('SELECT id, name FROM ledgers WHERE id = ?', invite.ledger_id);
+  const ledger = await db.get<{ id: number; name: string }>('SELECT id, name FROM ledgers WHERE id = ? AND is_archived = 0', invite.ledger_id);
   if (!ledger) return { error: { title: '账本不存在', message: '该账本已被删除。', status: 404 as const } };
   return { invite, ledger };
 }
@@ -423,18 +439,11 @@ authRoutes.post('/join/:code/register', async (c) => {
     stamp,
   );
   const newUserId = Number(info.lastInsertRowid);
-  const claim = await db.run(
-    'UPDATE ledger_invites SET used_by = ?, used_at = ? WHERE id = ? AND used_by IS NULL',
-    newUserId,
-    stamp,
-    invite.id,
-  );
-  if (claim.changes !== 1) {
+  if (!(await acceptInvite(db, invite, newUserId))) {
     await db.run('DELETE FROM users WHERE id = ?', newUserId);
-    return renderErr('邀请已使用', '该邀请链接已被使用，请让账本管理员重新生成。', 410);
+    return renderErr('邀请已失效', '该邀请已被使用或账本已归档，请让账本管理员重新生成。', 410);
   }
 
-  await addLedgerMember(db, invite.ledger_id, newUserId, safeInviteRole(invite.role));
   const payload = auth.createSessionPayload(newUserId, Number(invite.ledger_id), 1);
   const token = await auth.signSession(payload, getSessionSecret(envOf(c)));
   c.header('Set-Cookie', auth.sessionCookie(token, envOf(c)), { append: true });
@@ -467,18 +476,9 @@ authRoutes.post('/join/:code', async (c) => {
     setFlash(c, 'error', '该邀请链接已被使用');
     return c.redirect('/');
   }
-  if (!alreadyMember) {
-    const claim = await db.run(
-      'UPDATE ledger_invites SET used_by = ?, used_at = ? WHERE id = ? AND used_by IS NULL',
-      ctx.user!.id,
-      nowStr(),
-      invite.id,
-    );
-    if (claim.changes !== 1) {
-      setFlash(c, 'error', '该邀请链接已被使用');
-      return c.redirect('/');
-    }
-    await addLedgerMember(db, invite.ledger_id, ctx.user!.id, safeInviteRole(invite.role));
+  if (!alreadyMember && !(await acceptInvite(db, invite, ctx.user!.id))) {
+    setFlash(c, 'error', '该邀请已被使用或账本已归档');
+    return c.redirect('/');
   }
   const sess = c.get('sess')!;
   const token = await auth.signSession(

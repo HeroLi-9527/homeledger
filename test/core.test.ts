@@ -1,3 +1,4 @@
+import { rolloverPeriod } from '../src/lib/ledger-rollover.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { accountGroupOf, balanceDeltaStmts, isCreditGroupType, txnEffects } from '../src/db.js';
@@ -451,4 +452,15 @@ test('csvEscape 中和公式注入并保留合法负金额', () => {
   assert.equal(csvEscape('\t=1+1'), "'\t=1+1");
   assert.equal(csvEscape('\r=1+1'), '"\'\r=1+1"');
   assert.equal(csvEscape('  =HYPERLINK("a","b")'), '"  \'=HYPERLINK(""a"",""b"")"'.replace('  \'', '\'  '));
+});
+
+test('年度结转以站点日期确定目标年度和元旦确认边界', () => {
+  assert.deepEqual(rolloverPeriod(null, undefined, '2027-01-03'), {
+    targetYear: 2027, boundary: '2027-01-01', cutoffDate: '2026-12-31 23:59:59', periodClosed: true,
+  });
+  assert.equal(rolloverPeriod(2026, undefined, '2026-12-31').periodClosed, false);
+  assert.equal(rolloverPeriod(2026, undefined, '2027-01-01').periodClosed, true);
+  assert.equal(rolloverPeriod(2026, undefined, '2028-01-01').targetYear, 2027);
+  assert.throws(() => rolloverPeriod(2026, 2028, '2027-01-01'), { status: 400 });
+  assert.throws(() => rolloverPeriod(null, 2027.5, '2027-01-01'), { status: 400 });
 });

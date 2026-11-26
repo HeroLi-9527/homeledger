@@ -3,13 +3,18 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import test from 'node:test';
-import { makeDb, recomputeAccountBalances, todayStr } from '../src/db.js';
+import { makeDb, nowStr, recomputeAccountBalances, todayStr } from '../src/db.js';
 import { app } from '../src/index.js';
 import { getAiConfig } from '../src/lib/ai.js';
+import { removeById } from '../src/lib/attachments.js';
+import { createSessionPayload, hashPassword, sha256Hex, signSession } from '../src/lib/auth.js';
+import { executeLedgerRollover, previewLedgerRollover, RolloverError } from '../src/lib/ledger-rollover.js';
+import { createSessionCard, deleteSessionCard, toggleArchiveSessionCard, topUpSessionCard, undoSessionCardLog, updateSessionCard, useSessionCard } from '../src/lib/session-cards.js';
+import { runDue as runDueSubscriptions } from '../src/lib/subscriptions.js';
 import { importRecords, mapNativeRecords, NATIVE_EXPORT_HEADER, parseBill, toCsv } from '../src/lib/importers.js';
-import { checkCreditAccounts, checkSessionCards, repairReimbursedLinks, runScheduled } from '../src/lib/scheduler.js';
-import { iterateAllForExport } from '../src/lib/txn.js';
-import type { Env } from '../src/types.js';
+import { checkCreditAccounts, checkSessionCards, repairReimbursedLinks, runDueRecurring, runScheduled } from '../src/lib/scheduler.js';
+import { createTransaction, iterateAllForExport, markReimbursed, purgeTransaction, softDelete } from '../src/lib/txn.js';
+import type { Db, Env } from '../src/types.js';
 
 type SQLInputValue = null | number | bigint | string | Uint8Array;
 interface SqliteStatement {
@@ -32,7 +37,7 @@ function normParam(v: unknown): SQLInputValue {
   return String(v);
 }
 
-function createSqliteD1(sqlite: SqliteDatabase): D1Database {
+function createSqliteD1(sqlite: SqliteDatabase, beforeRun?: (sql: string) => Promise<void> | undefined): D1Database {
   const mkStmt = (sql: string, bound: SQLInputValue[] = []) => ({
     bind(...params: unknown[]) {
       return mkStmt(sql, params.map(normParam));
@@ -47,7 +52,14 @@ function createSqliteD1(sqlite: SqliteDatabase): D1Database {
       return (col ? row[col] : row) as T;
     },
     async run() {
-      if (/^\s*(?:SELECT|PRAGMA)\b/i.test(sql)) return this.all();
+      const barrier = beforeRun?.(sql);
+      if (barrier) await barrier;
+      return this.execute();
+    },
+    execute() {
+      if (/^\s*(?:SELECT|PRAGMA)\b/i.test(sql)) {
+        return { results: sqlite.prepare(sql).all(...bound), success: true, meta: { duration: 0, changes: 0, last_row_id: 0 } };
+      }
       const info = sqlite.prepare(sql).run(...bound);
       return {
         results: [],
@@ -68,11 +80,11 @@ function createSqliteD1(sqlite: SqliteDatabase): D1Database {
     prepare(sql: string) {
       return mkStmt(sql);
     },
-    async batch(statements: Array<{ run: () => Promise<unknown> }>) {
+    async batch(statements: Array<{ execute: () => unknown }>) {
       const out = [];
       sqlite.exec('BEGIN');
       try {
-        for (const s of statements) out.push(await s.run());
+        for (const s of statements) out.push(s.execute());
         sqlite.exec('COMMIT');
       } catch (err) {
         try {
@@ -207,7 +219,7 @@ function extractCsrf(html: string): string {
 const PNG_1X1_DATA_URL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 
-test('HomeLedger 端到端全链路测试（极简 D1 + 无状态 Cookie + 离线规则 + OpenAPI + Cron）', async () => {
+test('HomeLedger 端到端全链路测试（极简 D1 + 无状态 Cookie + 离线规则 + OpenAPI + Cron）', async (t) => {
   const { sqlite, env, r2Store } = setupEnv();
   const req = (p: string, init: RequestInit = {}) =>
     app.fetch(new Request(`http://localhost${p}`, init), env);
@@ -393,13 +405,17 @@ test('HomeLedger 端到端全链路测试（极简 D1 + 无状态 Cookie + 离�
   await trashAction('delete');
   const r2Delete = env.ATTACHMENTS.delete;
   env.ATTACHMENTS.delete = async () => { throw new Error('R2 暂不可用'); };
+  const purgeError = t.mock.method(console, 'error', () => {});
   try {
     await trashAction('purge');
+    assert.deepEqual(purgeError.mock.calls.map(({ arguments: args }) => [args[0], (args[1] as Error).message]),
+      [['[r2] delete failed:', 'R2 暂不可用']]);
     assert.equal(r2Store.has(analyzed.images[0].rel), true);
     await trashAction('restore');
     assert.equal((await req(analyzed.images[0].url, { headers: { Cookie: cookieHeader } })).status, 404);
   } finally {
     env.ATTACHMENTS.delete = r2Delete;
+    purgeError.mock.restore();
   }
   await trashAction('purge');
   assert.equal(r2Store.has(analyzed.images[0].rel), false, '永久删除应同步清理 R2 原图');
@@ -706,7 +722,7 @@ test('P0 回归：AI 配置保存、默认账户兜底、CSV 导入预览、邀�
   assert.ok(charlieHome.includes('Charlie的账本'));
   const charlieCsrf = extractCsrf(charlieHome);
 
-  // 5. 归档用户唯一账本后，无活跃账本访问各页面不触发 500
+  // 5. 归档账本保持可查阅，失去成员资格后无账本访问也不触发 500
   const charlieLedger = sqlite
     .prepare("SELECT id FROM ledgers WHERE name = 'Charlie的账本' ORDER BY id DESC LIMIT 1")
     .get() as { id: number };
@@ -717,6 +733,12 @@ test('P0 回归：AI 配置保存、默认账户兜底、CSV 导入预览、邀�
     body: new URLSearchParams({ _csrf: charlieCsrf }),
   });
   assert.equal(archiveRes.status, 302);
+
+  const archivedHome = await req('/', { headers: { Cookie: charlieCookie } });
+  assert.equal(archivedHome.status, 200);
+  assert.match(await archivedHome.text(), /已归档，只读/);
+  assert.equal((await req('/export/ledger.json', { headers: { Cookie: charlieCookie } })).status, 200);
+  sqlite.prepare('DELETE FROM ledger_members WHERE ledger_id = ?').run(charlieLedger.id);
 
   const noLedgerHome = await req('/', { headers: { Cookie: charlieCookie } });
   assert.equal(noLedgerHome.status, 200);
@@ -3960,6 +3982,7 @@ test('Web 表单只改交易金额时重新计算余额，并保留显式账户�
 test('自身 CSV 复用交易校验，第三方批量导入按请求读取账户和汇率', async () => {
   const { env } = setupEnv();
   const db = makeDb(env);
+  await db.run("INSERT INTO ledgers (id, name, owner_id, created_at) VALUES (1, '导入测试账本', 1, ?)", todayStr());
   await db.run("INSERT INTO accounts (id, ledger_id, name, currency, created_at) VALUES (1, 1, '美元账户', 'USD', ?)", todayStr());
   const category = await db.get<{ name: string }>("SELECT name FROM categories WHERE kind = 'expense' AND parent_id IS NULL LIMIT 1");
   assert.ok(category);
@@ -4307,7 +4330,7 @@ test('第 12 项回归：预算/订阅/导入/搜索/分类标签/个人资料/�
   assert.ok(ledgersAfterTransfer.includes('家庭成员二的账本'), '转交后管理员应继承并成为原用户账本的 owner');
 });
 
-test('复核修复回归：并发恢复/删除余额防护、二次建户回滚、CSV 公式中和、AI 密钥控制字符、运维安全与头像孤儿清理', async () => {
+test('复核修复回归：并发恢复/删除余额防护、二次建户回滚、CSV 公式中和、AI 密钥控制字符、运维安全与头像孤儿清理', async (t) => {
   const { execFileSync, spawnSync } = await import('node:child_process');
   const { ACCOUNT_TYPE_MAP } = await import('../src/constants.js');
   const { cleanupOrphanR2 } = await import('../src/lib/scheduler.js');
@@ -4495,6 +4518,7 @@ test('复核修复回归：并发恢复/删除余额防护、二次建户回滚�
       },
     } as unknown as R2Bucket,
   };
+  const avatarError = t.mock.method(console, 'error', () => {});
   const delFailRes = await req(
     '/admin/users/2',
     {
@@ -4505,6 +4529,10 @@ test('复核修复回归：并发恢复/删除余额防护、二次建户回滚�
     },
     brokenR2Env,
   );
+  avatarError.mock.restore();
+  assert.deepEqual(avatarError.mock.calls.map(({ arguments: args }) => [args[0], (args.at(-1) as Error).message]), [
+    ['[r2] delete failed:', 'mock R2 failure'], ['removeAvatar failed after delete user', 'mock R2 failure'],
+  ]);
   const flashHdr = decodeURIComponent(delFailRes.headers.get('Set-Cookie') || '');
   assert.ok(flashHdr.includes('R2 头像清理失败'), 'R2 删除失败时应返回告警 flash 而非静默成功');
   assert.equal(r2Store.has('uploads/avatars/user-2.png'), true, 'R2 失败后孤儿头像仍暂时存在');
@@ -4513,4 +4541,725 @@ test('复核修复回归：并发恢复/删除余额防护、二次建户回滚�
   assert.equal(cleanupRes.deletedUploads, 1, '手动 R2 孤儿清理应回收已删用户的超过 24 小时孤儿头像');
   assert.equal(r2Store.has('uploads/avatars/user-2.png'), false);
   assert.equal(r2Store.has('uploads/avatars/user-1.png'), true, '现存活跃用户的头像绝不能被误删');
+});
+
+async function rolloverFixture() {
+  const { sqlite, env } = setupEnv();
+  const db = makeDb(env);
+  const year = Number(todayStr().slice(0, 4));
+  const boundary = `${year}-01-01`;
+  const oldDay = `${year - 1}-12-31`;
+  const newDay = `${year}-01-03`;
+  const user = (name: string) => Number(sqlite.prepare(
+    'INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?,?,?,?)',
+  ).run(name, name, 'unused', nowStr()).lastInsertRowid);
+  const owner = user('rollover-owner');
+  const viewer = user('rollover-viewer');
+  const ledgerId = Number(sqlite.prepare(
+    "INSERT INTO ledgers (name, kind, currency, icon, color, owner_id, created_at) VALUES ('年度家庭账', 'family', 'CNY', '📗', '#018001', ?, ?)",
+  ).run(owner, oldDay).lastInsertRowid);
+  const member = sqlite.prepare('INSERT INTO ledger_members (ledger_id, user_id, role, joined_at) VALUES (?,?,?,?)');
+  member.run(ledgerId, owner, 'owner', oldDay);
+  member.run(ledgerId, viewer, 'viewer', oldDay);
+  const account = (name: string, currency = 'CNY', balance = 0, archived = 0, kind = 'cash') =>
+    Number(sqlite.prepare(
+      'INSERT INTO accounts (ledger_id, name, currency, type, initial_cents, balance_cents, is_archived, created_at) VALUES (?,?,?,?,?,?,?,?)',
+    ).run(ledgerId, name, currency, kind, balance, balance, archived, oldDay).lastInsertRowid);
+  const cash = account('现金', 'CNY', 10000);
+  const token = async (userId: number, id = ledgerId) => {
+    const raw = `rollover-test-token-${userId}-${id}`;
+    sqlite.prepare(
+      'INSERT INTO api_tokens (user_id, ledger_id, name, token_hash, token_tail, created_at) VALUES (?,?,?,?,?,?)',
+    ).run(userId, id, '年度令牌', await sha256Hex(raw), raw.slice(-4), nowStr());
+    return raw;
+  };
+  const session = async (userId: number, id = ledgerId) => {
+    const payload = createSessionPayload(userId, id, 1);
+    return { cookie: `hl.sid=${await signSession(payload, env.SESSION_SECRET!)}`, csrf: payload.csrf };
+  };
+  const request = (url: string, init: RequestInit = {}) => app.fetch(new Request(`http://localhost${url}`, init), env);
+  return { sqlite, db, env, ledgerId, owner, viewer, cash, year, oldDay, boundary, newDay, account, token, session, request, attachments: env.ATTACHMENTS! };
+}
+
+test('年度结转预览按旧年度账户侧金额、借还与次卡截止日计算，并重新拦截预览后的新流水', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, cash, year, oldDay, newDay } = f;
+  const usd = f.account('美元', 'USD', 1000);
+  const credit = f.account('信用卡', 'CNY', 0, 0, 'credit');
+  const archived = f.account('余额未清归档', 'CNY', 250, 1);
+  const zeroArchived = f.account('余额已清归档', 'CNY', 0, 1);
+  const write = (input: Parameters<typeof createTransaction>[3]) =>
+    createTransaction(db, ledgerId, owner, { txn_date: oldDay, account_id: cash, ...input });
+  await write({ type: 'transfer', amount_cents: 700, to_account_id: usd, to_account_amount_cents: 100 });
+  await write({ type: 'lend', amount_cents: 2000, merchant: '家人' });
+  await write({ type: 'repay_receive', amount_cents: 300, merchant: '家人' });
+  await write({ type: 'expense', amount_cents: 440, account_id: credit });
+  await write({ type: 'income', amount_cents: 10, account_id: usd, currency: 'USD' });
+  await write({ type: 'expense', amount_cents: 500 }).then((id) => softDelete(db, id, ledgerId));
+  sqlite.prepare("UPDATE transactions SET txn_date = ? WHERE account_id = ? AND type = 'expense'").run(`${oldDay} 23:59:59`, credit);
+  const future = await write({ type: 'expense', amount_cents: 333, txn_date: newDay, note: '<未来流水>' });
+
+  const card = await createSessionCard(db, ledgerId, owner, {
+    name: '泳池次卡', total_sessions: 10, total_cost_cents: 1000, purchase_date: oldDay, expires_at: `${year}-04-05`,
+  });
+  await useSessionCard(db, card, ledgerId, owner, { count: 2, used_at: oldDay });
+  const pendingUse = await useSessionCard(db, card, ledgerId, owner, { used_at: newDay });
+  await createSessionCard(db, ledgerId, owner, {
+    name: '过期卡', total_sessions: 3, total_cost_cents: 0, purchase_date: oldDay, expires_at: oldDay,
+  });
+
+  let p = await previewLedgerRollover(db, ledgerId, year);
+  assert.equal(p.cutoffDate, `${oldDay} 23:59:59`);
+  assert.deepEqual(p.accounts.map((a) => [a.id, a.closing_cents, a.is_archived]), [
+    [cash, 7600, 0], [usd, 1110, 0], [credit, -440, 0], [archived, 250, 1],
+  ]);
+  assert.ok(!p.accounts.some((a) => a.id === zeroArchived));
+  assert.deepEqual(p.debts.map((d) => [d.counterparty, d.balance_cents]), [['家人', 1700]]);
+  assert.deepEqual(p.blockingTransactions.map((t) => t.id), [future]);
+  assert.deepEqual(p.blockingCardActions.map((a) => a.activity_date), [newDay]);
+  assert.equal(p.canConfirm, false);
+
+  const session = await f.session(owner);
+  const page = await f.request(`/ledgers/${ledgerId}/rollover?target_year=${year}`, { headers: { Cookie: session.cookie } });
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.match(html, /需要处理的新年度流水/);
+  assert.match(html, /&lt;未来流水&gt;/);
+  assert.doesNotMatch(html, /id="rollover-name"/);
+  await assert.rejects(executeLedgerRollover(db, ledgerId, owner, { targetYear: year }), { status: 409 });
+
+  await softDelete(db, future, ledgerId);
+  await undoSessionCardLog(db, card, pendingUse.logId, ledgerId);
+  p = await previewLedgerRollover(db, ledgerId, year);
+  assert.equal(p.canConfirm, true);
+  assert.deepEqual(p.sessionCards.map((s) => [s.name, s.remaining_sessions, s.carry_cost_cents, s.expires_at]), [
+    ['泳池次卡', 8, 800, `${year}-04-05`],
+  ]);
+  const upcoming = await previewLedgerRollover(db, ledgerId, year + 1);
+  assert.equal(upcoming.canConfirm, false);
+  assert.match(upcoming.blockers.join(' '), /旧年度尚未结束/);
+  const lateId = await write({ type: 'income', amount_cents: 120, txn_date: newDay });
+  await assert.rejects(executeLedgerRollover(db, ledgerId, owner, { targetYear: year }), /新年度流水/);
+  await softDelete(db, lateId, ledgerId);
+  sqlite.prepare("UPDATE transactions SET account_amount_cents = NULL WHERE account_id = ? AND deleted_at IS NULL").run(credit);
+  const unresolved = await previewLedgerRollover(db, ledgerId, year);
+  assert.equal(unresolved.canConfirm, false);
+  assert.equal(unresolved.unresolvedTransactions.length, 1);
+  await assert.rejects(executeLedgerRollover(db, ledgerId, owner, { targetYear: year }), /账户原币金额/);
+});
+
+test('年度结转 Web、OpenAPI 与权限贯通，永久删除旧账本后仍可独立记账、还款、核销和调度', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, viewer, cash, oldDay, boundary, newDay, year } = f;
+  const ownerSession = await f.session(owner);
+  const viewerSession = await f.session(viewer);
+  const oldToken = await f.token(owner);
+  const viewToken = await f.token(viewer);
+  const route = `/ledgers/${ledgerId}/rollover`;
+  const api = (p: string, tok: string, method = 'GET', body?: object) => f.request(`/api/open${p}`, {
+    method,
+    headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const post = (p: string, auth = ownerSession, fields: Record<string, string> = {}) => f.request(p, {
+    method: 'POST', headers: { Cookie: auth.cookie, Origin: 'http://localhost' },
+    body: new URLSearchParams({ _csrf: auth.csrf, ...fields }),
+  });
+  const category = sqlite.prepare("INSERT INTO categories (ledger_id, parent_id, name, kind) VALUES (?,?,?,'expense')");
+  const parent = Number(category.run(ledgerId, null, '家庭交通').lastInsertRowid);
+  const child = Number(category.run(ledgerId, parent, '换乘费用').lastInsertRowid);
+  sqlite.prepare("INSERT INTO tags (ledger_id, name) VALUES (?, '生活')").run(ledgerId);
+  const rule = sqlite.prepare(`INSERT INTO recurring_rules
+    (ledger_id, name, payload, next_run_at, auto_post, created_by_user_id, created_at) VALUES (?,?,?,?,?,?,?)`);
+  const payload = JSON.stringify({ items: [{ type: 'expense', amount_cents: 120, account_id: cash, category_id: child }], user_id: owner });
+  rule.run(ledgerId, '定期车费', payload, boundary, 1, owner, oldDay);
+  rule.run(ledgerId, '只提醒车费', payload, boundary, 0, owner, oldDay);
+  const subscription = sqlite.prepare(`INSERT INTO subscriptions
+    (ledger_id, name, currency, amount_cents, account_id, category_id, next_charge_at, status,
+     auto_renew, trial_ends_on, anchor_day, last_charge_at, charge_count, created_at)
+    VALUES (?,?,'CNY',400,?,?,?,?,?,?,1,?,?,?)`);
+  subscription.run(ledgerId, '自动订阅', cash, child, boundary, 'active', 1, null, `${year - 1}-12-01`, 3, oldDay);
+  subscription.run(ledgerId, '只提醒订阅', cash, child, boundary, 'active', 0, null, null, 0, oldDay);
+  subscription.run(ledgerId, '跨年试用', cash, child, oldDay, 'trial', 1, newDay, null, 0, oldDay);
+  const loan = await createTransaction(db, ledgerId, owner, {
+    type: 'lend', amount_cents: 2000, account_id: cash, merchant: '应收对象', txn_date: oldDay,
+  });
+  const key = 'uploads/transactions/year-end-voucher.png';
+  const attachmentId = Number(sqlite.prepare(`INSERT INTO attachments (ledger_id, txn_id, user_id, file_name, rel_path, mime, created_at)
+    VALUES (?, ?, ?, '凭证.png', ?, 'image/png', ?)`).run(ledgerId, loan, owner, key, oldDay).lastInsertRowid);
+  const attachments = f.attachments;
+  await attachments.put(key, new Uint8Array([1, 2, 3]), { httpMetadata: { contentType: 'image/png' } });
+  sqlite.prepare("UPDATE debts SET due_date = ? WHERE ledger_id = ? AND counterparty = '应收对象'").run(newDay, ledgerId);
+  sqlite.prepare(`INSERT INTO debts (ledger_id, direction, counterparty, principal_cents, balance_cents, currency, account_id, created_at)
+    VALUES (?, 'payable', '手工外币应付', 450, 320, 'USD', ?, ?)`).run(ledgerId, cash, oldDay);
+  const cardId = await createSessionCard(db, ledgerId, owner, {
+    name: '十次卡', total_sessions: 10, total_cost_cents: 1001, purchase_date: oldDay,
+    account_id: cash, record_expense: true, expires_at: `${year}-12-31`,
+  });
+  await useSessionCard(db, cardId, ledgerId, owner, { count: 3, used_at: oldDay });
+  sqlite.prepare("INSERT INTO goals (ledger_id, name, target_cents, created_at) VALUES (?, '旧目标', 100, ?)").run(ledgerId, oldDay);
+  sqlite.prepare("INSERT INTO budgets (ledger_id, name, amount_cents, created_at) VALUES (?, '旧预算', 100, ?)").run(ledgerId, oldDay);
+
+  const ledgerList = await f.request('/ledgers', { headers: { Cookie: ownerSession.cookie } });
+  assert.ok((await ledgerList.text()).includes(`href="${route}"`));
+  assert.equal((await f.request(route, { headers: { Cookie: viewerSession.cookie } })).status, 403);
+  assert.equal((await post(route, viewerSession, { target_year: String(year) })).status, 403);
+  assert.equal((await api(route, viewToken)).status, 403);
+  assert.equal((await api(route, viewToken, 'POST', {})).status, 403);
+  assert.equal((await api(`${route}?target_year=unknown`, oldToken)).status, 400);
+  const preview = await api(route, oldToken);
+  assert.equal(preview.status, 200);
+  assert.equal((await preview.json() as { canConfirm: boolean }).canConfirm, true);
+
+  const completed = await post(route, ownerSession, { target_year: String(year), name: '新年度家庭账' });
+  assert.equal(completed.status, 303);
+  const switched = extractSidCookie(completed);
+  assert.ok(switched);
+  const old = await db.get<{ is_archived: number; rolled_over_to_id: number }>(
+    'SELECT is_archived, rolled_over_to_id FROM ledgers WHERE id = ?', ledgerId,
+  );
+  assert.ok(old?.is_archived);
+  const newId = old.rolled_over_to_id;
+  const newLedgerPage = await f.request('/ledgers', {
+    headers: { Cookie: [switched, (completed.headers.get('set-cookie') || '').match(/hl\.flash=[^;,]+/)?.[0]].filter(Boolean).join('; ') },
+  });
+  const newLedgerHtml = await newLedgerPage.text();
+  assert.match(newLedgerHtml, /topbar-sub">新年度家庭账/);
+  assert.match(newLedgerHtml, /请签发默认指向新账本的令牌/);
+  sqlite.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(await hashPassword('rollover-test-password'), owner);
+  const loggedIn = await f.request('/login', {
+    method: 'POST', headers: { Origin: 'http://localhost' },
+    body: new URLSearchParams({ username: 'rollover-owner', password: 'rollover-test-password' }),
+  });
+  assert.equal(loggedIn.status, 302);
+  const loginHome = await f.request('/', { headers: { Cookie: extractSidCookie(loggedIn) } });
+  assert.match(await loginHome.text(), /topbar-sub">新年度家庭账/);
+  const retry = await api(route, oldToken, 'POST', { target_year: year });
+  assert.equal(retry.status, 200);
+  assert.equal((await retry.json() as { ledgerId: number }).ledgerId, newId);
+
+  const newAccount = await db.get<{ id: number; initial_cents: number; balance_cents: number; created_at: string }>(
+    'SELECT id, initial_cents, balance_cents, created_at FROM accounts WHERE ledger_id = ?', newId,
+  );
+  assert.ok(newAccount && newAccount.id !== cash);
+  assert.equal(newAccount.initial_cents, 6999);
+  assert.equal(newAccount.balance_cents, 6999);
+  assert.equal(newAccount.created_at, `${boundary} 00:00:00`);
+  const newChild = await db.get<{ id: number; parent_id: number }>("SELECT id, parent_id FROM categories WHERE ledger_id = ? AND name = '换乘费用'", newId);
+  assert.ok(newChild && newChild.id !== child && newChild.parent_id !== parent);
+  assert.equal((await db.get<{ name: string }>('SELECT name FROM categories WHERE id = ? AND ledger_id = ?', newChild.parent_id, newId))?.name, '家庭交通');
+  assert.deepEqual((await db.all<{ role: string }>('SELECT role FROM ledger_members WHERE ledger_id = ? ORDER BY user_id', newId)).map((m) => m.role), ['owner', 'viewer']);
+  const newCard = await db.get<{ id: number; purchase_txn_id: number | null; total_sessions: number; total_cost_cents: number }>(
+    'SELECT id, purchase_txn_id, total_sessions, total_cost_cents FROM session_cards WHERE ledger_id = ?', newId,
+  );
+  assert.ok(newCard && newCard.id !== cardId);
+  assert.equal(newCard.purchase_txn_id, null);
+  assert.equal(newCard.total_sessions, 7);
+  assert.equal(newCard.total_cost_cents, 701);
+  for (const table of ['transactions', 'attachments', 'session_card_logs', 'budgets', 'goals']) {
+    assert.equal((await db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} WHERE ledger_id = ?`, newId))?.n, 0);
+  }
+  assert.equal((await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM recurring_rules WHERE ledger_id = ? AND is_active = 0', ledgerId))?.n, 2);
+  assert.equal((await db.get<{ n: number }>("SELECT COUNT(*) AS n FROM subscriptions WHERE ledger_id = ? AND status = 'canceled'", ledgerId))?.n, 3);
+  const oldPage = await f.request('/transactions', { headers: { Cookie: ownerSession.cookie } });
+  const oldHtml = await oldPage.text();
+  assert.match(oldHtml, /已归档，只读/);
+  assert.doesNotMatch(oldHtml, /href="\/transactions\/new"/);
+  assert.equal((await post('/transactions', ownerSession)).status, 403);
+  assert.equal((await post('/members/invite', ownerSession)).status, 403);
+  assert.equal((await f.request('/reports', { headers: { Cookie: viewerSession.cookie } })).status, 200);
+  assert.equal((await f.request('/export/csv', { headers: { Cookie: ownerSession.cookie } })).status, 200);
+  assert.equal((await api('/transactions', oldToken)).status, 200);
+  const archivedVoucher = await api(`/attachments/${attachmentId}`, oldToken);
+  assert.equal(archivedVoucher.status, 200);
+  assert.deepEqual(new Uint8Array(await archivedVoucher.arrayBuffer()), new Uint8Array([1, 2, 3]));
+  assert.equal((await api('/transactions', oldToken, 'POST', {})).status, 403);
+  assert.equal((await api('/budgets', oldToken, 'POST', {})).status, 403);
+  assert.equal((await post(`/ledgers/${ledgerId}/archive`)).status, 403);
+  assert.equal((await db.get<{ is_archived: number }>('SELECT is_archived FROM ledgers WHERE id = ?', ledgerId))?.is_archived, 1);
+  const deleted = await post(`/ledgers/${ledgerId}/delete`, ownerSession, { confirm_name: '年度家庭账', _json: '1' });
+  assert.equal(deleted.status, 200);
+  assert.equal(await db.get('SELECT id FROM ledgers WHERE id = ?', ledgerId), undefined);
+  assert.equal(await attachments.get(key), null);
+  assert.equal((await api('/transactions', oldToken)).status, 401);
+
+  const newToken = await f.token(owner, newId);
+  const newDebt = await db.get<{ id: number; account_id: number; opening_cents: number; due_date: string }>(
+    "SELECT * FROM debts WHERE ledger_id = ? AND counterparty = '应收对象'", newId,
+  );
+  assert.ok(newDebt);
+  assert.equal(newDebt.account_id, newAccount.id);
+  assert.equal(newDebt.opening_cents, 2000);
+  assert.equal(newDebt.due_date, newDay);
+  const pay = await api(`/debts/${newDebt.id}/settle`, newToken, 'POST', { amount_cents: 750, txn_date: newDay });
+  assert.equal(pay.status, 200);
+  assert.equal((await pay.json() as { debt: { balance_cents: number } }).debt.balance_cents, 1250);
+  const manual = await db.get<{ id: number; balance_cents: number }>("SELECT * FROM debts WHERE ledger_id = ? AND currency = 'USD'", newId);
+  assert.ok(manual);
+  assert.equal(manual.balance_cents, 320);
+  const fx = await api(`/debts/${manual.id}/settle`, newToken, 'POST', { amount_cents: 25, txn_date: newDay });
+  assert.equal(fx.status, 200);
+  assert.equal((await fx.json() as { debt: { balance_cents: number } }).debt.balance_cents, 295);
+  const spend = await api('/transactions', newToken, 'POST', { type: 'expense', amount_cents: 200, account_id: newAccount.id, category_id: newChild.id, tags: ['生活'], txn_date: newDay });
+  assert.equal(spend.status, 201);
+  const use = await api(`/session-cards/${newCard.id}/use`, newToken, 'POST', { count: 1, used_at: newDay });
+  assert.ok(use.ok);
+  assert.equal((await db.get<{ remaining_sessions: number }>('SELECT remaining_sessions FROM session_cards WHERE id = ?', newCard.id))?.remaining_sessions, 6);
+  assert.equal(await runDueRecurring(db, newDay), 1);
+  assert.equal(await runDueRecurring(db, newDay), 0);
+  assert.equal((await runDueSubscriptions(db, newDay)).charged, 2);
+  assert.equal((await runDueSubscriptions(db, newDay)).charged, 0);
+  const automated = await db.all<{ txn_date: string; source: string; account_id: number; category_id: number }>(
+    "SELECT txn_date, source, account_id, category_id FROM transactions WHERE ledger_id = ? AND source IN ('recurring', 'subscription') ORDER BY id", newId,
+  );
+  assert.deepEqual(automated.map((r) => [r.source, r.txn_date, r.account_id, r.category_id]), [
+    ['recurring', boundary, newAccount.id, newChild.id],
+    ['subscription', boundary, newAccount.id, newChild.id],
+    ['subscription', newDay, newAccount.id, newChild.id],
+  ]);
+  assert.ok(await db.get("SELECT id FROM notifications WHERE ledger_id = ? AND title LIKE '%只提醒订阅%'", newId));
+  assert.ok(await db.get("SELECT id FROM notifications WHERE ledger_id = ? AND title LIKE '%只提醒车费%'", newId));
+  assert.equal((await api('/transactions', await f.token(viewer, newId), 'POST', {})).status, 403);
+});
+
+test('年度结转遇到数据库失败完整回滚，API 重试及并发确认只创建一个新账本', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, year, cash, oldDay, boundary } = f;
+  sqlite.prepare(`INSERT INTO recurring_rules (ledger_id, name, payload, next_run_at, created_at)
+    VALUES (?, '旧年度末', ?, ?, ?)`).run(
+    ledgerId, JSON.stringify([{ account_id: cash, amount_cents: 200 }]), oldDay, oldDay,
+  );
+  const options = { targetYear: year, name: '只有一份结转' };
+  assert.deepEqual((await previewLedgerRollover(db, ledgerId, year)).blockingPeriods.map((p) => p.next_date), [oldDay]);
+  await assert.rejects(executeLedgerRollover(db, ledgerId, owner, options), /旧年度未处理/);
+  sqlite.exec(`CREATE TRIGGER fail_rollover BEFORE INSERT ON accounts
+    WHEN NEW.ledger_id <> ${ledgerId} BEGIN SELECT RAISE(ABORT, 'injected rollover failure'); END;`);
+  assert.equal(await runDueRecurring(db, oldDay), 1);
+  await assert.rejects(executeLedgerRollover(db, ledgerId, owner, options), /injected rollover failure/);
+  assert.equal((await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM ledgers'))?.n, 1);
+  assert.equal((await db.get<{ is_archived: number }>('SELECT is_archived FROM ledgers WHERE id = ?', ledgerId))?.is_archived, 0);
+  const oldRule = await db.get<{ is_active: number; next_run_at: string }>('SELECT is_active, next_run_at FROM recurring_rules WHERE ledger_id = ?', ledgerId);
+  assert.deepEqual({ ...oldRule }, { is_active: 1, next_run_at: `${year}-01-31` });
+  assert.equal(await runDueRecurring(db, oldDay), 0);
+  const booked = await createTransaction(db, ledgerId, owner, { type: 'income', amount_cents: 300, account_id: cash, txn_date: oldDay });
+  assert.ok(booked);
+  sqlite.exec('DROP TRIGGER fail_rollover');
+
+  const raw = await f.token(owner);
+  const execute = () => f.request(`/api/open/ledgers/${ledgerId}/rollover`, {
+    method: 'POST', headers: { Authorization: `Bearer ${raw}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target_year: year, name: options.name }),
+  });
+  const responses = await Promise.all([execute(), execute()]);
+  assert.deepEqual(responses.map((res) => res.status).sort(), [200, 201]);
+  const results = await Promise.all(responses.map(async (res) => await res.json() as { ledgerId: number; message: string }));
+  assert.equal(results[0].ledgerId, results[1].ledgerId);
+  assert.match(results[0].message, /令牌/);
+  const result = results[0].ledgerId;
+  assert.equal((await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM ledgers'))?.n, 2);
+  assert.equal((await db.get<{ initial_cents: number }>('SELECT initial_cents FROM accounts WHERE ledger_id = ?', result))?.initial_cents, 10100);
+  assert.equal((await db.get<{ created_at: string }>('SELECT created_at FROM accounts WHERE ledger_id = ?', result))?.created_at, `${boundary} 00:00:00`);
+});
+
+test('年度结转与调度竞争时按原期次落账，旧账本先归档则旧调度批次不会写入', async () => {
+  for (const kind of ['recurring', 'subscription', 'card'] as const) {
+    for (const rolloverFirst of [true, false]) {
+      const { sqlite, db, ledgerId, owner, year, cash, oldDay, boundary } = await rolloverFixture();
+      if (kind === 'recurring') {
+        sqlite.prepare(`INSERT INTO recurring_rules (ledger_id, name, payload, next_run_at, created_at)
+          VALUES (?, '跨年规则', ?, ?, ?)`).run(
+          ledgerId, JSON.stringify({ account_id: cash, amount_cents: 180 }), boundary, oldDay,
+        );
+      } else if (kind === 'subscription') {
+        sqlite.prepare(`INSERT INTO subscriptions (ledger_id, name, amount_cents, account_id, next_charge_at, created_at)
+          VALUES (?, '跨年订阅', 180, ?, ?, ?)`).run(ledgerId, cash, boundary, oldDay);
+      }
+      const cardId = kind === 'card' ? await createSessionCard(db, ledgerId, owner, {
+        name: '竞争次卡', total_sessions: 2, total_cost_cents: 400, purchase_date: oldDay,
+      }) : 0;
+      let reach!: () => void;
+      let release!: () => void;
+      const reached = new Promise<void>((resolve) => { reach = resolve; });
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      const delayed: Db = {
+        ...db,
+        async batch(statements) {
+          if (statements.some(([sql]) => /INSERT INTO (transactions|session_card_logs)/.test(sql))) {
+            reach();
+            await released;
+          }
+          return db.batch(statements);
+        },
+      };
+      const run = async (workerDb: Db, id: number) => {
+        if (kind === 'recurring') return runDueRecurring(workerDb, boundary);
+        if (kind === 'subscription') return (await runDueSubscriptions(workerDb, boundary)).charged;
+        await topUpSessionCard(workerDb, id, ledgerId, owner, {
+          add_sessions: 1, add_cost_cents: 180, account_id: cash, record_expense: true, topup_date: boundary,
+        });
+        return 1;
+      };
+      const running = run(delayed, cardId);
+      const done = running.then((count) => ({ count, error: null }), (error: Error) => ({ count: 0, error }));
+      await reached;
+      let newId: number | undefined;
+      try {
+        if (rolloverFirst) newId = (await executeLedgerRollover(db, ledgerId, owner, { targetYear: year })).ledgerId;
+      } finally {
+        release();
+      }
+      const { count, error } = await done;
+      if (rolloverFirst) {
+        assert.equal(count, 0);
+        if (kind === 'card') assert.match(String(error), /账本已归档/);
+        assert.equal((await db.get<{ c: number }>('SELECT COUNT(*) AS c FROM transactions WHERE ledger_id = ?', ledgerId))?.c, 0);
+        assert.equal((await db.get<{ balance_cents: number }>('SELECT balance_cents FROM accounts WHERE id = ?', cash))?.balance_cents, 10000);
+        if (kind !== 'card') {
+          assert.equal(await run(db, 0), 1);
+          assert.equal(await run(db, 0), 0);
+          assert.equal((await db.get<{ ledger_id: number }>('SELECT ledger_id FROM transactions'))?.ledger_id, newId);
+        } else {
+          assert.equal((await db.get<{ n: number }>('SELECT remaining_sessions AS n FROM session_cards WHERE ledger_id = ?', newId))?.n, 2);
+        }
+      } else {
+        assert.equal(error, null);
+        assert.equal(count, 1);
+        await assert.rejects(executeLedgerRollover(db, ledgerId, owner, { targetYear: year }),
+          (error: unknown) => error instanceof RolloverError && error.status === 409 && error.message.includes('新年度流水'));
+        assert.equal((await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM ledgers'))?.n, 1);
+        assert.equal((await db.get<{ balance_cents: number }>('SELECT balance_cents FROM accounts WHERE id = ?', cash))?.balance_cents, 9820);
+      }
+    }
+  }
+});
+
+test('年度结转先校验 Web 和 OpenAPI 账本 ID，再读取无效的表单和 JSON', async () => {
+  const f = await rolloverFixture();
+  const { cookie, csrf } = await f.session(f.owner);
+  const web = await f.request('/ledgers/abc/rollover', {
+    method: 'POST', headers: { Cookie: cookie, Origin: 'http://localhost' },
+    body: new URLSearchParams({ _csrf: csrf, target_year: '错误' }),
+  });
+  assert.equal(web.status, 404);
+  assert.equal(web.headers.get('Location'), null);
+  const api = await f.request('/api/open/ledgers/abc/rollover', {
+    method: 'POST', headers: { Authorization: `Bearer ${await f.token(f.owner)}` }, body: 'invalid json',
+  });
+  assert.equal(api.status, 404);
+});
+
+test('结转排除元旦创建的账户与手工借贷，并拦截引用不可用账户的规则和订阅', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, year, boundary, oldDay, cash } = f;
+  const fresh = f.account('元旦开户', 'CNY', 700);
+  const zero = f.account('零余额归档', 'CNY', 0, 1);
+  const nonzero = f.account('有余额归档', 'CNY', 500, 1);
+  sqlite.prepare('UPDATE accounts SET created_at = ? WHERE id = ?').run(`${boundary} 00:00:00`, fresh);
+  const debtId = Number(sqlite.prepare(`INSERT INTO debts
+    (ledger_id, direction, counterparty, principal_cents, balance_cents, created_at)
+    VALUES (?, 'payable', '元旦借贷', 750, 750, ?)`).run(ledgerId, boundary).lastInsertRowid);
+  const rule = sqlite.prepare(`INSERT INTO recurring_rules (ledger_id, name, payload, next_run_at, created_at)
+    VALUES (?, ?, ?, ?, ?)`);
+  const payload = (from: number, to: number) => JSON.stringify({ items: [{ type: 'transfer', amount_cents: 100, account_id: from, to_account_id: to }] });
+  const ruleId = Number(rule.run(ledgerId, '目标账户不可用', payload(cash, zero), boundary, oldDay).lastInsertRowid);
+  const subId = Number(sqlite.prepare(`INSERT INTO subscriptions (ledger_id, name, amount_cents, account_id, next_charge_at, created_at)
+    VALUES (?, '归档账户订阅', 100, ?, ?, ?)`).run(ledgerId, nonzero, boundary, oldDay).lastInsertRowid);
+
+  const preview = await previewLedgerRollover(db, ledgerId, year);
+  assert.equal(preview.canConfirm, false);
+  assert.deepEqual(preview.accounts.map(({ id }) => id), [cash, nonzero]);
+  assert.deepEqual(preview.debts, []);
+  assert.match(preview.blockers.join(' '), /新年度创建的账户.*新年度创建的手工借贷.*目标账户不可用.*归档账户订阅/);
+  await assert.rejects(executeLedgerRollover(db, ledgerId, owner, { targetYear: year }), { status: 409 });
+  sqlite.prepare('DELETE FROM accounts WHERE id = ?').run(fresh);
+  sqlite.prepare('DELETE FROM debts WHERE id = ?').run(debtId);
+  await assert.rejects(executeLedgerRollover(db, ledgerId, owner, { targetYear: year }), /请先为以下周期账单或订阅更换不可用的账户/);
+  const destination = f.account('有效转入账户');
+  sqlite.prepare('UPDATE recurring_rules SET payload = ? WHERE id = ?').run(payload(cash, destination), ruleId);
+  sqlite.prepare('UPDATE subscriptions SET account_id = ? WHERE id = ?').run(cash, subId);
+  assert.equal((await previewLedgerRollover(db, ledgerId, year)).canConfirm, true);
+});
+
+test('软删已入账的新年周期及订阅流水后，从最早受影响的计划期次接续', async () => {
+  const { sqlite, db, ledgerId, owner, year, boundary, oldDay, cash } = await rolloverFixture();
+  const feb = `${year}-02-01`;
+  sqlite.prepare(`INSERT INTO recurring_rules (ledger_id, name, payload, next_run_at, created_at)
+    VALUES (?, '接续规则', ?, ?, ?)`).run(ledgerId, JSON.stringify({ account_id: cash, amount_cents: 120 }), boundary, oldDay);
+  sqlite.prepare(`INSERT INTO subscriptions (ledger_id, name, amount_cents, account_id, next_charge_at, created_at)
+    VALUES (?, '接续订阅', 280, ?, ?, ?)`).run(ledgerId, cash, boundary, oldDay);
+  assert.equal(await runDueRecurring(db, boundary), 1);
+  assert.equal((await runDueSubscriptions(db, boundary)).charged, 1);
+  assert.equal((await db.get<{ next_run_at: string }>('SELECT next_run_at FROM recurring_rules'))?.next_run_at, feb);
+  assert.equal((await db.get<{ next_charge_at: string }>('SELECT next_charge_at FROM subscriptions'))?.next_charge_at, feb);
+  const written = await db.all<{ id: number }>('SELECT id FROM transactions WHERE ledger_id = ?', ledgerId);
+  for (const { id } of written) await softDelete(db, id, ledgerId);
+  const preview = await previewLedgerRollover(db, ledgerId, year);
+  assert.equal(preview.canConfirm, true);
+  assert.equal(preview.recurringRules[0].next_date, boundary);
+  assert.equal(preview.subscriptions[0].next_date, boundary);
+
+  const { ledgerId: newId } = await executeLedgerRollover(db, ledgerId, owner, { targetYear: year });
+  assert.equal(await runDueRecurring(db, boundary), 1);
+  assert.equal((await runDueSubscriptions(db, boundary)).charged, 1);
+  assert.equal(await runDueRecurring(db, boundary), 0);
+  assert.equal((await runDueSubscriptions(db, boundary)).charged, 0);
+  assert.equal((await db.get<{ charge_count: number }>('SELECT charge_count FROM subscriptions WHERE ledger_id = ?', newId))?.charge_count, 1);
+  const posted = await db.all<{ txn_date: string; source: string }>('SELECT txn_date, source FROM transactions WHERE ledger_id = ? ORDER BY id', newId);
+  assert.deepEqual(posted.map(({ txn_date, source }) => [txn_date, source]), [[boundary, 'recurring'], [boundary, 'subscription']]);
+});
+
+test('连续年度结转保留指定期初债务冲减、普通还款 FIFO 和逐笔本币折算', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, year, oldDay } = f;
+  const firstYear = year - 1;
+  const prior = `${firstYear - 1}-12-31`;
+  const usd = f.account('外币账户', 'USD', 20000);
+  sqlite.prepare('UPDATE accounts SET created_at = ? WHERE ledger_id = ?').run(prior, ledgerId);
+  const debt = sqlite.prepare(`INSERT INTO debts
+    (ledger_id, direction, counterparty, principal_cents, balance_cents, currency, account_id, note, created_at)
+    VALUES (?, 'receivable', ?, ?, ?, 'USD', ?, ?, ?)`);
+  for (const [party, amount, note] of [['同人', 100, '先到'], ['同人', 200, '后到'], ['汇率', 100, '汇率期初']] as const) {
+    debt.run(ledgerId, party, amount, amount, usd, note, prior);
+  }
+  const first = (await executeLedgerRollover(db, ledgerId, owner, { targetYear: firstYear })).ledgerId;
+  const account = (await db.get<{ id: number }>("SELECT id FROM accounts WHERE ledger_id = ? AND currency = 'USD'", first))!.id;
+  const baseAccount = (await db.get<{ id: number }>("SELECT id FROM accounts WHERE ledger_id = ? AND currency = 'CNY'", first))!.id;
+  const later = (await db.get<{ id: number }>("SELECT id FROM debts WHERE ledger_id = ? AND note = '后到'", first))!.id;
+  const token = await f.token(owner, first);
+  const settle = (amount_cents: number) => f.request(`/api/open/debts/${later}/settle`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ amount_cents, account_id: account, txn_date: oldDay }),
+  });
+
+  let reachSync!: () => void;
+  let releaseSync!: () => void;
+  const waiting = new Promise<void>((resolve) => { reachSync = resolve; });
+  const barrier = new Promise<void>((resolve) => { releaseSync = resolve; });
+  const delayed: Db = {
+    ...db,
+    async batch(statements) {
+      if (statements[0]?.[0].includes('changed_balances')) {
+        reachSync();
+        await barrier;
+      }
+      return db.batch(statements);
+    },
+  };
+  const ordinaryPayment = createTransaction(delayed, first, owner, {
+    type: 'repay_receive', amount_cents: 110, merchant: '同人', rate: 7,
+    txn_date: oldDay, account_id: account, currency: 'USD',
+  });
+  await waiting;
+  try {
+    assert.equal((await settle(200)).status, 400, '普通还款已入账时，指定结算不能继续使用过时余额');
+  } finally {
+    releaseSync();
+  }
+  await softDelete(db, await ordinaryPayment, first);
+  assert.equal((await settle(40)).status, 200);
+  const openings = () => db.all<{ note: string; balance_cents: number }>(
+    "SELECT note, balance_cents FROM debts WHERE ledger_id = ? AND counterparty = '同人' ORDER BY id", first,
+  ).then((rows) => rows.map((d) => [d.note, d.balance_cents]));
+  assert.deepEqual(await openings(), [['先到', 100], ['后到', 160]]);
+  const write = (type: string, amount_cents: number, merchant: string, rate?: number) =>
+    createTransaction(db, first, owner, {
+      type, amount_cents, merchant, rate, txn_date: oldDay,
+      account_id: rate ? account : baseAccount, currency: rate ? 'USD' : 'CNY',
+    });
+  await write('repay_receive', 130, '同人', 7);
+  assert.deepEqual(await openings(), [['先到', 0], ['后到', 130]]);
+  await write('lend', 1000, '汇率');
+  await write('repay_receive', 60, '汇率', 5);
+  await write('repay_receive', 90, '汇率', 8);
+  const second = (await executeLedgerRollover(db, first, owner, { targetYear: year })).ledgerId;
+  const carried = await db.all<{ counterparty: string; currency: string; opening_cents: number }>(
+    'SELECT counterparty, currency, opening_cents FROM debts WHERE ledger_id = ? ORDER BY id', second,
+  );
+  assert.deepEqual(carried.map((d) => [d.counterparty, d.currency, d.opening_cents]), [['同人', 'USD', 130], ['汇率', 'CNY', 600]]);
+});
+
+test('结转前 Web 和 OpenAPI 的手工外币借贷结算保留币种，债务更新失败整体回滚', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, oldDay, cash } = f;
+  const usd = f.account('收款美元账户', 'USD', 1000);
+  const debt = sqlite.prepare(`INSERT INTO debts
+    (ledger_id, direction, counterparty, principal_cents, balance_cents, currency, account_id, created_at)
+    VALUES (?, 'receivable', ?, 200, 200, 'USD', ?, ?)`);
+  const apiId = Number(debt.run(ledgerId, '接口手工欠款', usd, oldDay).lastInsertRowid);
+  const webId = Number(debt.run(ledgerId, '网页手工欠款', usd, oldDay).lastInsertRowid);
+  await createTransaction(db, ledgerId, owner, {
+    type: 'lend', amount_cents: 300, merchant: '接口手工欠款', account_id: cash, txn_date: oldDay,
+  });
+  const token = await f.token(owner);
+  const api = () => f.request(`/api/open/debts/${apiId}/settle`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ amount_cents: 75, txn_date: oldDay }),
+  });
+  sqlite.exec(`CREATE TRIGGER reject_settlement BEFORE UPDATE OF balance_cents ON debts
+    WHEN NEW.id = ${apiId} BEGIN SELECT RAISE(ABORT, 'injected debt update failure'); END;`);
+  assert.equal((await api()).status, 400);
+  assert.deepEqual({ ...(await db.get('SELECT balance_cents, manual_balance_cents FROM debts WHERE id = ?', apiId)) },
+    { balance_cents: 200, manual_balance_cents: null });
+  assert.equal(await db.get("SELECT id FROM transactions WHERE type = 'repay_receive'"), undefined);
+  assert.equal((await db.get<{ balance_cents: number }>('SELECT balance_cents FROM accounts WHERE id = ?', usd))?.balance_cents, 1000);
+  sqlite.exec('DROP TRIGGER reject_settlement');
+
+  const { cookie, csrf } = await f.session(owner);
+  const web = await f.request(`/debts/${webId}/settle`, {
+    method: 'POST', headers: { Cookie: cookie, Origin: 'http://localhost' },
+    body: new URLSearchParams({ _csrf: csrf, amount: '0.50', account_id: String(usd) }),
+  });
+  assert.equal(web.status, 302);
+  const success = await api();
+  assert.equal(success.status, 200);
+  assert.equal((await success.json() as { debt: { balance_cents: number } }).debt.balance_cents, 125);
+  const payments = await db.all<{ id: number; currency: string; amount_cents: number; settlement_debt_id: number }>(
+    "SELECT id, currency, amount_cents, settlement_debt_id FROM transactions WHERE type = 'repay_receive' ORDER BY id",
+  );
+  assert.deepEqual(payments.map((p) => [p.currency, p.amount_cents, p.settlement_debt_id]), [['USD', 50, webId], ['USD', 75, apiId]]);
+  assert.equal((await db.get<{ balance_cents: number }>('SELECT balance_cents FROM accounts WHERE id = ?', usd))?.balance_cents, 1125);
+  assert.equal((await db.get<{ balance_cents: number }>("SELECT balance_cents FROM debts WHERE ledger_id = ? AND note = '系统自动汇总'", ledgerId))?.balance_cents, 300);
+  await softDelete(db, payments[1].id, ledgerId);
+  assert.equal((await db.get<{ balance_cents: number }>('SELECT balance_cents FROM debts WHERE id = ?', apiId))?.balance_cents, 200);
+});
+
+test('结转抢先提交时，报销、永久删除和次卡写入在 SQL 层被拒绝', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, cash, year, oldDay, attachments } = f;
+  const reimbursable = await createTransaction(db, ledgerId, owner, {
+    type: 'expense', amount_cents: 200, account_id: cash, txn_date: oldDay, is_reimbursable: true,
+  });
+  const trash = await createTransaction(db, ledgerId, owner, {
+    type: 'expense', amount_cents: 300, account_id: cash, txn_date: oldDay,
+  });
+  await softDelete(db, trash, ledgerId);
+  const key = 'uploads/transactions/rollover-trash-voucher.png';
+  sqlite.prepare(`INSERT INTO attachments (ledger_id, txn_id, user_id, file_name, rel_path, mime, created_at)
+    VALUES (?, ?, ?, '凭证.png', ?, 'image/png', ?)`).run(ledgerId, trash, owner, key, oldDay);
+  await attachments.put(key, 'voucher');
+  const card = await createSessionCard(db, ledgerId, owner, { name: '旧次卡', total_sessions: 3, total_cost_cents: 300, purchase_date: oldDay });
+  await useSessionCard(db, card, ledgerId, owner, { used_at: oldDay });
+
+  let reachReimburse!: () => void;
+  let reachPurge!: () => void;
+  let release!: () => void;
+  const waited = Promise.all([
+    new Promise<void>((resolve) => { reachReimburse = resolve; }),
+    new Promise<void>((resolve) => { reachPurge = resolve; }),
+  ]);
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const delayed: Db = {
+    ...db,
+    async batch(statements) {
+      if (statements.some(([sql]) => /SET reimbursed_at = \?, related_id = last_insert_rowid/.test(sql))) {
+        reachReimburse();
+        await barrier;
+      }
+      return db.batch(statements);
+    },
+    async run(sql, ...args) {
+      if (sql.startsWith('UPDATE transactions SET purge_started = 1')) {
+        reachPurge();
+        await barrier;
+      }
+      return db.run(sql, ...args);
+    },
+  };
+  const reimbursement = assert.rejects(markReimbursed(delayed, [reimbursable], ledgerId, owner, cash), /账本已归档/);
+  const purge = assert.rejects(purgeTransaction(delayed, { ATTACHMENTS: attachments }, trash, ledgerId), /账本已归档/);
+  await waited;
+  try {
+    await executeLedgerRollover(db, ledgerId, owner, { targetYear: year });
+  } finally {
+    release();
+  }
+  await Promise.all([reimbursement, purge]);
+  assert.equal((await db.get<{ balance_cents: number }>('SELECT balance_cents FROM accounts WHERE id = ?', cash))?.balance_cents, 9800);
+  assert.equal(await db.get("SELECT id FROM transactions WHERE type = 'reimburse'"), undefined);
+  assert.deepEqual({ ...(await db.get('SELECT reimbursed_at, related_id FROM transactions WHERE id = ?', reimbursable)) },
+    { reimbursed_at: null, related_id: null });
+  assert.equal((await db.get<{ purge_started: number }>('SELECT purge_started FROM transactions WHERE id = ?', trash))?.purge_started, 0);
+  assert.ok(await db.get('SELECT id FROM attachments WHERE txn_id = ?', trash));
+  assert.ok(await attachments.get(key));
+
+  await assert.rejects(updateSessionCard(db, card, ledgerId, { name: '应拒绝' }), /账本已归档/);
+  assert.equal(await toggleArchiveSessionCard(db, card, ledgerId), false);
+  assert.equal(await deleteSessionCard(db, card, ledgerId), false);
+  assert.deepEqual({ ...(await db.get('SELECT name, is_archived FROM session_cards WHERE id = ?', card)) },
+    { name: '旧次卡', is_archived: 0 });
+  assert.ok(await db.get('SELECT id FROM session_card_logs WHERE card_id = ?', card));
+});
+
+test('结转在 Web 和 OpenAPI 通过鉴权后抢先提交时，新建标签返回 403 且两个账本均未写入', async () => {
+  const f = await rolloverFixture();
+  const { cookie, csrf } = await f.session(f.owner);
+  const token = await f.token(f.owner);
+  let count = 0;
+  let reach!: () => void;
+  let release!: () => void;
+  const waiting = new Promise<void>((resolve) => { reach = resolve; });
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  f.env.DB = createSqliteD1(f.sqlite, (sql) => {
+    if (!/^INSERT (OR IGNORE )?INTO tags/.test(sql)) return;
+    if (++count === 2) reach();
+    return barrier;
+  });
+
+  const web = f.request('/tags', {
+    method: 'POST', headers: { Cookie: cookie, Origin: 'http://localhost' },
+    body: new URLSearchParams({ _csrf: csrf, name: 'Web 并发标签' }),
+  });
+  const api = f.request('/api/open/tags', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'OpenAPI 并发标签' }),
+  });
+  await waiting;
+  try {
+    await executeLedgerRollover(f.db, f.ledgerId, f.owner, { targetYear: f.year });
+  } finally {
+    release();
+  }
+  assert.deepEqual((await Promise.all([web, api])).map(({ status }) => status), [403, 403]);
+  assert.deepEqual(await f.db.all('SELECT name FROM tags'), []);
+});
+
+test('流水或独立附件的 R2 删除先取得声明时，结转等待删除结束', async () => {
+  for (const kind of ['transaction', 'attachment'] as const) {
+    const f = await rolloverFixture();
+    const { sqlite, db, ledgerId, owner, cash, year, oldDay, attachments } = f;
+    const txn = await createTransaction(db, ledgerId, owner, {
+      type: 'expense', amount_cents: 300, account_id: cash, txn_date: oldDay,
+    });
+    const key = 'uploads/transactions/rollover-in-flight.png';
+    const attachmentId = Number(sqlite.prepare(`INSERT INTO attachments
+      (ledger_id, txn_id, user_id, file_name, rel_path, mime, created_at)
+      VALUES (?, ?, ?, '凭证.png', ?, 'image/png', ?)`).run(ledgerId, txn, owner, key, oldDay).lastInsertRowid);
+    await attachments.put(key, 'voucher');
+    if (kind === 'transaction') await softDelete(db, txn, ledgerId);
+
+    let reach!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { reach = resolve; });
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const deleteObject = attachments.delete.bind(attachments);
+    attachments.delete = async (keys) => {
+      reach();
+      await barrier;
+      return deleteObject(keys);
+    };
+    const deletion = kind === 'transaction'
+      ? purgeTransaction(db, f.env, txn, ledgerId)
+      : removeById(db, f.env, ledgerId, attachmentId);
+    await waiting;
+    try {
+      const preview = await previewLedgerRollover(db, ledgerId, year);
+      assert.equal(preview.canConfirm, false);
+      await assert.rejects(executeLedgerRollover(db, ledgerId, owner, { targetYear: year }), /先完成流水或附件的永久删除/);
+    } finally {
+      release();
+    }
+    await deletion;
+    assert.equal(await attachments.get(key), null);
+    assert.equal((await previewLedgerRollover(db, ledgerId, year)).canConfirm, true);
+  }
 });

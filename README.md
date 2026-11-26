@@ -19,6 +19,7 @@
   - 原图存档至 Cloudflare R2 并绑定流水。流水移入回收站后，标签、AA 分账和凭证随流水保留，附件从存档页隐藏。永久删除流水或单独删除附件时同步清理对应 R2 对象。
 - **家庭多账本与权限安全**：
   - 支持多账本隔离、账本改名/归档，以及账本所有者输入账本名称二次确认后的**全子表与 R2 级联永久删除**（同步吊销绑定该账本的 API 令牌）。
+  - 账本所有者可在「账本管理」预览并确认年度结转。新账本承接期末账户余额、未结借贷、有效次卡和接续规则，归档旧账本仍可查阅与导出。
   - 支持 `owner` / `admin` / `member` / `viewer` 四档成员角色；在关闭全站自助注册时仍可通过一次性邀请链接 `/join/:code` 定向注册加入，或由站点管理员在 `/admin` 直接建号与执行 `Cache-Control: no-store` 一次性密码重置。
 - **理财规划与每 4 小时自动任务**：
   - 支持多周期预算（含上期结余滚存结转）、周期账单（支持多明细编辑）、借贷台账（自动汇总借贷支持设到期日并在重算时保留）、储蓄目标与订阅扣费（试用期跟踪、月/年摊销测算、历史扣费明细与删规则留流水）。
@@ -169,6 +170,7 @@ Authorization: Bearer hl_xxxxxxxxxxxxxxxx
 常用端点（写操作兼容 `*_cents` 整数分与元单位金额，编辑同时支持 `PUT` 与 `PATCH`）：
 
 - `GET /api/open/ping`：校验令牌连通性与当前绑定账本信息
+- `GET|POST /api/open/ledgers/:id/rollover`：仅账本所有者可预览或确认年度结转。预览可传查询参数 `target_year`，确认可传 JSON 字段 `target_year` 和 `name`。创建返回 `201`，成功重试返回相同的 `ledgerId` 和 `200`。归档账本的普通写请求返回 `403`。
 - `GET /api/open/overview` / `GET /api/open/summary` / `GET /api/open/reports`：月度汇总、资产负债概览与报表聚合
 - `GET /api/open/transactions` / `GET /api/open/transactions/recent` / `GET /api/open/transactions/:id`：查询流水明细
 - `POST /api/open/transactions` / `PUT|PATCH /api/open/transactions/:id` / `DELETE /api/open/transactions/:id`：写入、编辑或软删流水。转账可传 `account_amount_cents` 和 `to_account_amount_cents` 指定两端实际原币金额。软删保留凭证，永久删除在网页回收站操作。

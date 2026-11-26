@@ -1,5 +1,5 @@
 import { TXN_TYPE_MAP } from '../db.js';
-import { canWrite } from '../lib/auth.js';
+import { canWriteLedger } from '../lib/auth.js';
 import type { AppContext, TxnRow } from '../types.js';
 import type { TxnDateGroup } from '../lib/txn.js';
 import { avatarUrl, esc, fmtAmount, initials, relDate } from '../lib/util.js';
@@ -132,7 +132,7 @@ export function layout({
       ],
     },
   ];
-  const writable = Boolean(ctx.ledger && canWrite(ctx.ledger.role));
+  const writable = canWriteLedger(ctx.ledger);
 
   const ledgerSwitcher = ctx.ledgers.length
     ? `<div class="ledger-switch">
@@ -140,7 +140,7 @@ export function layout({
   <form method="post" action="/ledgers/switch">
     <input type="hidden" name="_csrf" value="${esc(csrf)}">
     <select name="ledger_id" data-autosubmit>
-      ${ctx.ledgers.map((l) => `<option value="${l.id}" ${ctx.ledger && Number(l.id) === Number(ctx.ledger.id) ? 'selected' : ''}>${esc(l.icon || '📒')} ${esc(l.name)}</option>`).join('')}
+      ${ctx.ledgers.map((l) => `<option value="${l.id}" ${ctx.ledger && Number(l.id) === Number(ctx.ledger.id) ? 'selected' : ''}>${esc(l.icon || '📒')} ${esc(l.name)}${l.is_archived ? '（已归档）' : ''}</option>`).join('')}
     </select>
   </form>
 </div>`
@@ -202,7 +202,7 @@ ${g.items
       <button class="nav-toggle" id="nav-toggle" type="button" aria-label="菜单">☰</button>
       <div>
         <div class="topbar-title">${esc(title)}</div>
-        ${ctx.ledger ? `<div class="topbar-sub">${esc(ctx.ledger.name)} · ${esc(ctx.ledger.currency || 'CNY')}</div>` : ''}
+        ${ctx.ledger ? `<div class="topbar-sub">${esc(ctx.ledger.name)} · ${esc(ctx.ledger.currency || 'CNY')}${ctx.ledger.is_archived ? ' · 已归档，只读' : ''}</div>` : ''}
       </div>
       <div class="spacer"></div>
       <a class="btn btn-sm" href="/search" title="搜索">🔍</a>

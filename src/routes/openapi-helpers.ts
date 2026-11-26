@@ -8,6 +8,7 @@ const YUAN_RE = /^-?\d{1,12}(\.\d{0,4})?$/;
 
 export function requireWriteApi(c: Context<HonoEnv>): Response | null {
   const oa = c.get('openAuth');
+  if (oa?.archived) return c.json({ ok: false, error: '账本已归档，只能查阅和导出' }, 403);
   if (!oa || !auth.canWrite(oa.role)) {
     return c.json({ ok: false, error: '当前令牌成员角色为只读，禁止写入' }, 403);
   }

@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { getSetting, nowStr, todayStr } from '../db.js';
 import { accountOptionsHtml } from '../lib/accounts.js';
-import { canWrite, ledgerWriterIds, notify } from '../lib/auth.js';
+import { canWriteLedger, ledgerWriterIds, notify } from '../lib/auth.js';
 import { progressBar } from '../lib/charts.js';
 import * as fd from '../lib/formdata.js';
 import {
@@ -10,7 +10,7 @@ import {
   budgetPeriodRange,
   budgetUsedInRange,
   effectiveBudget,
-  recurringPostStmts,
+  postRecurringPeriod,
   ruleBadAccount,
   tzRefDate,
   type BudgetRow,
@@ -22,7 +22,7 @@ import { esc, fmtAmount } from '../lib/util.js';
 import type { AccountRow, CategoryRow, HonoEnv } from '../types.js';
 import { layout, simpleTable } from '../views/layout.js';
 import { budgetsPage } from '../views/planning.js';
-import { bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
+import { archivedLedgerResponse, bodyOf, dbOf, requireLedger, requireWrite, setFlash, siteMeta, takeFlash, toPublicError } from './helpers.js';
 import { assertAccountInLedger, assertCategoryInLedger } from './openapi-helpers.js';
 
 export const planningRoutes = new Hono<HonoEnv>();
@@ -101,7 +101,7 @@ planningRoutes.get('/budgets', async (c) => {
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
       body: budgetsPage({
-        writable: canWrite(ctx.ledger?.role),
+        writable: canWriteLedger(ctx.ledger),
         items,
         cats,
         accounts,
@@ -153,10 +153,10 @@ planningRoutes.post('/budgets', async (c) => {
     return c.redirect('/budgets');
   }
 
-  await db.run(
+  const created = await db.run(
     `INSERT INTO budgets (ledger_id, name, scope, category_id, account_id, period, amount_cents, currency,
       trigger_type, rollover, alert_pct, start_date, end_date, is_active, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`,
+     SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${txn.activeLedgerGuard}`,
     lid,
     name.slice(0, 30),
     effScope,
@@ -171,7 +171,9 @@ planningRoutes.post('/budgets', async (c) => {
     period === 'custom' ? startDate : null,
     period === 'custom' ? endDate : null,
     nowStr(),
+    lid,
   );
+  if (!created.changes) return archivedLedgerResponse(c);
   setFlash(c, 'success', `预算「${name}」已创建`);
   return c.redirect('/budgets');
 });
@@ -271,7 +273,7 @@ planningRoutes.post('/budgets/:id', async (c) => {
     return c.redirect(`/budgets/${id}/edit`);
   }
   await db.run(
-    `UPDATE budgets SET name=?, scope=?, category_id=?, account_id=?, period=?, amount_cents=?, currency=?, trigger_type=?, rollover=?, alert_pct=?, start_date=?, end_date=?, is_active=? WHERE id=? AND ledger_id=?`,
+    `UPDATE budgets SET name=?, scope=?, category_id=?, account_id=?, period=?, amount_cents=?, currency=?, trigger_type=?, rollover=?, alert_pct=?, start_date=?, end_date=?, is_active=? WHERE id=? AND ledger_id=? AND ${txn.activeLedgerGuard}`,
     String(body.name || b.name).slice(0, 30),
     effScope,
     categoryId,
@@ -287,6 +289,7 @@ planningRoutes.post('/budgets/:id', async (c) => {
     body.is_active ? 1 : 0,
     id,
     lid,
+    lid,
   );
   setFlash(c, 'success', '预算已更新');
   return c.redirect('/budgets');
@@ -298,14 +301,14 @@ planningRoutes.post('/budgets/:id/toggle', async (c) => {
   const db = dbOf(c);
   const id = Number(c.req.param('id'));
   const row = await db.get<{ is_active: number }>('SELECT is_active FROM budgets WHERE id = ? AND ledger_id = ?', id, ledgerId(c));
-  if (row) await db.run('UPDATE budgets SET is_active = ? WHERE id = ?', row.is_active ? 0 : 1, id);
+  if (row) await db.run(`UPDATE budgets SET is_active = ? WHERE id = ? AND ${txn.activeLedgerGuard}`, row.is_active ? 0 : 1, id, ledgerId(c));
   return c.redirect('/budgets');
 });
 
 planningRoutes.post('/budgets/:id/delete', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
-  await dbOf(c).run('DELETE FROM budgets WHERE id = ? AND ledger_id = ?', Number(c.req.param('id')), ledgerId(c));
+  await dbOf(c).run(`DELETE FROM budgets WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, Number(c.req.param('id')), ledgerId(c), ledgerId(c));
   return c.redirect('/budgets');
 });
 
@@ -373,7 +376,7 @@ planningRoutes.get('/recurring', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
-  const writable = canWrite(ctx.ledger?.role);
+  const writable = canWriteLedger(ctx.ledger);
   const [rows, accounts, cats] = await Promise.all([
     db.all<RecurringRuleRow>('SELECT * FROM recurring_rules WHERE ledger_id = ? ORDER BY next_run_at', lid),
     fd.accounts(db, lid),
@@ -536,8 +539,8 @@ planningRoutes.post('/recurring', async (c) => {
   while (next < todayStr() && guard++ < 400) {
     next = advanceDate(next, { frequency, interval_n: intervalN, day_of_month: dayOfMonth });
   }
-  await db.run(
-    'INSERT INTO recurring_rules (ledger_id, name, payload, frequency, interval_n, day_of_month, next_run_at, auto_post, is_active, created_by_user_id, created_at) VALUES (?,?,?,?,?,?,?,?,1,?,?)',
+  const created = await db.run(
+    `INSERT INTO recurring_rules (ledger_id, name, payload, frequency, interval_n, day_of_month, next_run_at, auto_post, is_active, created_by_user_id, created_at) SELECT ?,?,?,?,?,?,?,?,1,?,? WHERE ${txn.activeLedgerGuard}`,
     ledgerId(c),
     name.slice(0, 40),
     JSON.stringify({ items, user_id: ctx.user!.id }),
@@ -548,7 +551,9 @@ planningRoutes.post('/recurring', async (c) => {
     body.auto_post ? 1 : 0,
     ctx.user!.id,
     nowStr(),
+    ledgerId(c),
   );
+  if (!created.changes) return archivedLedgerResponse(c);
   setFlash(c, 'success', `周期账单「${name}」已创建，下次执行 ${next}`);
   return c.redirect('/recurring');
 });
@@ -594,7 +599,7 @@ planningRoutes.post('/recurring/:id', async (c) => {
     }
   }
   await db.run(
-    'UPDATE recurring_rules SET name=?, payload=?, frequency=?, interval_n=?, day_of_month=?, next_run_at=?, auto_post=?, is_active=? WHERE id=? AND ledger_id=?',
+    `UPDATE recurring_rules SET name=?, payload=?, frequency=?, interval_n=?, day_of_month=?, next_run_at=?, auto_post=?, is_active=? WHERE id=? AND ledger_id=? AND ${txn.activeLedgerGuard}`,
     name.slice(0, 40),
     JSON.stringify({ items, user_id: prevPayload.user_id || old.created_by_user_id || ctx.user!.id }),
     frequency,
@@ -604,6 +609,7 @@ planningRoutes.post('/recurring/:id', async (c) => {
     body.auto_post ? 1 : 0,
     body.is_active ? 1 : 0,
     id,
+    lid,
     lid,
   );
   setFlash(c, 'success', '周期账单已更新');
@@ -625,30 +631,14 @@ planningRoutes.post('/recurring/:id/run', async (c) => {
       setFlash(c, 'error', `无法执行：${bad}`);
       return c.redirect('/recurring');
     }
-    const { stmts, created } = await recurringPostStmts(db, rule, todayStr());
     const period = String(body.next_run_at || rule.next_run_at);
-    const next = advanceDate(period, rule);
-    const claim = await db.run(
-      'UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND ledger_id = ? AND next_run_at = ?',
-      next,
-      id,
-      lid,
-      period,
-    );
-    if (claim.changes !== 1) {
+    const today = todayStr();
+    const result = await postRecurringPeriod(db, rule, period, period < today ? period : today);
+    if (!result) {
       setFlash(c, 'error', '该期已执行，请勿重复提交');
       return c.redirect('/recurring');
     }
-    try {
-      stmts.push(['UPDATE recurring_rules SET last_run_at = ? WHERE id = ?', [nowStr(), id]]);
-      await db.batch(stmts);
-    } catch (e) {
-      await db
-        .run('UPDATE recurring_rules SET next_run_at = ? WHERE id = ? AND next_run_at = ?', period, id, next)
-        .catch(() => {});
-      throw e;
-    }
-    setFlash(c, 'success', `已立即记账 ${created} 笔`);
+    setFlash(c, 'success', `已立即记账 ${result.created} 笔`);
   } catch (e) {
     setFlash(c, 'error', `执行失败：${toPublicError(e)}`);
   }
@@ -661,14 +651,14 @@ planningRoutes.post('/recurring/:id/toggle', async (c) => {
   const db = dbOf(c);
   const id = Number(c.req.param('id'));
   const row = await db.get<{ is_active: number }>('SELECT is_active FROM recurring_rules WHERE id = ? AND ledger_id = ?', id, ledgerId(c));
-  if (row) await db.run('UPDATE recurring_rules SET is_active = ? WHERE id = ?', row.is_active ? 0 : 1, id);
+  if (row) await db.run(`UPDATE recurring_rules SET is_active = ? WHERE id = ? AND ${txn.activeLedgerGuard}`, row.is_active ? 0 : 1, id, ledgerId(c));
   return c.redirect('/recurring');
 });
 
 planningRoutes.post('/recurring/:id/delete', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
-  await dbOf(c).run('DELETE FROM recurring_rules WHERE id = ? AND ledger_id = ?', Number(c.req.param('id')), ledgerId(c));
+  await dbOf(c).run(`DELETE FROM recurring_rules WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, Number(c.req.param('id')), ledgerId(c), ledgerId(c));
   return c.redirect('/recurring');
 });
 
@@ -680,6 +670,8 @@ interface DebtRow {
   counterparty: string;
   principal_cents: number;
   balance_cents: number;
+  opening_cents: number;
+  currency: string;
   account_id: number | null;
   due_date: string | null;
   status: string;
@@ -693,7 +685,7 @@ planningRoutes.get('/debts', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
-  const writable = canWrite(ctx.ledger?.role);
+  const writable = canWriteLedger(ctx.ledger);
   const [rows, accounts] = await Promise.all([
     db.all<DebtRow>('SELECT * FROM debts WHERE ledger_id = ? ORDER BY status, id DESC', lid),
     fd.accounts(db, lid),
@@ -701,12 +693,12 @@ planningRoutes.get('/debts', async (c) => {
   const bodyRows =
     rows
       .map((d) => {
-        const isAuto = d.note === '系统自动汇总';
+        const isAuto = d.opening_cents > 0 || d.note === '系统自动汇总';
         return `<tr>
-  <td><b>${esc(d.counterparty)}</b>${isAuto ? ' <span class="chip">自动汇总</span>' : ''}</td>
+  <td><b>${esc(d.counterparty)}</b>${d.opening_cents > 0 ? ' <span class="chip">年度期初</span>' : isAuto ? ' <span class="chip">自动汇总</span>' : ''}</td>
   <td><span class="chip ${d.direction === 'receivable' ? 'income' : 'expense'}">${d.direction === 'receivable' ? '借出/应收' : '借入/应付'}</span></td>
-  <td class="num amount">${fmtAmount(d.principal_cents)}</td>
-  <td class="num amount">${fmtAmount(d.balance_cents)}</td>
+  <td class="num amount">${esc(u.money(d.principal_cents, d.currency))}</td>
+  <td class="num amount">${esc(u.money(d.balance_cents, d.currency))}</td>
   <td>${esc(d.due_date || '—')}</td>
   <td>${d.status === 'open' ? '进行中' : '已结清'}</td>
   <td><div class="row wrap">
@@ -764,7 +756,7 @@ planningRoutes.get('/debts/:id/edit', async (c) => {
   const d = await db.get<DebtRow>('SELECT * FROM debts WHERE id = ? AND ledger_id = ?', id, lid);
   if (!d) return c.redirect('/debts');
   const accounts = await fd.accounts(db, lid);
-  const isAuto = d.note === '系统自动汇总';
+  const isAuto = d.opening_cents > 0 || d.note === '系统自动汇总';
 
   return c.html(
     layout({
@@ -776,12 +768,12 @@ planningRoutes.get('/debts/:id/edit', async (c) => {
       cspNonce: c.get('cspNonce'),
       flash: takeFlash(c),
       body: isAuto
-        ? `<div class="card"><div class="card-head"><b>自动汇总借贷：${esc(d.counterparty)}</b><a class="btn btn-sm" href="/debts">← 返回列表</a></div>
-<div class="notice mb16">该借贷由「借出 / 借入」与「收款 / 还款」流水自动汇总生成，本金与余额不可直接修改。如需调整金额请前往修改对应流水；此处可设置或清空到期日（用于到期提醒并在重算时自动保留）。</div>
+        ? `<div class="card"><div class="card-head"><b>${d.opening_cents > 0 ? '期初借贷' : '自动汇总借贷'} · ${esc(d.counterparty)}</b><a class="btn btn-sm" href="/debts">← 返回列表</a></div>
+<div class="notice mb16">${d.opening_cents > 0 ? '期初本金来自上年度未结余额，本年度同币种还款冲减余额。' : '该借贷由借还流水汇总，本金与余额由关联流水决定。'}此处可设置或清空到期日。</div>
 <div class="kpi-grid mb16">
   <div class="stat"><div class="label">方向</div><div class="value" style="font-size:18px">${d.direction === 'receivable' ? '借出（应收）' : '借入（应付）'}</div></div>
-  <div class="stat"><div class="label">本金</div><div class="value amount">${fmtAmount(d.principal_cents)}</div></div>
-  <div class="stat"><div class="label">待还/待收</div><div class="value amount">${fmtAmount(d.balance_cents)}</div></div>
+  <div class="stat"><div class="label">本金</div><div class="value amount">${esc(u.money(d.principal_cents, d.currency))}</div></div>
+  <div class="stat"><div class="label">待还/待收</div><div class="value amount">${esc(u.money(d.balance_cents, d.currency))}</div></div>
   <div class="stat"><div class="label">状态</div><div class="value" style="font-size:18px">${d.status === 'open' ? '进行中' : '已结清'}</div></div>
 </div>
 <form method="post" action="/debts/${d.id}">${csrfInput(c)}
@@ -842,11 +834,12 @@ planningRoutes.post('/debts', async (c) => {
     });
     if (dueDate) {
       await db.run(
-        "UPDATE debts SET due_date = ? WHERE ledger_id = ? AND direction = ? AND counterparty = ? AND note = '系统自动汇总'",
+        `UPDATE debts SET due_date = ? WHERE ledger_id = ? AND direction = ? AND counterparty = ? AND opening_cents = 0 AND note = '系统自动汇总' AND ${txn.activeLedgerGuard}`,
         dueDate,
         ledgerId(c),
         direction,
         cleanName,
+        ledgerId(c),
       );
     }
     setFlash(c, 'success', '已记一笔并同步到借贷台账');
@@ -857,8 +850,8 @@ planningRoutes.post('/debts', async (c) => {
     setFlash(c, 'error', '备注不能使用系统保留关键字「系统自动汇总」');
     return c.redirect('/debts');
   }
-  await db.run(
-    'INSERT INTO debts (ledger_id, direction, counterparty, principal_cents, balance_cents, account_id, due_date, status, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+  const created = await db.run(
+    `INSERT INTO debts (ledger_id, direction, counterparty, principal_cents, balance_cents, account_id, due_date, status, note, created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
     ledgerId(c),
     direction,
     cleanName,
@@ -869,7 +862,9 @@ planningRoutes.post('/debts', async (c) => {
     'open',
     rawNote.slice(0, 200),
     nowStr(),
+    ledgerId(c),
   );
+  if (!created.changes) return archivedLedgerResponse(c);
   await txn.syncDebts(db, ledgerId(c));
   return c.redirect('/debts');
 });
@@ -890,9 +885,9 @@ planningRoutes.post('/debts/:id', async (c) => {
   }
   const dueDate = dueRaw || null;
 
-  if (d.note === '系统自动汇总') {
-    await db.run('UPDATE debts SET due_date = ? WHERE id = ? AND ledger_id = ?', dueDate, id, lid);
-    setFlash(c, 'success', '自动汇总借贷到期日已更新');
+  if (d.opening_cents > 0 || d.note === '系统自动汇总') {
+    await db.run(`UPDATE debts SET due_date = ? WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, dueDate, id, lid, lid);
+    setFlash(c, 'success', '借贷到期日已更新');
     return c.redirect('/debts');
   }
 
@@ -914,16 +909,18 @@ planningRoutes.post('/debts/:id', async (c) => {
   const direction = body.direction === 'payable' ? 'payable' : 'receivable';
   const status = balance === 0 || body.status === 'closed' ? 'closed' : 'open';
   await db.run(
-    'UPDATE debts SET direction=?, counterparty=?, principal_cents=?, balance_cents=?, account_id=?, due_date=?, status=?, note=? WHERE id=? AND ledger_id=?',
+    `UPDATE debts SET direction=?, counterparty=?, principal_cents=?, manual_balance_cents=manual_balance_cents + ? - balance_cents, balance_cents=?, account_id=?, due_date=?, status=?, note=? WHERE id=? AND ledger_id=? AND ${txn.activeLedgerGuard}`,
     direction,
     counterparty,
     principal,
+    balance,
     balance,
     body.account_id ? Number(body.account_id) : null,
     dueDate,
     status,
     note,
     id,
+    lid,
     lid,
   );
   setFlash(c, 'success', '借贷记录已更新');
@@ -937,7 +934,7 @@ planningRoutes.post('/debts/:id/settle', async (c) => {
   const ctx = c.get('ctx');
   const body = await bodyOf(c);
   const id = Number(c.req.param('id'));
-  const d = await db.get<{ id: number; direction: string; counterparty: string; balance_cents: number; account_id: number | null; note: string | null }>(
+  const d = await db.get<DebtRow>(
     'SELECT * FROM debts WHERE id = ? AND ledger_id = ?',
     id,
     ledgerId(c),
@@ -950,20 +947,19 @@ planningRoutes.post('/debts/:id/settle', async (c) => {
     setFlash(c, 'error', '请填写有效金额并选择账户');
     return c.redirect('/debts');
   }
-  await txn.createTransaction(db, ledgerId(c), ctx.user!.id, {
-    type: d.direction === 'receivable' ? 'repay_receive' : 'repay_pay',
-    amount_cents: amount,
-    account_id: accountId,
-    txn_date: todayStr(),
-    merchant: d.counterparty,
-    note: `${d.direction === 'receivable' ? '收回借款 · ' : '偿还借款 · '}${d.counterparty}`,
-    source: 'manual',
-  });
-  if (d.note !== '系统自动汇总') {
-    const newBalance = Math.max(0, Number(d.balance_cents) - amount);
-    await db.run('UPDATE debts SET balance_cents = ?, status = ? WHERE id = ?', newBalance, newBalance <= 0 ? 'closed' : 'open', id);
+  try {
+    await txn.settleDebt(db, ledgerId(c), ctx.user!.id, d, {
+      amount_cents: amount,
+      account_id: accountId,
+      txn_date: todayStr(),
+      note: `${d.direction === 'receivable' ? '收回借款 · ' : '偿还借款 · '}${d.counterparty}`,
+      source: 'manual',
+    });
+  } catch (error) {
+    setFlash(c, 'error', error instanceof Error ? error.message : '借贷结算失败');
+    return c.redirect('/debts');
   }
-  setFlash(c, 'success', `已${d.direction === 'receivable' ? '收款' : '还款'} ${fmtAmount(amount)}`);
+  setFlash(c, 'success', `已${d.direction === 'receivable' ? '收款' : '还款'} ${u.money(amount, d.currency)}`);
   return c.redirect('/debts');
 });
 
@@ -972,7 +968,7 @@ planningRoutes.post('/debts/:id/delete', async (c) => {
   if (r) return r;
   const db = dbOf(c);
   const id = Number(c.req.param('id'));
-  await db.run("DELETE FROM debts WHERE id = ? AND ledger_id = ? AND note != '系统自动汇总'", id, ledgerId(c));
+  await db.run(`DELETE FROM debts WHERE id = ? AND ledger_id = ? AND opening_cents = 0 AND note IS NOT '系统自动汇总' AND ${txn.activeLedgerGuard}`, id, ledgerId(c), ledgerId(c));
   return c.redirect('/debts');
 });
 
@@ -998,7 +994,7 @@ planningRoutes.get('/goals', async (c) => {
   const ctx = c.get('ctx');
   const meta = await siteMeta(c);
   const lid = ledgerId(c);
-  const writable = canWrite(ctx.ledger?.role);
+  const writable = canWriteLedger(ctx.ledger);
   const [rows, accounts] = await Promise.all([
     db.all<GoalRow>(
       'SELECT g.*, a.name AS account_name FROM goals g LEFT JOIN accounts a ON a.id = g.account_id WHERE g.ledger_id = ? ORDER BY g.status, g.id DESC',
@@ -1134,7 +1130,7 @@ planningRoutes.post('/goals/:id', async (c) => {
   const saved = Math.max(0, u.parseAmountToCents(body.saved_amount));
   const status = saved >= target ? 'completed' : 'active';
   await db.run(
-    'UPDATE goals SET name=?, icon=?, target_cents=?, saved_cents=?, account_id=?, target_date=?, status=?, note=? WHERE id=? AND ledger_id=?',
+    `UPDATE goals SET name=?, icon=?, target_cents=?, saved_cents=?, account_id=?, target_date=?, status=?, note=? WHERE id=? AND ledger_id=? AND ${txn.activeLedgerGuard}`,
     name,
     String(body.icon || '🎯').slice(0, 8) || '🎯',
     target,
@@ -1144,6 +1140,7 @@ planningRoutes.post('/goals/:id', async (c) => {
     status,
     body.note ? String(body.note).slice(0, 200) : null,
     id,
+    lid,
     lid,
   );
   setFlash(c, 'success', '储蓄目标已更新');
@@ -1171,8 +1168,8 @@ planningRoutes.post('/goals', async (c) => {
     }
   }
   const saved = Math.max(0, u.parseAmountToCents(body.saved_amount));
-  await db.run(
-    'INSERT INTO goals (ledger_id, name, icon, target_cents, saved_cents, account_id, target_date, status, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+  const created = await db.run(
+    `INSERT INTO goals (ledger_id, name, icon, target_cents, saved_cents, account_id, target_date, status, note, created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE ${txn.activeLedgerGuard}`,
     lid,
     String(body.name || '').trim().slice(0, 30),
     String(body.icon || '🎯'),
@@ -1183,7 +1180,9 @@ planningRoutes.post('/goals', async (c) => {
     saved >= target ? 'completed' : 'active',
     body.note ? String(body.note).slice(0, 200) : null,
     nowStr(),
+    lid,
   );
+  if (!created.changes) return archivedLedgerResponse(c);
   return c.redirect('/goals');
 });
 
@@ -1227,12 +1226,13 @@ planningRoutes.post('/goals/:id/deposit', async (c) => {
   const saved = Math.max(0, prevSaved + amt);
   const done = Number(g.target_cents) > 0 && saved >= Number(g.target_cents);
   const claim = await db.run(
-    'UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ? AND saved_cents = ?',
+    `UPDATE goals SET saved_cents = ?, status = ? WHERE id = ? AND ledger_id = ? AND saved_cents = ? AND ${txn.activeLedgerGuard}`,
     saved,
     done ? 'completed' : 'active',
     id,
     lid,
     prevSaved,
+    lid,
   );
   if (Number(claim.changes || 0) !== 1) {
     setFlash(c, 'error', '储蓄目标刚被更新，请刷新重试');
@@ -1254,10 +1254,11 @@ planningRoutes.post('/goals/:id/deposit', async (c) => {
           `UPDATE goals
            SET saved_cents = MAX(0, saved_cents - ?),
                status = CASE WHEN target_cents > 0 AND MAX(0, saved_cents - ?) >= target_cents THEN 'completed' ELSE 'active' END
-           WHERE id = ? AND ledger_id = ?`,
+           WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`,
           amt,
           amt,
           id,
+          lid,
           lid,
         )
         .catch(() => {});
@@ -1285,6 +1286,6 @@ planningRoutes.post('/goals/:id/deposit', async (c) => {
 planningRoutes.post('/goals/:id/delete', async (c) => {
   const r = requireWrite(c);
   if (r) return r;
-  await dbOf(c).run('DELETE FROM goals WHERE id = ? AND ledger_id = ?', Number(c.req.param('id')), ledgerId(c));
+  await dbOf(c).run(`DELETE FROM goals WHERE id = ? AND ledger_id = ? AND ${txn.activeLedgerGuard}`, Number(c.req.param('id')), ledgerId(c), ledgerId(c));
   return c.redirect('/goals');
 });

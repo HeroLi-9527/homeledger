@@ -290,14 +290,18 @@ SET account_amount_cents = (
       FROM accounts a, base WHERE a.id = t.to_account_id AND a.ledger_id = t.ledger_id
     )`];
 
-export const recomputeAccountBalances: BatchStatement = [`WITH sides AS (
+export const accountBalanceCtes = `sides AS (
   SELECT account_id AS id, CASE
     WHEN type = 'invest_sell' AND to_account_id IS NULL THEN 0
     WHEN type IN ('income','borrow','repay_receive','reimburse','refund','interest','invest_sell','adjust')
       THEN account_amount_cents ELSE -account_amount_cents END AS delta
-  FROM transactions WHERE deleted_at IS NULL AND account_id IS NOT NULL
+  FROM balance_txns WHERE account_id IS NOT NULL
   UNION ALL
   SELECT to_account_id, CASE WHEN type = 'invest_sell' THEN -to_account_amount_cents ELSE to_account_amount_cents END
-  FROM transactions WHERE deleted_at IS NULL AND to_account_id IS NOT NULL AND type IN ('transfer','invest_buy','invest_sell')
-), totals AS (SELECT id, SUM(delta) AS delta FROM sides GROUP BY id)
+  FROM balance_txns WHERE to_account_id IS NOT NULL AND type IN ('transfer','invest_buy','invest_sell')
+), totals AS (SELECT id, SUM(delta) AS delta FROM sides GROUP BY id)`;
+
+export const recomputeAccountBalances: BatchStatement = [`WITH balance_txns AS (
+  SELECT * FROM transactions WHERE deleted_at IS NULL
+), ${accountBalanceCtes}
 UPDATE accounts SET balance_cents = initial_cents + COALESCE((SELECT delta FROM totals WHERE id = accounts.id), 0)`];

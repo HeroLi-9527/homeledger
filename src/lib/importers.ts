@@ -1,7 +1,7 @@
 import { accountCentsFromBase, balanceDeltaStmts, baseExchangeRates, getSetting, nowStr, TXN_TYPES } from '../db.js';
 import type { BatchStatement, Db, Env, TxnRow } from '../types.js';
 import { classifyByKeywords, guessAccountName } from './ai.js';
-import { kindOfType, syncDebts, validateAccounts } from './txn.js';
+import { activeLedgerGuard, kindOfType, syncDebts, validateAccounts } from './txn.js';
 import { parseAmountToCents, toBase, uid } from './util.js';
 
 export function decodeBuffer(buf: ArrayBuffer | Uint8Array): { text: string; encoding: string } {
@@ -373,7 +373,7 @@ async function ensureAccount(
   const icon = type === 'credit' ? '💳' : type === 'prepaid' ? '🎟️' : type === 'virtual' ? '📱' : type === 'debit' ? '🏦' : '📦';
   const r = await db.run(
     `INSERT INTO accounts (ledger_id, name, type, icon, currency, initial_cents, balance_cents, sort_order, note, created_at)
-     VALUES (?,?,?,?,?,0,0,999,?,?)`,
+     SELECT ?,?,?,?,?,0,0,999,?,? WHERE ${activeLedgerGuard}`,
     ledgerId,
     String(name).slice(0, 30),
     type,
@@ -381,7 +381,9 @@ async function ensureAccount(
     currency,
     '由账单导入自动创建',
     nowStr(),
+    ledgerId,
   );
+  if (!r.changes) throw new Error('账本已归档，只能查阅和导出');
   const newId = r.lastInsertRowid;
   accounts.push({ id: newId, name: String(name).slice(0, 30), currency });
   createdList.push(name);
@@ -451,7 +453,7 @@ export async function importRecords(
   const insertSql = `INSERT INTO transactions
      (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id, category_id,
       user_id, txn_date, note, merchant, status, source, ai_json, created_at, updated_at, account_amount_cents, to_account_amount_cents)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
+     SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${activeLedgerGuard}`;
 
   const stmts: Array<{
     sql: string;
@@ -508,7 +510,8 @@ export async function importRecords(
       };
       const now = nowStr();
       stmts.push({
-        effects: balanceDeltaStmts([[{ ...effect, ...amounts }, 1]]),
+        effects: balanceDeltaStmts([[{ ...effect, ...amounts }, 1]]).map(([sql, args = []]) =>
+          [`${sql} AND ${activeLedgerGuard}`, [...args, ledgerId]]),
         sql: insertSql,
         params: [
           ledgerId,
@@ -531,6 +534,7 @@ export async function importRecords(
           now,
           amounts.account_amount_cents,
           amounts.to_account_amount_cents,
+          ledgerId,
         ],
         fp,
         index: i,
@@ -550,10 +554,18 @@ export async function importRecords(
   for (let start = 0; start < stmts.length; start += BATCH_SIZE) {
     const chunk = stmts.slice(start, start + BATCH_SIZE);
     try {
-      await db.batch(chunk.flatMap((s): BatchStatement[] => [[s.sql, s.params], ...s.effects]));
+      const results = await db.batch(chunk.flatMap((s): BatchStatement[] => [[s.sql, s.params], ...s.effects]));
+      // The active-ledger guard has the same value for the entire D1 batch.
       for (const s of chunk) {
-        dupSet.add(s.fp);
-        imported++;
+        if (results[0].meta.changes) {
+          dupSet.add(s.fp);
+          imported++;
+        } else {
+          failed++;
+          const f = { index: s.index, line: s.line, merchant: s.merchant, error: '账本已归档，只能查阅和导出' };
+          failuresAll.push(f);
+          if (failures.length < 10) failures.push(f);
+        }
       }
     } catch {
       dupSet = await loadDupSet(db, ledgerId, source);
@@ -563,7 +575,8 @@ export async function importRecords(
           continue;
         }
         try {
-          await db.batch([[s.sql, s.params], ...s.effects]);
+          const [inserted] = await db.batch([[s.sql, s.params], ...s.effects]);
+          if (!inserted.meta.changes) throw new Error('账本已归档，只能查阅和导出');
           dupSet.add(s.fp);
           imported++;
         } catch (e2) {
@@ -589,7 +602,7 @@ export async function importRecords(
   }
   const job = await db.run(
     `INSERT INTO import_jobs (ledger_id, user_id, source, file_name, total, imported, skipped, failed, status, message, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+     SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE ${activeLedgerGuard}`,
     ledgerId,
     userId,
     source,
@@ -601,10 +614,11 @@ export async function importRecords(
     'done',
     msgs.length ? msgs.join('；') : null,
     nowStr(),
+    ledgerId,
   );
 
   let failuresUrl: string | null = null;
-  if (failed > 10 && env?.ATTACHMENTS) {
+  if (job.changes && failed > 10 && env?.ATTACHMENTS) {
     try {
       const key = `imports/failures-${job.lastInsertRowid}.json`;
       await env.ATTACHMENTS.put(
@@ -613,7 +627,7 @@ export async function importRecords(
         { httpMetadata: { contentType: 'application/json' } },
       );
       const fullMsg = `${msgs.length ? `${msgs.join('；')}；` : ''}完整失败清单（共 ${failed} 条）：${key}`;
-      await db.run('UPDATE import_jobs SET message = ? WHERE id = ?', fullMsg, job.lastInsertRowid);
+      await db.run(`UPDATE import_jobs SET message = ? WHERE id = ? AND ${activeLedgerGuard}`, fullMsg, job.lastInsertRowid, ledgerId);
       failuresUrl = key;
     } catch (e) {
       console.error('[import] 失败清单写入 R2 失败:', e);
@@ -779,10 +793,10 @@ export async function importNativeRecords(
         `INSERT INTO transactions (ledger_id, type, amount_cents, currency, rate, amount_base_cents, account_id, to_account_id,
           account_amount_cents, to_account_amount_cents, category_id, user_id, txn_date, note, merchant, status, source, ai_json, created_at, updated_at)
          SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
-         WHERE NOT EXISTS (SELECT 1 FROM transactions WHERE ledger_id = ? AND source = 'homeledger_csv' AND ai_json = ?)`,
+         WHERE ${activeLedgerGuard} AND NOT EXISTS (SELECT 1 FROM transactions WHERE ledger_id = ? AND source = 'homeledger_csv' AND ai_json = ?)`,
         [ledgerId, rec.type, rec.amount_cents, data.currency, data.rate ?? (data.baseCents / rec.amount_cents || 1), data.baseCents,
           account.id, to.id, account.amount, to.amount, categoryId, userId, rec.txn_date, rec.note, rec.merchant, data.status,
-          'homeledger_csv', key, nowStr(), stamp, ledgerId, key],
+          'homeledger_csv', key, nowStr(), stamp, ledgerId, ledgerId, key],
       ]);
       const effects = balanceDeltaStmts([[{
         type: rec.type, amount_base_cents: data.baseCents, account_id: account.id, to_account_id: to.id,

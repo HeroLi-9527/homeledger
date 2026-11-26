@@ -156,6 +156,9 @@ export async function importLedger(db: Db, userId: number, value: unknown, copyN
         row.to_account_amount_cents = nativeAmount(row.to_account_id, row.to_account_amount_cents);
         // Deleting a subscription deliberately leaves its historical charges in the ledger.
         row.subscription_id = ids.get('subscriptions')?.get(Number(row.subscription_id)) ?? null;
+        row.recurring_rule_id = ids.get('recurring_rules')?.get(Number(row.recurring_rule_id)) ?? null;
+        // A deleted manual debt's settlement remains directed after import.
+        if (row.settlement_debt_id != null) row.settlement_debt_id = ids.get('debts')?.get(Number(row.settlement_debt_id)) ?? 0;
         row.related_id = ref('transactions', row.related_id, true);
         if (row.group_id) row.group_id = `${groupPrefix}_${row.group_id}`;
         if (row.purge_started) row.purge_started = 0;
@@ -210,6 +213,7 @@ export async function importLedger(db: Db, userId: number, value: unknown, copyN
   ledger.name = copyName || `${ledger.name}（导入）`.slice(0, 40);
   ledger.owner_id = userId;
   ledger.is_archived = 0;
+  delete ledger.rolled_over_to_id;
   const statements: BatchStatement[] = [];
   for (const [index, table] of tables.entries()) {
     appendRows(statements, table, rows.get(table)!, (schema[index].results || []) as unknown as TableColumnInfo[]);

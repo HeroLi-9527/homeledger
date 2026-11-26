@@ -64,6 +64,8 @@ export interface LedgerRow {
   is_archived: number;
   sort_order: number;
   created_at: string;
+  rollover_year?: number | null;
+  rolled_over_to_id?: number | null;
   role?: Role;
 }
 
@@ -81,6 +83,7 @@ export interface OpenAuth {
   displayName?: string;
   isAdmin?: boolean;
   ledgerId: number;
+  archived: boolean;
   tokenId: number;
   tokenName: string;
   role: Role;
@@ -172,6 +175,7 @@ export interface TxnRow {
   updated_at: string;
   deleted_at: string | null;
   subscription_id: number | null;
+  settlement_debt_id?: number | null;
   category_name?: string | null;
   category_icon?: string | null;
   category_color?: string | null;
