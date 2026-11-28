@@ -44,6 +44,14 @@ const STATUS_KIND: Record<string, string> = {
 
 const MAX_CATCHUP = 6;
 
+export const isAutoRenew = (v: unknown): boolean => Number(v) === 1;
+
+export function parseAutoRenewFlag(val: unknown, fallback = 0): number {
+  if (val === undefined) return isAutoRenew(fallback) ? 1 : 0;
+  return val === true || val === 1 ||
+    (typeof val === 'string' && ['1', 'true', 'on'].includes(val.trim().toLowerCase())) ? 1 : 0;
+}
+
 export interface SubscriptionRow {
   id: number;
   ledger_id: number;
@@ -173,6 +181,7 @@ export function decorate(sub: SubscriptionRow, extras: Record<string, unknown> =
   const trialLeft = sub.trial_ends_on ? daysUntil(sub.trial_ends_on) : null;
   return {
     ...sub,
+    auto_renew: isAutoRenew(sub.auto_renew) ? 1 : 0,
     cycleLabel: cycleLabel(sub.cycle, sub.cycle_n),
     statusLabel: statusLabel(sub.status),
     statusKind: STATUS_KIND[sub.status] || 'info',
@@ -266,7 +275,7 @@ export async function charge(db: Db, sub: SubscriptionRow, userId: number | null
   const guard = `EXISTS (
     SELECT 1 FROM subscriptions s JOIN ledgers l ON l.id = s.ledger_id WHERE s.id = ?
       AND s.next_charge_at = ? AND s.status = ? AND s.account_id IS ? AND s.amount_cents = ?
-      AND s.auto_renew = ? AND s.currency = ? AND s.category_id IS ? AND s.trial_ends_on IS ?
+      AND s.auto_renew IS ? AND s.currency = ? AND s.category_id IS ? AND s.trial_ends_on IS ?
       AND s.cycle = ? AND s.cycle_n = ? AND s.anchor_day IS ? AND l.is_archived = 0
   )`;
   const params = [sub.id, period, sub.status, sub.account_id, sub.amount_cents, sub.auto_renew,
@@ -328,19 +337,20 @@ export async function runDue(db: Db, today = todayStr()) {
     today,
   );
   for (const t of expiredTrials) {
-    const toStatus = t.auto_renew ? 'active' : 'paused';
+    const autoRenew = isAutoRenew(t.auto_renew);
+    const toStatus = autoRenew ? 'active' : 'paused';
     const updated = await db.run(`UPDATE subscriptions SET status = ? WHERE id = ? AND status = 'trial'
-      AND trial_ends_on = ? AND auto_renew = ?
+      AND trial_ends_on = ? AND auto_renew IS ?
       AND EXISTS (SELECT 1 FROM ledgers WHERE id = subscriptions.ledger_id AND is_archived = 0)`,
       toStatus, t.id, t.trial_ends_on, t.auto_renew);
     if (updated.changes !== 1) continue;
     const key = `subtrial-end:${t.id}:${t.trial_ends_on}`;
     for (const uid of await ledgerWriterIds(db, t.ledger_id)) {
       await notify(db, uid, {
-        kind: t.auto_renew ? 'info' : 'warn',
+        kind: autoRenew ? 'info' : 'warn',
         ledgerId: t.ledger_id,
-        title: t.auto_renew ? `试用已结束，开始扣费：${t.name}` : `试用已结束：${t.name}`,
-        body: t.auto_renew
+        title: autoRenew ? `试用已结束，开始扣费：${t.name}` : `试用已结束：${t.name}`,
+        body: autoRenew
           ? `试用于 ${t.trial_ends_on} 结束，已开启自动续费，将按 ${(t.amount_cents / 100).toFixed(2)} ${cycleLabel(t.cycle, t.cycle_n)}扣费`
           : `试用于 ${t.trial_ends_on} 结束，未开启自动续费，订阅已暂停`,
         link: '/subscriptions',
@@ -357,7 +367,7 @@ export async function runDue(db: Db, today = todayStr()) {
   for (const sub of due) {
     if (sub.status === 'trial' && !sub.trial_ends_on) continue;
     if (sub.status === 'trial' && sub.trial_ends_on && sub.trial_ends_on > today) continue;
-    if (!sub.auto_renew) {
+    if (!isAutoRenew(sub.auto_renew)) {
       const key = `sub-hold:${sub.id}:${sub.next_charge_at}:${month}`;
       for (const uid of await ledgerWriterIds(db, sub.ledger_id)) {
         if (
@@ -419,7 +429,7 @@ export async function checkReminders(db: Db, today = todayStr()): Promise<number
   for (const sub of items) {
     const days = daysUntil(sub.next_charge_at);
     const ahead = Math.max(0, Number(sub.reminder_days) || 0);
-    const pastDueNoRenew = !sub.auto_renew && sub.next_charge_at && sub.next_charge_at <= today;
+    const pastDueNoRenew = !isAutoRenew(sub.auto_renew) && sub.next_charge_at && sub.next_charge_at <= today;
     if (days !== null && days >= 0 && days <= ahead && !pastDueNoRenew) {
       const key = `sub:${sub.id}:${sub.next_charge_at}`;
       for (const uid of await ledgerWriterIds(db, sub.ledger_id)) {

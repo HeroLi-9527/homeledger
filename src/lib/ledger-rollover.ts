@@ -17,16 +17,17 @@ export class RolloverError extends Error {
   }
 }
 
-// Closing balances use the same signed account-side amounts as txnEffects.
+// Stored balances include live changes. Undo signed new-year deltas, excluding frozen KAP history.
 const closingAccounts = `
   WITH scope(ledger_id, boundary) AS (VALUES (?, ?)),
   balance_txns AS (
     SELECT t.* FROM transactions t, scope s
-    WHERE t.ledger_id = s.ledger_id AND t.deleted_at IS NULL AND t.txn_date < s.boundary
+    WHERE t.ledger_id = s.ledger_id AND t.deleted_at IS NULL AND t.txn_date >= s.boundary
+      AND COALESCE(t.source, '') <> 'kap-import'
   ), ${accountBalanceCtes}
-  SELECT a.*, a.initial_cents + COALESCE(t.delta, 0) AS closing_cents
+  SELECT a.*, a.balance_cents - COALESCE(t.delta, 0) AS closing_cents
   FROM accounts a JOIN scope s ON s.ledger_id = a.ledger_id LEFT JOIN totals t ON t.id = a.id
-  WHERE a.created_at < s.boundary AND (a.is_archived = 0 OR a.initial_cents + COALESCE(t.delta, 0) <> 0)`;
+  WHERE a.created_at < s.boundary AND (a.is_archived = 0 OR a.balance_cents - COALESCE(t.delta, 0) <> 0)`;
 
 const closingDebts = `${debtScope}${debtBalancesCte}
   SELECT * FROM outstanding_debts`;
@@ -65,8 +66,12 @@ const badRuleAccounts = `SELECT r.name FROM recurring_rules r
         AND a.id = json_extract(item.value, '$.to_account_id'))
   )`;
 const badSubscriptionAccounts = `SELECT s.name FROM subscriptions s
-  WHERE s.ledger_id = ? AND s.status IN ('active','trial') AND (s.account_id IS NOT NULL OR s.amount_cents > 0)
-  AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = s.account_id AND a.ledger_id = s.ledger_id AND a.is_archived = 0)`;
+  WHERE s.ledger_id = ? AND s.status IN ('active','trial') AND (
+    (s.auto_renew = 1 AND s.account_id IS NULL)
+    OR (s.account_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM accounts a WHERE a.id = s.account_id AND a.ledger_id = s.ledger_id AND a.is_archived = 0
+    ))
+  )`;
 const recurringDate = `COALESCE((
     SELECT MIN(COALESCE(t.scheduled_period, t.txn_date)) FROM transactions t
     WHERE t.ledger_id = r.ledger_id AND t.source = 'recurring' AND t.deleted_at IS NOT NULL
@@ -86,7 +91,8 @@ const removedNewYearCharges = `FROM transactions t
   WHERE t.ledger_id = s.ledger_id AND t.subscription_id = s.id AND t.deleted_at IS NOT NULL
     AND ${chargePeriod} >= ? AND ${chargePeriod} < ${subscriptionDate}`;
 const resumedSubscriptionDate = `COALESCE((SELECT MIN(${chargePeriod}) ${removedNewYearCharges}), ${subscriptionDate})`;
-const subscriptionPeriods = `SELECT s.id, s.name, ${resumedSubscriptionDate} AS next_date, s.auto_renew AS automatic,
+const subscriptionPeriods = `SELECT s.id, s.name, ${resumedSubscriptionDate} AS next_date,
+  CASE WHEN s.auto_renew = 1 THEN 1 ELSE 0 END AS automatic,
   (s.status = 'active' OR s.trial_ends_on IS NULL OR s.trial_ends_on < ?) AS pending
   FROM subscriptions s WHERE s.ledger_id = ? AND s.status IN ('active','trial')`;
 const targetId = '(SELECT rolled_over_to_id FROM ledgers WHERE id = ?)';
@@ -285,7 +291,8 @@ export async function executeLedgerRollover(
         anchor_month, anchor_day, account_id, category_id, auto_renew, trial_ends_on, next_charge_at, last_charge_at,
         reminder_days, charge_count, status, note, created_by_user_id, created_at)
       SELECT ${targetId}, s.name, s.icon, s.plan, s.vendor_url, s.amount_cents, s.currency, s.cycle, s.cycle_n,
-        s.anchor_month, s.anchor_day, a.new_id, COALESCE(c.new_id, global.id), s.auto_renew, s.trial_ends_on,
+        s.anchor_month, s.anchor_day, a.new_id, COALESCE(c.new_id, global.id),
+        CASE WHEN s.auto_renew = 1 THEN 1 ELSE 0 END, s.trial_ends_on,
         ${resumedSubscriptionDate},
         CASE WHEN EXISTS (SELECT 1 ${removedNewYearCharges} AND ${chargePeriod} = s.last_charge_at) THEN (
           SELECT MAX(${chargePeriod}) FROM transactions t

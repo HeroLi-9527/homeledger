@@ -1303,10 +1303,11 @@ export async function accountOverview(db: Db, ledgerId: number) {
 
 export async function netWorthTrend(db: Db, ledgerId: number, months = 6) {
   const list = lastMonths(months, todayStr());
+  // Frozen KAP imports did not change stored balances, so omit them when replaying opening snapshots.
   const [allTxns, accounts, { rates }] = await Promise.all([
     db.all<Pick<TxnRow, 'txn_date' | 'type' | 'amount_base_cents' | 'account_id' | 'to_account_id' | 'account_amount_cents' | 'to_account_amount_cents'>>(
       `SELECT txn_date, type, amount_base_cents, account_id, to_account_id, account_amount_cents, to_account_amount_cents FROM transactions
-       WHERE ledger_id = ? AND deleted_at IS NULL ORDER BY txn_date`,
+       WHERE ledger_id = ? AND deleted_at IS NULL AND COALESCE(source, '') <> 'kap-import' ORDER BY txn_date`,
       ledgerId,
     ),
     db.all<Pick<AccountRow, 'id' | 'initial_cents' | 'include_in_net' | 'created_at' | 'balance_cents' | 'currency'>>(

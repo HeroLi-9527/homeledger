@@ -59,7 +59,7 @@ function readSubForm(
     anchor_day: anchorDay,
     account_id: body.account_id ? Number(body.account_id) : null,
     category_id: body.category_id ? Number(body.category_id) : null,
-    auto_renew: body.auto_renew ? 1 : 0,
+    auto_renew: subs.parseAutoRenewFlag(body.auto_renew, 0),
     trial_ends_on: trialEnds,
     next_charge_at: next,
     reminder_days: Math.max(0, Math.min(60, Number(body.reminder_days ?? 3) || 0)),
@@ -160,7 +160,7 @@ async function subscriptionDetails(c: Context<HonoEnv, '/subscriptions/:id' | '/
   <div class="field"><label>提前提醒天数</label><input name="reminder_days" type="number" min="0" max="60" value="${Number(s.reminder_days ?? 3)}"></div>
   <div class="field"><label>官网 / 退订链接${s.vendor_url && /^https?:\/\//i.test(s.vendor_url) ? ` <a href="${esc(s.vendor_url)}" target="_blank" rel="noopener noreferrer">打开 ↗</a>` : ''}</label><input name="vendor_url" type="url" value="${esc(s.vendor_url || '')}" maxlength="200"></div>
   <div class="field"><label>备注</label><input name="note" value="${esc(s.note || '')}"></div>
-  <div class="field" style="justify-content:flex-end"><label class="check"><input type="checkbox" name="auto_renew" ${s.auto_renew ? 'checked' : ''}> 到期自动扣费记账</label></div>
+  <div class="field" style="justify-content:flex-end"><label class="check"><input type="checkbox" name="auto_renew" ${subs.isAutoRenew(s.auto_renew) ? 'checked' : ''}> 到期自动扣费记账</label></div>
 </div>
 <div class="row mt12"><button class="btn btn-primary" type="submit">保存</button><a class="btn" href="/subscriptions">取消</a></div></form></div>` : `<div class="between mb16"><h2>${esc(s.name)}</h2><a href="/subscriptions">返回订阅</a></div>`}
 ${simpleTable('历史扣费记录', ['扣费日期', '本位币金额', '状态', '备注', '操作'], chargeRows, `<span class="muted small amount">累计 ${Number(statRow?.cnt || 0)} 期 · 合计 ${u.fmtAmount(Number(statRow?.total || 0))}</span>`)}`,

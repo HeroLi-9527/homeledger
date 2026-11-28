@@ -10,10 +10,11 @@ import { removeById } from '../src/lib/attachments.js';
 import { createSessionPayload, hashPassword, sha256Hex, signSession } from '../src/lib/auth.js';
 import { executeLedgerRollover, previewLedgerRollover, RolloverError } from '../src/lib/ledger-rollover.js';
 import { createSessionCard, deleteSessionCard, toggleArchiveSessionCard, topUpSessionCard, undoSessionCardLog, updateSessionCard, useSessionCard } from '../src/lib/session-cards.js';
-import { runDue as runDueSubscriptions } from '../src/lib/subscriptions.js';
+import { checkReminders as checkSubscriptionReminders, runDue as runDueSubscriptions } from '../src/lib/subscriptions.js';
 import { importRecords, mapNativeRecords, NATIVE_EXPORT_HEADER, parseBill, toCsv } from '../src/lib/importers.js';
 import { checkCreditAccounts, checkSessionCards, repairReimbursedLinks, runDueRecurring, runScheduled } from '../src/lib/scheduler.js';
-import { createTransaction, iterateAllForExport, markReimbursed, purgeTransaction, softDelete } from '../src/lib/txn.js';
+import { accountOverview, createTransaction, iterateAllForExport, markReimbursed, netWorthTrend, purgeTransaction, softDelete } from '../src/lib/txn.js';
+import { addDays, addMonths } from '../src/lib/util.js';
 import type { Db, Env } from '../src/types.js';
 
 type SQLInputValue = null | number | bigint | string | Uint8Array;
@@ -4581,6 +4582,118 @@ async function rolloverFixture() {
   return { sqlite, db, env, ledgerId, owner, viewer, cash, year, oldDay, boundary, newDay, account, token, session, request, attachments: env.ATTACHMENTS! };
 }
 
+function insertFrozenHistory(sqlite: SqliteDatabase, ledgerId: number, userId: number) {
+  const insert = sqlite.prepare(`INSERT INTO transactions
+    (ledger_id, user_id, type, amount_cents, amount_base_cents, account_id, account_amount_cents,
+     to_account_id, to_account_amount_cents, source, txn_date, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'kap-import', ?, ?, ?)`);
+  return (type: string, amount: number, accountId: number, date: string, toAccountId: number | null = null) =>
+    insert.run(ledgerId, userId, type, amount, amount, accountId, amount,
+      toAccountId, toAccountId === null ? null : amount, date, date, date);
+}
+
+test('年度结转按账户实存余额承接冻结导入后的快照及活流水', async () => {
+  const { sqlite, db, ledgerId, owner, cash, year, oldDay, account } = await rolloverFixture();
+  const bank = account('储蓄卡', 'CNY', 4321);
+  const insert = insertFrozenHistory(sqlite, ledgerId, owner);
+  insert('expense', 24689, cash, `${year - 1}-10-09`);
+  insert('income', 32765, bank, `${year - 1}-11-09`);
+  insert('transfer', 719, cash, `${year - 1}-12-09`, bank);
+  await createTransaction(db, ledgerId, owner, {
+    type: 'expense', amount_cents: 136, account_id: cash, txn_date: oldDay,
+  });
+  await createTransaction(db, ledgerId, owner, {
+    type: 'income', amount_cents: 244, account_id: bank, txn_date: oldDay,
+  });
+
+  const source = await accountOverview(db, ledgerId);
+  const expected = [[cash, 9864], [bank, 4565]];
+  assert.deepEqual(source.accounts.map((a) => [a.id, a.balance_cents]), expected);
+  assert.equal(source.net, 14429);
+
+  const { lastInsertRowid } = insert('expense', 300, cash, `${year}-01-01`);
+  const blocked = await previewLedgerRollover(db, ledgerId, year);
+  assert.equal(blocked.canConfirm, false);
+  assert.deepEqual(blocked.accounts.map((a) => [a.id, a.closing_cents]), expected);
+  sqlite.prepare('DELETE FROM transactions WHERE id = ?').run(lastInsertRowid);
+
+  const preview = await previewLedgerRollover(db, ledgerId, year);
+  assert.equal(preview.canConfirm, true);
+  assert.deepEqual(preview.accounts.map((a) => [a.id, a.closing_cents]), expected);
+  const { ledgerId: newId } = await executeLedgerRollover(db, ledgerId, owner, { targetYear: year });
+  const target = await accountOverview(db, newId);
+  assert.deepEqual(target.accounts.map((a) => [a.name, a.initial_cents, a.balance_cents]), [
+    ['现金', 9864, 9864], ['储蓄卡', 4565, 4565],
+  ]);
+  assert.equal(target.net, source.net);
+});
+
+test('Web 与 OpenAPI 报表保留冻结导入的收支统计并排除其净资产增量', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, cash } = f;
+  const month = todayStr().slice(0, 7);
+  const earlier = addMonths(month, -2);
+  const previous = addMonths(month, -1);
+  const bank = f.account('储蓄卡', 'CNY', 4321);
+  const excluded = f.account('不计入净资产', 'CNY', 9999);
+  const usd = f.account('美元账户', 'USD', 1000);
+  const archived = f.account('归档账户', 'CNY', 5000);
+  sqlite.prepare('UPDATE accounts SET created_at = ? WHERE ledger_id = ?').run(`${month}-20`, ledgerId);
+  sqlite.prepare('UPDATE accounts SET created_at = ? WHERE id IN (?, ?)').run(`${earlier}-01`, usd, archived);
+  sqlite.prepare('UPDATE accounts SET include_in_net = 0 WHERE id = ?').run(excluded);
+  sqlite.prepare("UPDATE exchange_rates SET rate = 7.5 WHERE base = 'USD' AND quote = 'CNY'").run();
+  const insert = insertFrozenHistory(sqlite, ledgerId, owner);
+  insert('expense', 24689, cash, `${earlier}-09`);
+  insert('expense', 21543, cash, `${previous}-09`);
+  insert('income', 7654, bank, `${previous}-12`);
+  insert('transfer', 719, cash, `${previous}-19`, bank);
+  await createTransaction(db, ledgerId, owner, {
+    type: 'income', amount_cents: 200, account_id: usd, currency: 'USD', rate: 6, txn_date: `${previous}-20`,
+  });
+  await createTransaction(db, ledgerId, owner, {
+    type: 'income', amount_cents: 300, account_id: archived, txn_date: `${previous}-21`,
+  });
+  sqlite.prepare('UPDATE accounts SET is_archived = 1 WHERE id = ?').run(archived);
+  await createTransaction(db, ledgerId, owner, {
+    type: 'expense', amount_cents: 136, account_id: cash, txn_date: `${month}-21`,
+  });
+  const balances = () => db.all<{ id: number; balance_cents: number }>(
+    'SELECT id, balance_cents FROM accounts WHERE ledger_id = ? ORDER BY id', ledgerId,
+  );
+  const before = await balances();
+  assert.deepEqual(before.map((a) => [a.id, a.balance_cents]), [
+    [cash, 9864], [bank, 4321], [excluded, 9999], [usd, 1200], [archived, 5300],
+  ]);
+  const expected = [{ month: earlier, value: 7500 }, { month: previous, value: 9000 }, { month, value: 23185 }];
+  assert.deepEqual(await netWorthTrend(db, ledgerId, 3), expected);
+
+  const web = await f.request('/reports?preset=all', { headers: { Cookie: (await f.session(owner)).cookie } });
+  assert.equal(web.status, 200);
+  const html = await web.text();
+  for (const point of expected) {
+    assert.ok(html.includes(`<title>家庭净资产 ${point.month.slice(5)}月：${(point.value / 100).toFixed(2)}元</title>`));
+  }
+  const api = await f.request('/api/open/reports?preset=all', {
+    headers: { Authorization: `Bearer ${await f.token(owner)}` },
+  });
+  assert.equal(api.status, 200);
+  const report = await api.json() as {
+    net_worth: typeof expected;
+    expense_categories: { name: string; total: number; cnt: number }[];
+    trend: { month: string; income: number; expense: number }[];
+    members: { id: number; income: number; expense: number; cnt: number }[];
+  };
+  assert.deepEqual(report.net_worth.slice(-3), expected);
+  assert.deepEqual(report.expense_categories.map((c) => [c.name, c.total, c.cnt]), [['未分类', 46368, 3]]);
+  assert.deepEqual(report.trend.slice(-3), [
+    { month: earlier, income: 0, expense: 24689 },
+    { month: previous, income: 9154, expense: 21543 },
+    { month, income: 0, expense: 136 },
+  ]);
+  assert.deepEqual(report.members.map((m) => [m.id, m.income, m.expense, m.cnt]), [[owner, 9154, 46368, 7]]);
+  assert.deepEqual(await balances(), before);
+});
+
 test('年度结转预览按旧年度账户侧金额、借还与次卡截止日计算，并重新拦截预览后的新流水', async () => {
   const f = await rolloverFixture();
   const { sqlite, db, ledgerId, owner, cash, year, oldDay, newDay } = f;
@@ -4978,6 +5091,175 @@ test('结转排除元旦创建的账户与手工借贷，并拦截引用不可�
   sqlite.prepare('UPDATE recurring_rules SET payload = ? WHERE id = ?').run(payload(cash, destination), ruleId);
   sqlite.prepare('UPDATE subscriptions SET account_id = ? WHERE id = ?').run(cash, subId);
   assert.equal((await previewLedgerRollover(db, ledgerId, year)).canConfirm, true);
+});
+
+test('年度结转承接未绑定账户的有金额提醒订阅', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, year, oldDay, newDay } = f;
+  const name = '剪映 SVIP';
+  sqlite.prepare(`INSERT INTO subscriptions
+    (ledger_id, name, amount_cents, account_id, auto_renew, cycle, next_charge_at, reminder_days, created_at)
+    VALUES (?, ?, 29900, NULL, 0, 'yearly', ?, 7, ?)`).run(ledgerId, name, newDay, oldDay);
+
+  const route = `/api/open/ledgers/${ledgerId}/rollover`;
+  const headers = { Authorization: `Bearer ${await f.token(owner)}`, 'Content-Type': 'application/json' };
+  const response = await f.request(`${route}?target_year=${year}`, { headers });
+  assert.equal(response.status, 200);
+  const preview = await response.json() as Awaited<ReturnType<typeof previewLedgerRollover>>;
+  assert.deepEqual(preview.blockers, []);
+  assert.equal(preview.canConfirm, true);
+  assert.deepEqual(preview.subscriptions.map((sub) => [sub.name, sub.next_date, sub.automatic]), [[name, newDay, 0]]);
+
+  const confirmed = await f.request(route, { method: 'POST', headers, body: JSON.stringify({ target_year: year }) });
+  assert.equal(confirmed.status, 201);
+  const { ledgerId: newId } = await confirmed.json() as { ledgerId: number };
+  const carried = await db.get(`SELECT name, auto_renew, account_id, amount_cents, cycle, next_charge_at, reminder_days, status
+    FROM subscriptions WHERE ledger_id = ?`, newId);
+  assert.ok(carried);
+  assert.deepEqual({ ...carried }, {
+    name, auto_renew: 0, account_id: null, amount_cents: 29900, cycle: 'yearly', next_charge_at: newDay,
+    reminder_days: 7, status: 'active',
+  });
+  const scheduled = await runDueSubscriptions(db, newDay);
+  assert.equal(scheduled.charged, 0);
+  assert.equal(scheduled.notified, 1);
+  assert.deepEqual(await db.all('SELECT id FROM transactions WHERE ledger_id = ?', newId), []);
+});
+
+test('年度结转拦截缺少账户的自动订阅和绑定无效账户的提醒订阅', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, year, oldDay, newDay } = f;
+  const archived = f.account('归档账户', 'CNY', 0, 1);
+  const insert = sqlite.prepare(`INSERT INTO subscriptions
+    (ledger_id, name, amount_cents, account_id, auto_renew, next_charge_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  const remove = sqlite.prepare('DELETE FROM subscriptions WHERE id = ?');
+  const cases = [
+    { name: '未绑定账户的自动订阅', amount: 0, account: null, autoRenew: 1 },
+    { name: '绑定归档账户的提醒订阅', amount: 500, account: archived, autoRenew: 0 },
+    { name: '绑定不存在账户的提醒订阅', amount: 500, account: archived + 1, autoRenew: 0 },
+    { name: '绑定归档账户的非标准标记订阅', amount: 500, account: archived, autoRenew: 2 },
+    { name: '绑定不存在账户的非标准标记订阅', amount: 500, account: archived + 1, autoRenew: 2 },
+  ];
+  for (const { name, amount, account, autoRenew } of cases) {
+    const { lastInsertRowid } = insert.run(ledgerId, name, amount, account, autoRenew, newDay, oldDay);
+    const blocker = `请先为以下周期账单或订阅更换不可用的账户：${name}`;
+    const preview = await previewLedgerRollover(db, ledgerId, year);
+    assert.equal(preview.canConfirm, false, name);
+    assert.deepEqual(preview.blockers, [blocker]);
+    await assert.rejects(executeLedgerRollover(db, ledgerId, owner, { targetYear: year }), { status: 409, message: blocker });
+    remove.run(lastInsertRowid);
+  }
+});
+
+test('非标准续费标记按提醒处理，拦截未处理的旧年期次并归一化新年订阅', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, year, oldDay, newDay } = f;
+  const insert = sqlite.prepare(`INSERT INTO subscriptions
+    (ledger_id, name, amount_cents, account_id, auto_renew, status, next_charge_at, trial_ends_on, created_at)
+    VALUES (?, ?, 29900, NULL, ?, ?, ?, ?, ?)`);
+  for (const flag of [0, 2]) {
+    for (const [status, trialEnds] of [['active', null], ['trial', oldDay], ['trial', null]] as const) {
+      const name = `未处理期次 ${flag}/${status}/${trialEnds}`;
+      const { lastInsertRowid } = insert.run(ledgerId, name, flag, status, oldDay, trialEnds, oldDay);
+      const blocked = await previewLedgerRollover(db, ledgerId, year);
+      assert.equal(blocked.canConfirm, false, name);
+      assert.deepEqual(blocked.blockingPeriods.map((s) => [s.name, s.next_date, s.automatic]), [[name, oldDay, 0]]);
+      await assert.rejects(executeLedgerRollover(db, ledgerId, owner, { targetYear: year }), { status: 409 });
+      sqlite.prepare('DELETE FROM subscriptions WHERE id = ?').run(lastInsertRowid);
+    }
+  }
+  insert.run(ledgerId, '到期提醒', 2, 'active', newDay, null, oldDay);
+  insert.run(ledgerId, '试用提醒', 2, 'trial', oldDay, newDay, oldDay);
+
+  const preview = await previewLedgerRollover(db, ledgerId, year);
+  assert.equal(preview.canConfirm, true);
+  assert.deepEqual(preview.blockingPeriods, []);
+  const expected = [['到期提醒', newDay, 0], ['试用提醒', newDay, 0]];
+  assert.deepEqual(preview.subscriptions.map((s) => [s.name, s.next_date, s.automatic]), expected);
+  const { ledgerId: newId } = await executeLedgerRollover(db, ledgerId, owner, { targetYear: year });
+  const target = await db.all<{ name: string; next_charge_at: string; auto_renew: number; account_id: number | null }>(
+    'SELECT name, next_charge_at, auto_renew, account_id FROM subscriptions WHERE ledger_id = ? ORDER BY id', newId,
+  );
+  assert.deepEqual(target.map((s) => [s.name, s.next_charge_at, s.auto_renew, s.account_id]),
+    expected.map((row) => [...row, null]));
+});
+
+test('活跃账本的非标准续费标记只提醒，Web 和 OpenAPI 读写规范化续费开关', async () => {
+  const f = await rolloverFixture();
+  const { sqlite, db, ledgerId, owner, cash } = f;
+  const today = todayStr();
+  const tomorrow = addDays(today, 1);
+  const insert = sqlite.prepare(`INSERT INTO subscriptions
+    (ledger_id, name, amount_cents, account_id, auto_renew, status, next_charge_at, trial_ends_on, created_at)
+    VALUES (?, ?, 29900, ?, 2, ?, ?, ?, ?)`);
+  const id = Number(insert.run(ledgerId, '到期提醒', cash, 'active', today, null, today).lastInsertRowid);
+  const trial = insert.run(ledgerId, '试用提醒', cash, 'trial', today, today, today).lastInsertRowid;
+  insert.run(ledgerId, '即将到期提醒', cash, 'active', tomorrow, null, today);
+  const storedFlag = (subId: number) => db.get<{ auto_renew: number }>('SELECT auto_renew FROM subscriptions WHERE id = ?', subId);
+  const setDirtyFlag = sqlite.prepare('UPDATE subscriptions SET auto_renew = 2 WHERE id = ?');
+
+  const result = await runDueSubscriptions(db, today);
+  assert.equal(result.charged, 0);
+  assert.equal(result.notified, 1);
+  assert.equal(await checkSubscriptionReminders(db, today), 1);
+  assert.deepEqual(
+    (await db.all<{ title: string; kind: string }>('SELECT title, kind FROM notifications WHERE ledger_id = ? ORDER BY id', ledgerId))
+      .map((n) => [n.title, n.kind]),
+    [['试用已结束：试用提醒', 'warn'], ['订阅到期待确认：到期提醒', 'warn'], ['订阅即将扣费：即将到期提醒', 'info']],
+  );
+  assert.equal((await db.get<{ status: string }>('SELECT status FROM subscriptions WHERE id = ?', trial))?.status, 'paused');
+
+  const { cookie, csrf } = await f.session(owner);
+  const webPath = `/subscriptions/${id}`;
+  const web = await f.request(`${webPath}/edit`, { headers: { Cookie: cookie } });
+  assert.equal(web.status, 200);
+  assert.match(await web.text(), /name="auto_renew"\s*>/);
+  for (const [flag, expected] of [['2', 0], ['0', 0], ['on', 1]] as const) {
+    setDirtyFlag.run(id);
+    const response = await f.request(webPath, {
+      method: 'POST', headers: { Cookie: cookie },
+      body: new URLSearchParams({ _csrf: csrf, name: '到期提醒', amount: '299', account_id: String(cash), auto_renew: flag }),
+    });
+    assert.equal(response.status, 302);
+    assert.equal((await storedFlag(id))?.auto_renew, expected, `Web ${flag}`);
+  }
+
+  setDirtyFlag.run(id);
+  const route = '/api/open/subscriptions';
+  const headers = { Authorization: `Bearer ${await f.token(owner)}`, 'Content-Type': 'application/json' };
+  const read = await f.request(`${route}/${id}`, { headers });
+  assert.equal(read.status, 200);
+  const { subscription } = await read.json() as { subscription: { auto_renew: number } };
+  assert.equal(subscription.auto_renew, 0);
+  const list = await f.request(route, { headers });
+  assert.equal(list.status, 200);
+  const { subscriptions } = await list.json() as { subscriptions: { id: number; auto_renew: number }[] };
+  assert.deepEqual(subscriptions.map((s) => s.auto_renew), [0, 0, 0]);
+  assert.equal((await storedFlag(id))?.auto_renew, 2);
+
+  const write = async (method: string, body: object, expected: number) => {
+    const url = method === 'POST' ? route : `${route}/${id}`;
+    const response = await f.request(url, { method, headers, body: JSON.stringify(body) });
+    assert.equal(response.status, method === 'POST' ? 201 : 200);
+    const saved = await response.json() as { id: number; subscription: { auto_renew: number } };
+    assert.equal(saved.subscription.auto_renew, expected, `${method} ${JSON.stringify(body)}`);
+    assert.equal((await storedFlag(saved.id))?.auto_renew, expected, `${method} 持久化`);
+  };
+  await write('PUT', subscription, 0);
+  setDirtyFlag.run(id);
+  await write('PATCH', { note: '仅编辑备注' }, 0);
+  for (const flag of [2, '2']) {
+    await write('POST', { name: `新订阅 ${typeof flag}`, amount_cents: 29900, account_id: cash, auto_renew: flag }, 0);
+  }
+  for (const method of ['PATCH', 'PUT']) {
+    for (const [enabled, invalid] of [[true, 2], [1, '2'], ['1', 2], ['on', '2']] as const) {
+      await write(method, { auto_renew: enabled }, 1);
+      await write(method, { auto_renew: invalid }, 0);
+      assert.equal((await runDueSubscriptions(db, today)).charged, 0);
+    }
+  }
+  assert.deepEqual(await db.all('SELECT id FROM transactions WHERE ledger_id = ?', ledgerId), []);
 });
 
 test('软删已入账的新年周期及订阅流水后，从最早受影响的计划期次接续', async () => {

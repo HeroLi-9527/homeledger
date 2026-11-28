@@ -412,7 +412,7 @@ async function normalizeSubscriptionWrite(
     anchor_day: anchorDay,
     account_id: accountId,
     category_id: categoryId,
-    auto_renew: parseBoolFlag(body.auto_renew, existing?.auto_renew ?? 1),
+    auto_renew: subs.parseAutoRenewFlag(body.auto_renew, existing?.auto_renew ?? 1),
     trial_ends_on: trialEndsOn,
     next_charge_at: next,
     reminder_days:
